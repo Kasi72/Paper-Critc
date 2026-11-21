@@ -10,7 +10,10 @@ import androidx.room.PrimaryKey
 import androidx.room.Query
 import androidx.room.Room
 import androidx.room.RoomDatabase
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
 import com.example.data.model.PaperReview
+import com.example.data.model.ReviewMode
 import com.google.firebase.Timestamp
 import kotlinx.coroutines.flow.Flow
 
@@ -31,6 +34,18 @@ data class SqlReviewCacheEntity(
   val originalityScore: Int,
   val mathRigorScore: Int,
   val reproducibilityScore: Int,
+  val methodologyJustification: String = "",
+  val clarityJustification: String = "",
+  val significanceJustification: String = "",
+  val originalityJustification: String = "",
+  val mathRigorJustification: String = "",
+  val reproducibilityJustification: String = "",
+  val refereeConfidence: Int = 4,
+  val extractionConfidence: Int = 4,
+  val reviewMode: String = ReviewMode.POST_PUBLICATION_APPRAISAL.name,
+  val coverageDisclosure: String = "",
+  val validationStatus: String = "VERIFIED",
+  val structuredFindingsJson: String = "",
   val abstractSummary: String,
   val researchQuestion: String,
   val keyMethodology: String,
@@ -67,6 +82,24 @@ data class SqlReviewCacheEntity(
       isEmpirical = isEmpirical,
       credibilityScore = credibilityScore,
       verdict = verdict,
+      methodologyScore = methodologyScore,
+      significanceScore = significanceScore,
+      clarityScore = clarityScore,
+      originalityScore = originalityScore,
+      mathRigorScore = mathRigorScore,
+      reproducibilityScore = reproducibilityScore,
+      methodologyJustification = methodologyJustification,
+      significanceJustification = significanceJustification,
+      clarityJustification = clarityJustification,
+      originalityJustification = originalityJustification,
+      mathRigorJustification = mathRigorJustification,
+      reproducibilityJustification = reproducibilityJustification,
+      refereeConfidence = refereeConfidence,
+      extractionConfidence = extractionConfidence,
+      reviewMode = reviewMode,
+      coverageDisclosure = coverageDisclosure,
+      validationStatus = validationStatus,
+      structuredFindingsJson = structuredFindingsJson,
       abstractSummary = abstractSummary,
       researchQuestion = researchQuestion,
       keyMethodology = keyMethodology,
@@ -98,7 +131,7 @@ data class SqlReviewCacheEntity(
         publicationYear = review.publicationYear,
         venueOrCitation = review.venueOrCitation,
         isEmpirical = review.isEmpirical,
-        credibilityScore = review.credibilityScore,
+        credibilityScore = rubric.overallCredibilityScore.toLong(),
         verdict = review.verdict,
         methodologyScore = rubric.methodology,
         clarityScore = rubric.clarity,
@@ -106,6 +139,18 @@ data class SqlReviewCacheEntity(
         originalityScore = rubric.originality,
         mathRigorScore = rubric.mathematicalRigor,
         reproducibilityScore = rubric.reproducibility,
+        methodologyJustification = rubric.methodologyJustification,
+        clarityJustification = rubric.clarityJustification,
+        significanceJustification = rubric.significanceJustification,
+        originalityJustification = rubric.originalityJustification,
+        mathRigorJustification = rubric.mathematicalRigorJustification,
+        reproducibilityJustification = rubric.reproducibilityJustification,
+        refereeConfidence = rubric.refereeConfidence,
+        extractionConfidence = rubric.extractionConfidence,
+        reviewMode = review.reviewMode.ifBlank { ReviewMode.POST_PUBLICATION_APPRAISAL.name },
+        coverageDisclosure = review.coverageDisclosure,
+        validationStatus = review.validationStatus.ifBlank { "VERIFIED" },
+        structuredFindingsJson = review.structuredFindingsJson,
         abstractSummary = review.abstractSummary,
         researchQuestion = review.researchQuestion,
         keyMethodology = review.keyMethodology,
@@ -149,7 +194,7 @@ data class SqlApiProviderEntity(
   val protocolTypeName: String,
   val baseUrl: String,
   val modelId: String,
-  val apiKey: String,
+  val apiKey: String, // Encrypted via ApiKeyVault (Android Keystore AES-256-GCM)
   val isFreeTierPreset: Boolean,
   val enabled: Boolean,
   val notes: String,
@@ -165,7 +210,7 @@ data class SqlApiProviderEntity(
       protocolType = protocol,
       baseUrl = baseUrl,
       modelId = modelId,
-      apiKey = apiKey,
+      apiKey = ApiKeyVault.decrypt(apiKey),
       isFreeTierPreset = isFreeTierPreset,
       enabled = enabled,
       notes = notes
@@ -180,7 +225,7 @@ data class SqlApiProviderEntity(
         protocolTypeName = entry.protocolType.name,
         baseUrl = entry.baseUrl,
         modelId = entry.modelId,
-        apiKey = entry.apiKey,
+        apiKey = ApiKeyVault.encrypt(entry.apiKey),
         isFreeTierPreset = entry.isFreeTierPreset,
         enabled = entry.enabled,
         notes = entry.notes
@@ -242,7 +287,7 @@ interface PaperCriticSqlDao {
     SqlChatMessageEntity::class,
     SqlApiProviderEntity::class
   ],
-  version = 3,
+  version = 4,
   exportSchema = false
 )
 abstract class PaperCriticSqlDatabase : RoomDatabase() {
@@ -252,6 +297,27 @@ abstract class PaperCriticSqlDatabase : RoomDatabase() {
     @Volatile
     private var INSTANCE: PaperCriticSqlDatabase? = null
 
+    /**
+     * Explicit non-destructive migration preserving all existing user reviews, chat messages,
+     * and provider settings when upgrading from Room schema v3 to v4.
+     */
+    val MIGRATION_3_4 = object : Migration(3, 4) {
+      override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE sql_review_cache ADD COLUMN methodologyJustification TEXT NOT NULL DEFAULT ''")
+        db.execSQL("ALTER TABLE sql_review_cache ADD COLUMN clarityJustification TEXT NOT NULL DEFAULT ''")
+        db.execSQL("ALTER TABLE sql_review_cache ADD COLUMN significanceJustification TEXT NOT NULL DEFAULT ''")
+        db.execSQL("ALTER TABLE sql_review_cache ADD COLUMN originalityJustification TEXT NOT NULL DEFAULT ''")
+        db.execSQL("ALTER TABLE sql_review_cache ADD COLUMN mathRigorJustification TEXT NOT NULL DEFAULT ''")
+        db.execSQL("ALTER TABLE sql_review_cache ADD COLUMN reproducibilityJustification TEXT NOT NULL DEFAULT ''")
+        db.execSQL("ALTER TABLE sql_review_cache ADD COLUMN refereeConfidence INTEGER NOT NULL DEFAULT 4")
+        db.execSQL("ALTER TABLE sql_review_cache ADD COLUMN extractionConfidence INTEGER NOT NULL DEFAULT 4")
+        db.execSQL("ALTER TABLE sql_review_cache ADD COLUMN reviewMode TEXT NOT NULL DEFAULT 'POST_PUBLICATION_APPRAISAL'")
+        db.execSQL("ALTER TABLE sql_review_cache ADD COLUMN coverageDisclosure TEXT NOT NULL DEFAULT ''")
+        db.execSQL("ALTER TABLE sql_review_cache ADD COLUMN validationStatus TEXT NOT NULL DEFAULT 'VERIFIED'")
+        db.execSQL("ALTER TABLE sql_review_cache ADD COLUMN structuredFindingsJson TEXT NOT NULL DEFAULT ''")
+      }
+    }
+
     fun getDatabase(context: Context): PaperCriticSqlDatabase {
       return INSTANCE ?: synchronized(this) {
         val instance = Room.databaseBuilder(
@@ -259,7 +325,7 @@ abstract class PaperCriticSqlDatabase : RoomDatabase() {
           PaperCriticSqlDatabase::class.java,
           "paper_critic_sql_database"
         )
-          .fallbackToDestructiveMigration(true)
+          .addMigrations(MIGRATION_3_4)
           .build()
         INSTANCE = instance
         instance

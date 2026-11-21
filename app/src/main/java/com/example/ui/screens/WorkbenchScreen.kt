@@ -615,6 +615,35 @@ fun WorkbenchScreen(
                   )
                 }
 
+                formState.coverageReport?.let { cov ->
+                  val covAccent = if (cov.isHighCoverage) CupertinoGreen else CupertinoAmber
+                  val covShape = SquircleShape(cornerRadius = 8.dp, smoothing = 0.88f)
+                  Column(
+                    modifier = Modifier
+                      .fillMaxWidth()
+                      .clip(covShape)
+                      .background(covAccent.copy(alpha = 0.09f))
+                      .border(0.6.dp, covAccent.copy(alpha = 0.30f), covShape)
+                      .padding(horizontal = 9.dp, vertical = 6.dp)
+                      .testTag("document_coverage_banner"),
+                    verticalArrangement = Arrangement.spacedBy(2.dp)
+                  ) {
+                    Text(
+                      text = "DOCUMENT COVERAGE • EXTRACTION CONFIDENCE ${cov.extractionConfidence}/5",
+                      style = MaterialTheme.typography.labelSmall,
+                      fontFamily = JetBrainsMonoFamily,
+                      fontSize = 9.5.sp,
+                      fontWeight = FontWeight.Bold,
+                      color = covAccent
+                    )
+                    Text(
+                      text = cov.toDisclosureLine(),
+                      style = MaterialTheme.typography.labelSmall,
+                      color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                  }
+                }
+
                   if (formState.pdfPageBitmaps.isNotEmpty()) {
                     Text(
                       text = "Rendered PDF Pages Attached for Gemini Vision:",
@@ -1078,6 +1107,21 @@ fun WorkbenchScreen(
       }
 
       3 -> {
+        IosGroupedCard(
+          header = "Appraisal Mode & Framing",
+          footer = formState.options.reviewMode.description
+        ) {
+          val modes = com.example.data.model.ReviewMode.entries
+          IosSegmentedControl(
+            items = modes.map { it.shortLabel },
+            selectedIndex = modes.indexOf(formState.options.reviewMode).coerceAtLeast(0),
+            onSelect = { idx ->
+              onOptionsChange { it.copy(reviewMode = modes[idx]) }
+            },
+            modifier = Modifier.testTag("review_mode_selector")
+          )
+        }
+
         IosGroupedCard(
           header = "4. Pipeline Stage Toggles (iOS Cupertino Switches)",
           footer = "Toggle individual Reviewer2 & PhD-Skills stages for this paper analysis."

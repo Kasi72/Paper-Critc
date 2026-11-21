@@ -3,19 +3,30 @@ package com.example
 import com.example.data.ai.ManuscriptForensicEngine
 import com.example.data.ai.QuantFindingStatus
 import com.example.data.ai.QuantitativeForensicAnalyzer
+import com.example.data.ai.Reviewer2PipelineService
 import com.example.data.ai.StudyDesignArchetype
+import com.example.data.model.EvidenceAnchor
+import com.example.data.model.FindingStatus
+import com.example.data.model.PaperReview
+import com.example.data.model.PaperReviewRubric
+import com.example.data.model.ReviewFinding
+import com.example.data.model.ReviewFindingCodec
+import com.example.data.model.ReviewMode
 import com.example.util.CalloutTone
 import com.example.util.DossierFormattingEngine
+import com.example.util.ExtractedPage
+import com.example.util.ManuscriptExtractor
 import com.example.util.ReportBlock
 import com.example.util.SeverityLevel
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
  * Local JVM unit tests verifying Paper Critic's formatting engine, domain-aware forensic scanner,
- * and exact deterministic quantitative/statistical audit math.
+ * exact deterministic quantitative/statistical audit math, cross-pass adjudication, and rubric scoring.
  */
 class ExampleUnitTest {
 
@@ -99,9 +110,246 @@ class ExampleUnitTest {
       report.proceduralLeakageAlerts.any { it.contains("random seed", ignoreCase = true) }
     )
     assertTrue(
-      "Should flag unweighted median/IQR synthesis in quantitative forensics",
+      "Should flag unweighted median/IQR synthesis when no random-effects pooling is present",
       report.quantForensics.heterogeneitySignals.any { it.contains("UNWEIGHTED SYNTHESIS", ignoreCase = true) }
     )
+  }
+
+  @Test
+  fun forensicEngine_psychiatricBedBenchmark_zeroFalseAbsenceAlarmsAndCatchesPage8ImpossibleCi() {
+    val benchmarkText = """
+      [PAGE 1]
+      Need estimates of psychiatric beds: a systematic review and meta-analysis
+      Abstract: We searched PubMed, Embase, and PsycINFO up to 13 September 2022 in accordance with PRISMA guidelines.
+      We included 65 publications providing 98 estimates of needed psychiatric beds per 100,000 population across
+      high-income countries (HIC) and low- and middle-income countries (LMIC).
+
+      [PAGE 3]
+      Methods: Three authors independently extracted data from all eligible studies using a structured extraction form
+      and evaluated methodological rigor with a custom quality-scoring checklist. We conducted random-effects
+      meta-analyses to pool bed-need estimates per 100,000 population and explored between-study variance using
+      univariable meta-regression models.
+
+      [PAGE 7]
+      Results: Between-study heterogeneity was extreme across all pooled estimates (I² > 99%). In meta-regression,
+      year of publication was positively associated with estimated need (β = 0.53, p = 0.004). Median estimates
+      and interquartile ranges (IQR) were also summarized descriptively alongside pooled random-effects estimates.
+
+      [PAGE 8]
+      Subgroup analysis for chronic inpatient facilities yielded a pooled long-stay bed estimate of 9, 95% CI 1.26 to 2.35
+      per 100,000 population across contributing jurisdictions.
+
+      [PAGE 9]
+      Figure 2. Forest plot of long-stay psychiatric bed estimates showing pooled estimate of 9 (95% CI 3–15)
+      per 100,000 population with I² > 99%.
+    """.trimIndent()
+
+    val report = ManuscriptForensicEngine.analyzeManuscript(
+      text = benchmarkText,
+      isEmpiricalTrack = true
+    )
+
+    assertEquals(StudyDesignArchetype.SYSTEMATIC_REVIEW_META_ANALYSIS, report.studyDesign)
+    assertTrue(report.studyDesign.reportingGuideline.contains("PRISMA 2020"))
+    assertTrue(report.studyDesign.riskOfBiasInstrument.contains("AMSTAR", ignoreCase = true))
+    assertTrue(report.studyDesign.certaintyFramework.contains("GRADE", ignoreCase = true))
+
+    // Precision gates: ZERO false absence alarms on this benchmark
+    assertFalse(
+      "Must not emit false UNWEIGHTED SYNTHESIS when random-effects meta-analyses are explicitly reported",
+      report.quantForensics.heterogeneitySignals.any { it.contains("UNWEIGHTED SYNTHESIS", ignoreCase = true) }
+    )
+    assertFalse(
+      "Must not emit false HETEROGENEITY OMISSION when I² > 99% is reported",
+      report.quantForensics.heterogeneitySignals.any { it.contains("HETEROGENEITY OMISSION", ignoreCase = true) }
+    )
+    assertFalse(
+      "Must not emit false PUBLICATION BIAS warning for descriptive/normative bed-need estimates",
+      report.quantForensics.heterogeneitySignals.any { it.contains("PUBLICATION BIAS WARN", ignoreCase = true) }
+    )
+
+    // Must catch the Page 8 impossible CI and cross-reference it with Figure 2 (95% CI 3–15) on Page 9
+    val page8CiFail = report.quantForensics.confidenceIntervalChecks.firstOrNull {
+      it.status == QuantFindingStatus.FAIL
+    }
+    assertNotNull("Must flag impossible narrative CI '9, 95% CI 1.26 to 2.35'", page8CiFail)
+    assertEquals(8, page8CiFail!!.pageNumber)
+    assertEquals(9.0, page8CiFail.pointEstimate, 0.001)
+    assertEquals(1.26, page8CiFail.lower, 0.001)
+    assertEquals(2.35, page8CiFail.upper, 0.001)
+    assertTrue(
+      "Cross-reference note must link to Figure 2 / 3–15 on Page 9",
+      page8CiFail.crossReferenceNote.contains("3") &&
+        page8CiFail.crossReferenceNote.contains("15") &&
+        page8CiFail.crossReferenceNote.contains("Page 9")
+    )
+
+    // Methodological nuance: quality scoring recognized (not falsely flagged as absent), independent extraction recognized
+    assertFalse(
+      "Must not falsely claim multi-author independent extraction was absent",
+      report.proceduralLeakageAlerts.any { it.contains("independent extraction", ignoreCase = true) && it.contains("no ", ignoreCase = true) }
+    )
+    assertTrue(
+      "Clinical applicability lens must generate structured real-world notes",
+      report.clinicalApplicabilityNotes.isNotEmpty()
+    )
+  }
+
+  @Test
+  fun rubricWeightedScore_matchesExactlyAcrossComputeAndModel() {
+    // Weights: 25% Methodology + 20% Significance + 15% Clarity + 15% Originality + 15% Math + 10% Repro
+    // (6*25 + 8*20 + 7*15 + 7*15 + 5*15 + 4*10) / 10.0 = 635 / 10.0 = 63.5 -> 64
+    val exact = PaperReviewRubric.computeWeightedScore(
+      methodology = 6,
+      significance = 8,
+      clarity = 7,
+      originality = 7,
+      mathematicalRigor = 5,
+      reproducibility = 4
+    )
+    assertEquals(64, exact)
+
+    val review = PaperReview(
+      id = "rubric-test",
+      title = "Rubric Reconciliation Check",
+      methodologyScore = 6,
+      significanceScore = 8,
+      clarityScore = 7,
+      originalityScore = 7,
+      mathRigorScore = 5,
+      reproducibilityScore = 4,
+      credibilityScore = 99 // stale/mismatched legacy value must be overridden by authoritative rubric
+    )
+    assertEquals(64, review.toRubric().overallCredibilityScore)
+  }
+
+  @Test
+  fun adjudicator_downgradesUngroundedQuotesContradictsFalseAbsencesAndInjectsImpossibleCi() {
+    val benchmarkText = """
+      [PAGE 3]
+      Methods: Three authors independently extracted data and performed random-effects meta-analyses.
+      [PAGE 7]
+      Results: Heterogeneity was very high (I² > 99%).
+      [PAGE 8]
+      Subgroup analysis yielded a pooled long-stay bed estimate of 9, 95% CI 1.26 to 2.35 per 100,000.
+      [PAGE 9]
+      Figure 2 shows pooled estimate of 9 (95% CI 3–15).
+    """.trimIndent()
+
+    val forensic = ManuscriptForensicEngine.analyzeManuscript(benchmarkText, isEmpiricalTrack = true)
+
+    val rawFindings = listOf(
+      ReviewFinding(
+        id = "F-1",
+        title = "Hallucinated Verbatim Quote",
+        allegation = "Authors omitted ethics approval in Table 4.",
+        severity = "MAJOR",
+        status = FindingStatus.VERIFIED,
+        supportingEvidence = listOf(
+          EvidenceAnchor(
+            pageNumber = 4,
+            section = "Table 4",
+            exactQuote = "Table 4 explicitly omits all institutional review board protocol identifiers across 99 cohorts"
+          )
+        )
+      ),
+      ReviewFinding(
+        id = "F-2",
+        title = "False Absence of Meta-Analysis",
+        allegation = "The authors did not perform any random-effects meta-analysis and omitted I² heterogeneity statistics.",
+        severity = "CRITICAL",
+        status = FindingStatus.VERIFIED,
+        supportingEvidence = listOf(
+          EvidenceAnchor(pageNumber = 3, section = "Methods", exactQuote = "Three authors independently extracted data")
+        )
+      )
+    )
+
+    val adjudicated = Reviewer2PipelineService.adjudicateFindingsAndScores(
+      rawFindings = rawFindings,
+      manuscriptText = benchmarkText,
+      forensicReport = forensic,
+      methodologyScore = 6,
+      significanceScore = 8,
+      clarityScore = 7,
+      originalityScore = 7,
+      mathRigorScore = 5,
+      reproducibilityScore = 4,
+      rawVerdict = "HIGH_CREDIBILITY",
+      reviewMode = ReviewMode.POST_PUBLICATION_APPRAISAL
+    )
+
+    assertEquals(64, adjudicated.weightedCredibilityScore)
+    // Verified CRITICAL CI error must prevent HIGH_CREDIBILITY and downgrade to REQUIRES_CORRECTION
+    assertEquals("REQUIRES_CORRECTION", adjudicated.resolvedVerdict)
+
+    val f1 = adjudicated.adjudicatedFindings.first { it.id == "F-1" }
+    assertEquals(
+      "Ungrounded quote must be downgraded from VERIFIED to UNVERIFIED",
+      FindingStatus.UNVERIFIED,
+      f1.status
+    )
+
+    val f2 = adjudicated.adjudicatedFindings.first { it.id == "F-2" }
+    assertEquals(
+      "False absence claim must be marked CONTRADICTED",
+      FindingStatus.CONTRADICTED,
+      f2.status
+    )
+    assertTrue("Contradicted finding must include counter-evidence snippet", f2.counterEvidence.isNotEmpty())
+
+    val injectedCi = adjudicated.adjudicatedFindings.firstOrNull { it.id == "Q-01" }
+    assertNotNull("Deterministic impossible CI must be injected as Q-01", injectedCi)
+    assertEquals(FindingStatus.VERIFIED, injectedCi!!.status)
+    assertEquals("CRITICAL", injectedCi.severity)
+    assertEquals(8, injectedCi.supportingEvidence.first().pageNumber)
+  }
+
+  @Test
+  fun prepareManuscriptForPrompt_preservesFullBodyAndTrimsReferencesTailFirst() {
+    val body = "[PAGE 1]\nIntroduction\n" + "Core methods and results sentence. ".repeat(110) +
+      "\n[PAGE 8]\nCRITICAL_MID_BODY_RESULT: estimate of 9, 95% CI 1.26 to 2.35\n"
+    val refs = "\nReferences\n" + (1..60).joinToString("\n") { "[$it] Author $it et al. Journal of Psychiatry 2022; 10: 1-12." }
+    val fullDoc = body + refs
+
+    val prepared = Reviewer2PipelineService.prepareManuscriptForPrompt(fullDoc, maxChars = 4800)
+    assertTrue("Should flag that bibliography was trimmed", prepared.wasTrimmed)
+    assertTrue(
+      "Must preserve the entire middle body including Page 8 critical result without middle truncation",
+      prepared.text.contains("CRITICAL_MID_BODY_RESULT: estimate of 9, 95% CI 1.26 to 2.35")
+    )
+    assertTrue("Should note bibliography trimming", prepared.trimmedNote.contains("bibliography", ignoreCase = true))
+  }
+
+  @Test
+  fun visionPageSelector_prioritizesTitleFiguresTablesAndLowDensityPages() {
+    val pages = (1..14).map { pageNum ->
+      val text = when (pageNum) {
+        1 -> "Title and Abstract"
+        5 -> "Table 1 characteristics of included studies"
+        9 -> "Figure 2 forest plot of long-stay estimates"
+        11 -> "Chart" // low text density
+        else -> "Narrative methods and discussion text ".repeat(25)
+      }
+      ExtractedPage(
+        pageNumber = pageNum,
+        text = text,
+        charCount = text.length,
+        wordCount = text.split(Regex("\\s+")).count { it.isNotBlank() },
+        hasLowTextDensity = text.length < 40,
+        mentionsFiguresOrTables = text.contains("Figure", ignoreCase = true) || text.contains("Table", ignoreCase = true)
+      )
+    }
+    val selected = ManuscriptExtractor.selectHighValueVisionPages(
+      totalPages = 14,
+      extractedPages = pages,
+      maxPages = 6
+    )
+    assertTrue("Always includes Page 1 (index 0)", 0 in selected)
+    assertTrue("Prioritizes Figure 2 on Page 9 (index 8)", 8 in selected)
+    assertTrue("Prioritizes Table 1 on Page 5 (index 4)", 4 in selected)
+    assertTrue("Prioritizes low-text-density Page 11 (index 10)", 10 in selected)
+    assertEquals(6, selected.size)
   }
 
   @Test
@@ -120,7 +368,7 @@ class ExampleUnitTest {
   @Test
   fun quantitativeForensics_catchesGrossStatcheckErrorImpossibleCiAndFixedEffectMismatch() {
     val text = """
-      Across k = 18 included studies, a fixed-effect meta-analysis yielded I² = 84%.
+      Across k = 18 included clinical trials of an antidepressant intervention, a fixed-effect meta-analysis yielded I² = 84%.
       Primary group comparison reported t(28) = 1.75, p = 0.03 and a consistent check z = 2.58, p = 0.01.
       Adjusted odds ratio was OR = 2.40 (95% CI 0.90–1.80) alongside median of 45 (IQR 40–95).
     """.trimIndent()
@@ -148,7 +396,7 @@ class ExampleUnitTest {
       report.heterogeneitySignals.any { it.contains("MODEL MISMATCH FAIL", ignoreCase = true) }
     )
     assertTrue(
-      "Should flag missing Egger/funnel bias check for k = 18 >= 10",
+      "Should flag missing Egger/funnel bias check for comparative effect-size trials with k = 18 >= 10",
       report.heterogeneitySignals.any { it.contains("PUBLICATION BIAS WARN", ignoreCase = true) }
     )
   }
@@ -175,7 +423,7 @@ class ExampleUnitTest {
 
   @Test
   fun searchDossier_findsMatchesAcrossSectionsAndRanksByHitCount() {
-    val review = com.example.data.model.PaperReview(
+    val review = PaperReview(
       id = "r1",
       title = "Psychiatric Beds Review",
       abstractSummary = "Synthesizes median and IQR bed estimates.",

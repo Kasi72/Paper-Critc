@@ -2,8 +2,15 @@ package com.example.data.ai
 
 import android.graphics.Bitmap
 import android.util.Log
+import com.example.data.model.EvidenceAnchor
+import com.example.data.model.FindingStatus
 import com.example.data.model.PaperReview
+import com.example.data.model.PaperReviewRubric
 import com.example.data.model.PipelineOptions
+import com.example.data.model.ReviewFinding
+import com.example.data.model.ReviewFindingCodec
+import com.example.data.model.ReviewMode
+import com.example.util.DocumentCoverageReport
 import com.google.firebase.Firebase
 import com.google.firebase.ai.ai
 import com.google.firebase.ai.type.GenerateContentResponse
@@ -16,6 +23,7 @@ import com.google.firebase.ai.type.thinkingConfig
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlin.math.roundToInt
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.TimeoutCancellationException
@@ -29,6 +37,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import org.json.JSONArray
 import org.json.JSONObject
 
 private const val TAG = "Reviewer2Pipeline"
@@ -167,13 +176,36 @@ class Reviewer2PipelineService {
   //                Stage 02a–03c Blue Team, Assessment & Fact-Checked List v2 +
   //                Stage 04a–09c Reviewer Essay, Legal Pass, Alchemist & Copyedit
   // ============================================================================
+  private val structuredFindingItemSchema = Schema.obj(
+    properties = mapOf(
+      "id" to Schema.string(description = "Stable finding code such as M-01, Q-01, R-01, C-01"),
+      "title" to Schema.string(description = "Concise, specific finding title"),
+      "allegation" to Schema.string(description = "Exact scientific critique or verified discrepancy"),
+      "severity" to Schema.enumeration(
+        values = listOf("CRITICAL", "MAJOR", "MINOR", "INFO"),
+        description = "Severity tier"
+      ),
+      "status" to Schema.enumeration(
+        values = listOf("VERIFIED", "PARTIALLY_SUPPORTED", "CONTRADICTED", "UNVERIFIED", "NOT_APPLICABLE"),
+        description = "Verification status strictly grounded in the extracted manuscript"
+      ),
+      "pageNumber" to Schema.integer(description = "1-based page number from [PAGE N] marker where evidence appears, or 0 if not page-indexed"),
+      "section" to Schema.string(description = "Manuscript section or table/figure reference (e.g., 'Results, p. 8 / Figure 2')"),
+      "supportingQuote" to Schema.string(description = "Short VERBATIM excerpt copied directly from the manuscript text supporting the finding"),
+      "counterEvidenceQuote" to Schema.string(description = "Short VERBATIM excerpt from the manuscript that qualifies or contradicts the claim, if any"),
+      "methodologicalJustification" to Schema.string(description = "Why this matters methodologically, statistically, or clinically"),
+      "recommendedCorrection" to Schema.string(description = "Concrete erratum, sensitivity check, or revision remedy")
+    ),
+    optionalProperties = listOf("pageNumber", "section", "counterEvidenceQuote", "methodologicalJustification", "recommendedCorrection")
+  )
+
   private val pass2VerificationAndSynthesisSchema = Schema.obj(
     properties = mapOf(
       "credibilityScore" to Schema.integer(
-        description = "Calibrated overall credibility score (0 to 100) consistent with the weighted 6-axis scores and surviving verified issues"
+        description = "Calibrated overall credibility score (0 to 100) equal to 2.5*Methodology + 2.0*Significance + 1.5*Clarity + 1.5*Originality + 1.5*MathRigor + 1.0*Reproducibility"
       ),
       "refereeConfidence" to Schema.integer(
-        description = "Referee confidence on standard 1 to 5 academic peer-review scale"
+        description = "Scientific judgment confidence on standard 1 to 5 academic peer-review scale (independent of PDF extraction quality)"
       ),
       "noveltyScore" to Schema.integer(
         description = "Score from 1 to 10 for intellectual originality and contribution delta"
@@ -194,32 +226,40 @@ class Reviewer2PipelineService {
         description = "Score from 1 to 10 for policy, clinical, theoretical, or empirical significance and impact"
       ),
       "verdict" to Schema.enumeration(
-        values = listOf("ACCEPT", "MINOR_REVISION", "MAJOR_REVISION", "REJECT_AND_RESUBMIT", "REJECT"),
-        description = "Final editorial decision strictly aligned with credibilityScore and surviving [CRITICAL]/[MAJOR] issues"
+        values = listOf(
+          "HIGH_CREDIBILITY", "SOUND_WITH_CAVEATS", "REQUIRES_CORRECTION", "MAJOR_CONCERNS", "LOW_CREDIBILITY",
+          "ACCEPT", "MINOR_REVISION", "MAJOR_REVISION", "REJECT_AND_RESUBMIT", "REJECT",
+          "HIGH_CERTAINTY", "MODERATE_CERTAINTY", "LOW_CERTAINTY", "VERY_LOW_CERTAINTY"
+        ),
+        description = "Final appraisal verdict strictly matching the active ReviewMode and weighted credibility score"
       ),
       "rubricRationaleSummary" to Schema.string(
-        description = "Six concise newline-separated 1-line axis rationales prefixed exactly with [RUBRIC:Methodology], [RUBRIC:Significance], [RUBRIC:Clarity], [RUBRIC:Originality], [RUBRIC:Math], [RUBRIC:Reproducibility]"
+        description = "Six concise newline-separated rationales prefixed exactly with [RUBRIC:Methodology], [RUBRIC:Significance], [RUBRIC:Clarity], [RUBRIC:Originality], [RUBRIC:Math], [RUBRIC:Reproducibility]"
+      ),
+      "structuredFindings" to Schema.array(
+        items = structuredFindingItemSchema,
+        description = "4 to 8 prioritized, source-grounded critical appraisal findings with verbatim quotes and [PAGE N] anchors"
       ),
       "stage01eTo01fdMathAudit" to Schema.string(
         description = "Stage 01e–01fd Quantitative & Mathematical Audit: Concise newline-separated bullets auditing statistical estimators, pooling/derivation logic, bounds, assumptions, and sober verification. Never wrap plain acronyms like IQR or CI in $ signs."
       ),
       "stage01iTo01nCodeAndDataAudit" to Schema.string(
-        description = "Stage 01i–01n & 07b Reproducibility, Provenance & Methodology Audit: Domain-appropriate bullets auditing protocol registration, data extraction/code transparency, split hygiene (for ML only), and bias risks."
+        description = "Stage 01i–01n & 07b Reproducibility, Provenance & Clinical/Policy Applicability Audit: Domain-appropriate bullets auditing protocol registration, data extraction/code transparency, RoB vs quality scoring, and clinical/policy transferability."
       ),
       "stage02aNumbersCheck" to Schema.string(
-        description = "Stage 02a Numbers Verifier: Newline-separated bullets verifying reported sample/study counts, medians/IQRs, ratios, percentages, and internal numerical consistency."
+        description = "Stage 02a Numbers Verifier: Newline-separated bullets verifying reported sample/study counts, medians/IQRs, confidence intervals, ratios, percentages, and text-vs-figure consistency."
       ),
       "stage02cBlueTeamDefense" to Schema.string(
         description = "Stage 02c BLUE TEAM: Newline-separated bullets providing the strongest scholarly counterarguments defending the manuscript against each Red Team finding."
       ),
       "stage02eTo03cVerifiedListV2" to Schema.string(
-        description = "Stage 02e–03c Adjudicated Verified List v2: Each surviving issue on its OWN NEWLINE prefixed with [CRITICAL], [MAJOR], or [MINOR] (with Title, Evidence Anchor, and Required Remedy), followed by dismissed Red Team false positives each on its OWN NEWLINE prefixed with [DISMISSED]."
+        description = "Stage 02e–03c Adjudicated Verified List v2: Each surviving issue on its OWN NEWLINE prefixed with [CRITICAL], [MAJOR], or [MINOR] (with Title, [Page N] Evidence Anchor, and Required Remedy), followed by dismissed Red Team false positives each on its OWN NEWLINE prefixed with [DISMISSED]."
       ),
       "stage04aIsItCredibleEssay" to Schema.string(
         description = "Stage 04a THE REVIEWER (Stage 06 Legal-Checked): Three distinct newline-separated blocks prefixed exactly with 'Executive Assessment:', 'The Bottom Line:', and 'Future Research Agenda:'."
       ),
       "stage08aTo08bAlchemistEditorNote" to Schema.string(
-        description = "Stage 08a–08b Editor Decision Memo & Prioritized Revision Roadmap: Brief 'Editorial Decision Rationale:' paragraph followed by newline-separated action items prefixed with [MUST FIX], [SHOULD FIX], or [RECOMMENDED]."
+        description = "Stage 08a–08b Appraisal Decision Memo & Prioritized Action Roadmap: Brief 'Editorial Decision Rationale:' paragraph followed by newline-separated action items prefixed with [MUST FIX], [SHOULD FIX], or [RECOMMENDED]."
       ),
       "stage09aTo09cCopyeditReport" to Schema.string(
         description = "Stage 09a–09c Proofreader & Copyedit: Two newline-separated sections prefixed with 'Extraction / Typesetting Artifacts:' and 'Substantive Prose Improvements:' with concrete bullet points."
@@ -228,7 +268,7 @@ class Reviewer2PipelineService {
         description = "PhD-Skills Fortify: 4–5 sharp Reviewer 2 questions each on its OWN NEWLINE numbered '1. ', '2. ', '3. ', '4. ', followed by 'Recommended Sensitivity & Robustness Checks:' with 2–3 concise bullets."
       )
     ),
-    optionalProperties = listOf("refereeConfidence", "rubricRationaleSummary")
+    optionalProperties = listOf("refereeConfidence", "rubricRationaleSummary", "structuredFindings")
   )
 
   // ============================================================================
@@ -385,23 +425,16 @@ class Reviewer2PipelineService {
     )
   }
 
-  private fun condenseTextForPrompt(raw: String, maxChars: Int = 16_000): String {
-    val clean = raw.trim()
-    if (clean.length <= maxChars) return clean
-    val headLen = (maxChars * 0.62).toInt()
-    val tailLen = maxChars - headLen - 120
-    return buildString {
-      append(clean.take(headLen))
-      append("\n\n[... ${clean.length - headLen - tailLen} middle characters condensed to keep stage latency fast ...]\n\n")
-      append(clean.takeLast(tailLen.coerceAtLeast(1000)))
-    }
-  }
+  private data class ParsedJsonResult(
+    val json: JSONObject,
+    val wasRepaired: Boolean
+  )
 
-  private fun parseJsonObjectSafely(rawResponse: String): JSONObject {
+  private fun parseJsonObjectSafely(rawResponse: String): ParsedJsonResult {
     val extracted = ExternalApiGatewayClient.extractCleanJsonObject(rawResponse)
-    runCatching { return JSONObject(extracted) }
+    runCatching { return ParsedJsonResult(JSONObject(extracted), wasRepaired = false) }
 
-    // Attempt balanced repair if stream was clipped at maxOutputTokens
+    // Attempt balanced repair if stream was clipped at maxOutputTokens; mark wasRepaired = true
     val firstBrace = extracted.indexOf('{')
     if (firstBrace != -1) {
       val slice = extracted.substring(firstBrace).trimEnd()
@@ -409,6 +442,7 @@ class Reviewer2PipelineService {
       var inString = false
       var escaped = false
       var openBraces = 0
+      var openBrackets = 0
       for (ch in slice) {
         when {
           escaped -> escaped = false
@@ -416,26 +450,28 @@ class Reviewer2PipelineService {
           ch == '"' -> inString = !inString
           !inString && ch == '{' -> openBraces++
           !inString && ch == '}' -> openBraces = (openBraces - 1).coerceAtLeast(0)
+          !inString && ch == '[' -> openBrackets++
+          !inString && ch == ']' -> openBrackets = (openBrackets - 1).coerceAtLeast(0)
         }
       }
       if (inString) {
         if (escaped) repaired.append('\\')
         repaired.append('"')
       } else {
-        // Drop trailing incomplete tokens such as `, "nextKey":` before closing braces
         val trimmed = repaired.toString().trimEnd()
         if (trimmed.endsWith(",")) {
           repaired.setLength(trimmed.length - 1)
         }
       }
+      repeat(openBrackets) { repaired.append(']') }
       repeat(openBraces) { repaired.append('}') }
-      runCatching { return JSONObject(repaired.toString()) }
+      runCatching { return ParsedJsonResult(JSONObject(repaired.toString()), wasRepaired = true) }
 
-      // Fallback recovery: truncate back to the last complete comma-separated property
       val lastComma = slice.lastIndexOf(',')
       if (lastComma > 0) {
         val candidate = StringBuilder(slice.substring(0, lastComma).trimEnd())
         var cOpenBraces = 0
+        var cOpenBrackets = 0
         var cInStr = false
         var cEsc = false
         for (ch in candidate) {
@@ -445,11 +481,14 @@ class Reviewer2PipelineService {
             ch == '"' -> cInStr = !cInStr
             !cInStr && ch == '{' -> cOpenBraces++
             !cInStr && ch == '}' -> cOpenBraces = (cOpenBraces - 1).coerceAtLeast(0)
+            !cInStr && ch == '[' -> cOpenBrackets++
+            !cInStr && ch == ']' -> cOpenBrackets = (cOpenBrackets - 1).coerceAtLeast(0)
           }
         }
-        if (!cInStr && cOpenBraces > 0) {
+        if (!cInStr && (cOpenBraces > 0 || cOpenBrackets > 0)) {
+          repeat(cOpenBrackets) { candidate.append(']') }
           repeat(cOpenBraces) { candidate.append('}') }
-          runCatching { return JSONObject(candidate.toString()) }
+          runCatching { return ParsedJsonResult(JSONObject(candidate.toString()), wasRepaired = true) }
         }
       }
     }
@@ -465,7 +504,7 @@ class Reviewer2PipelineService {
       .take(maxCount)
       .mapNotNull { bmp ->
         runCatching {
-          val maxDim = 768
+          val maxDim = 1024
           if (bmp.width <= maxDim && bmp.height <= maxDim) {
             bmp
           } else {
@@ -479,13 +518,19 @@ class Reviewer2PipelineService {
       .toList()
   }
 
+  private fun isLikelyVisionPayloadError(err: Throwable?): Boolean {
+    if (err == null) return false
+    val msg = formatThrowableDetails(err).lowercase(Locale.US)
+    return msg.contains("payload") || msg.contains("413") || msg.contains("too large") ||
+      msg.contains("image") || msg.contains("multimodal") || msg.contains("unsupported mime")
+  }
+
   /**
    * Executes a structured JSON stage pass off the Main thread using unary generateContent()
-   * (avoiding Ktor SSE stream decoding issues on complex responseSchema payloads) with a
-   * live UI progress heartbeat and an automatic 3-tier fallback chain:
-   *   Tier 1: gemini-3.8-flash (responseSchema + ThinkingLevel.LOW + optional vision bitmaps)
-   *   Tier 2: gemini-3.5-flash-lite (responseSchema, text-only condensed prompt)
-   *   Tier 3: gemini-3.5-flash-lite (unconstrained plain JSON prompt, zero schema/thinking config)
+   * with a live UI progress heartbeat and an automatic 3-tier fallback chain:
+   *   Tier 1: gemini-3.8-flash (responseSchema + ThinkingLevel.LOW + up to 4 high-value vision bitmaps)
+   *   Tier 2: gemini-3.5-flash-lite (responseSchema, preserves vision bitmaps unless Tier 1 had a vision/payload error)
+   *   Tier 3: gemini-3.5-flash-lite (unconstrained plain JSON prompt)
    */
   private suspend fun executeResilientJsonPass(
     primaryModel: com.google.firebase.ai.GenerativeModel,
@@ -504,14 +549,14 @@ class Reviewer2PipelineService {
     externalSystemPrompt: String,
     autoFallbackToKeylessFirebase: Boolean,
     onStageUpdate: (stageCode: String, stageLabel: String, progress: Float) -> Unit
-  ): JSONObject = withContext(Dispatchers.IO) {
+  ): ParsedJsonResult = withContext(Dispatchers.IO) {
     suspend fun invokeUnaryTier(
       model: com.google.firebase.ai.GenerativeModel,
       promptText: String,
       bitmaps: List<Bitmap>,
       tierHint: String,
       timeoutMs: Long
-    ): JSONObject = coroutineScope {
+    ): ParsedJsonResult = coroutineScope {
       val startMs = System.currentTimeMillis()
       val heartbeatJob = launch {
         while (isActive) {
@@ -554,7 +599,7 @@ class Reviewer2PipelineService {
     // Optional external BYOK provider path
     if (useExternalProvider && externalProvider != null) {
       try {
-        val raw = withTimeout(90_000L) {
+        val raw = withTimeout(95_000L) {
           onStageUpdate(
             stageCode,
             "$stageTitle [${externalProvider.serviceName}] • Awaiting structured analysis...",
@@ -571,16 +616,19 @@ class Reviewer2PipelineService {
       } catch (e: CancellationException) {
         if (e !is TimeoutCancellationException) throw e
         if (!autoFallbackToKeylessFirebase) {
-          throw IllegalStateException("Stage $stageCode timed out after 90s on ${externalProvider.serviceName}.")
+          throw IllegalStateException(
+            "Stage $stageCode timed out after 95s on ${externalProvider.serviceName}. " +
+              "Provider fallback is disabled to protect manuscript routing privacy."
+          )
         }
-        Log.w(TAG, "External provider timed out on $stageCode; falling back to Firebase.ai", e)
+        Log.w(TAG, "External provider timed out on $stageCode; falling back to Firebase.ai (user-authorized)", e)
       } catch (e: Exception) {
         if (!autoFallbackToKeylessFirebase) throw e
-        Log.w(TAG, "External provider failed on $stageCode; falling back to Firebase.ai", e)
+        Log.w(TAG, "External provider failed on $stageCode; falling back to Firebase.ai (user-authorized)", e)
       }
     }
 
-    val safeBitmaps = sanitizeBitmapsForInference(attachedBitmaps, maxCount = 2)
+    val safeBitmaps = sanitizeBitmapsForInference(attachedBitmaps, maxCount = 4)
     var tier1Err: Throwable? = null
     var tier2Err: Throwable? = null
 
@@ -591,7 +639,7 @@ class Reviewer2PipelineService {
         promptText = primaryPrompt,
         bitmaps = safeBitmaps,
         tierHint = " [3.8 Flash]",
-        timeoutMs = 55_000L
+        timeoutMs = 70_000L
       )
     } catch (e: CancellationException) {
       if (e !is TimeoutCancellationException) throw e
@@ -602,7 +650,8 @@ class Reviewer2PipelineService {
       Log.w(TAG, "Tier 1 (3.8 Flash) failed on $stageCode: ${formatThrowableDetails(e)}", e)
     }
 
-    // TIER 2: Fast gemini-3.5-flash-lite (unary JSON + responseSchema, text-only, no thinkingConfig)
+    // TIER 2: Fast gemini-3.5-flash-lite — preserve visual bitmaps unless Tier 1 failed on a vision/payload error
+    val tier2Bitmaps = if (isLikelyVisionPayloadError(tier1Err)) emptyList() else safeBitmaps.take(2)
     onStageUpdate(
       stageCode,
       "$stageTitle • Switching to fast engine (gemini-3.5-flash-lite)...",
@@ -612,9 +661,9 @@ class Reviewer2PipelineService {
       return@withContext invokeUnaryTier(
         model = liteSchemaModel,
         promptText = compactPrompt,
-        bitmaps = emptyList(),
+        bitmaps = tier2Bitmaps,
         tierHint = " [3.5 Lite]",
-        timeoutMs = 50_000L
+        timeoutMs = 55_000L
       )
     } catch (e: CancellationException) {
       if (e !is TimeoutCancellationException) throw e
@@ -625,7 +674,7 @@ class Reviewer2PipelineService {
       Log.w(TAG, "Tier 2 (3.5 Lite schema) failed on $stageCode: ${formatThrowableDetails(e)}", e)
     }
 
-    // TIER 3: Unconstrained plain JSON fallback on gemini-3.5-flash-lite (no schema/mime constraints)
+    // TIER 3: Unconstrained plain JSON fallback on gemini-3.5-flash-lite
     onStageUpdate(
       stageCode,
       "$stageTitle • Retrying in compatibility JSON mode...",
@@ -643,7 +692,7 @@ class Reviewer2PipelineService {
         promptText = plainPrompt,
         bitmaps = emptyList(),
         tierHint = " [Compat]",
-        timeoutMs = 45_000L
+        timeoutMs = 50_000L
       )
     } catch (e: CancellationException) {
       if (e !is TimeoutCancellationException) throw e
@@ -674,10 +723,11 @@ class Reviewer2PipelineService {
     manuscriptText: String,
     replicationCodeText: String = "",
     pdfPageBitmaps: List<Bitmap> = emptyList(),
-    reviewStrictness: String = "AGGRESSIVE_REVIEWER2",
+    coverageReport: DocumentCoverageReport? = null,
+    reviewStrictness: String = "BALANCED_AREA_CHAIR",
     options: PipelineOptions,
     externalProvider: com.example.data.model.AiApiProviderEntry? = null,
-    autoFallbackToKeylessFirebase: Boolean = true,
+    autoFallbackToKeylessFirebase: Boolean = false,
     onStageUpdate: (stageCode: String, stageLabel: String, progress: Float) -> Unit
   ): PaperReview {
     val useExternalProvider = externalProvider != null &&
@@ -685,11 +735,11 @@ class Reviewer2PipelineService {
       externalProvider.apiKey.isNotBlank()
 
     // ==========================================================================
-    // PASS 0: Deterministic Forensic Pre-Flight Engine (Stage 00a / 01c / 01e / 02a)
+    // PASS 0: Deterministic Forensic Pre-Flight Engine (Full Document, Zero Middle Truncation)
     // ==========================================================================
     onStageUpdate(
       "00a-00c",
-      "Stage 00a–00c: Running Deterministic Forensic & Equation Pre-Flight Scanner...",
+      "Stage 00a–00c: Running Full-Document Forensic, Statcheck & CI Geometry Scanner...",
       0.12f
     )
     val forensicReport = withContext(Dispatchers.Default) {
@@ -701,24 +751,22 @@ class Reviewer2PipelineService {
     }
     val forensicContext = forensicReport.toStructuredPromptContext()
 
-    // ==========================================================================
-    // PASS 1: Stage 00 Metadata + Stage 01 Red Team Adversarial Attack
-    //         (01a The Breaker, 01b The Butcher, 01c The Shredder,
-    //          01d The Collector, 01g The Void)
-    // ==========================================================================
+    // Preserve the entire paper body (up to 160,000 chars primary / 90,000 chars compact);
+    // never delete the middle Methods/Results section.
+    val primaryPrepared = prepareManuscriptForPrompt(manuscriptText, maxChars = 160_000)
+    val compactPrepared = prepareManuscriptForPrompt(manuscriptText, maxChars = 90_000)
+    val pass1Bitmaps = pdfPageBitmaps.take(4)
+    val pass2Bitmaps = if (manuscriptText.trim().length < 200) pdfPageBitmaps.take(3) else pdfPageBitmaps.take(2)
+
     val providerLabel = if (useExternalProvider) {
       " [${externalProvider.serviceName} • ${externalProvider.modelId}]"
     } else {
       ""
     }
-    val condensedManuscript = condenseTextForPrompt(manuscriptText, maxChars = 14_000)
-    val compactManuscript = condenseTextForPrompt(manuscriptText, maxChars = 8_500)
-    val pass1Bitmaps = pdfPageBitmaps.take(2)
-    val pass2Bitmaps = if (manuscriptText.trim().length < 200) pdfPageBitmaps.take(1) else emptyList()
 
     onStageUpdate(
       "01a-01g",
-      "Stage 01a–01g: Executing Red Team (Breaker, Butcher, Shredder, Void)$providerLabel...",
+      "Stage 01a–01g: Executing Evidence-Grounded Critique (${options.reviewMode.shortLabel})$providerLabel...",
       0.24f
     )
 
@@ -727,7 +775,7 @@ class Reviewer2PipelineService {
       authors = authors,
       year = year,
       venueOrCitation = venueOrCitation,
-      manuscriptText = condensedManuscript,
+      manuscriptText = primaryPrepared.text,
       forensicContext = forensicContext,
       reviewStrictness = reviewStrictness,
       attachedPageCount = pass1Bitmaps.count { !it.isRecycled },
@@ -738,15 +786,15 @@ class Reviewer2PipelineService {
       authors = authors,
       year = year,
       venueOrCitation = venueOrCitation,
-      manuscriptText = compactManuscript,
-      forensicContext = forensicContext.take(2_000),
+      manuscriptText = compactPrepared.text,
+      forensicContext = forensicContext.take(4_500),
       reviewStrictness = reviewStrictness,
-      attachedPageCount = 0,
+      attachedPageCount = pass1Bitmaps.take(2).count { !it.isRecycled },
       options = options
     )
     val pass1KeysSpec = "Return ONLY a valid JSON object with exact string keys: extractedTitle, extractedAuthors, extractedYear, studyDesignType, abstractSummary, researchQuestion, keyMethodology, coreContributions, stage01aBreaker, stage01bButcher, stage01cShredder, stage01dCollector, stage01gTheVoid."
 
-    val pass1Json = executeResilientJsonPass(
+    val pass1Result = executeResilientJsonPass(
       primaryModel = pass1RedTeamModel,
       liteSchemaModel = pass1FastFallbackModel,
       plainJsonModel = pass1PlainJsonFallbackModel,
@@ -755,15 +803,16 @@ class Reviewer2PipelineService {
       plainJsonDirective = pass1KeysSpec,
       attachedBitmaps = pass1Bitmaps,
       stageCode = "01a-01g",
-      stageTitle = "Stage 01a–01g Red Team$providerLabel",
+      stageTitle = "Stage 01a–01g Appraisal$providerLabel",
       startProgress = 0.24f,
-      endProgress = 0.56f,
+      endProgress = 0.54f,
       externalProvider = externalProvider,
       useExternalProvider = useExternalProvider,
       externalSystemPrompt = pass1KeysSpec,
       autoFallbackToKeylessFirebase = autoFallbackToKeylessFirebase,
       onStageUpdate = onStageUpdate
     )
+    val pass1Json = pass1Result.json
 
     val extractedTitle = pass1Json.optString("extractedTitle", "").trim()
     val extractedAuthors = pass1Json.optString("extractedAuthors", "").trim()
@@ -840,19 +889,17 @@ class Reviewer2PipelineService {
 
     // ==========================================================================
     // PASS 2 (CONCURRENT):
-    //   • Pass 2A: Dedicated 8-Pillar Ultra-Deep Quantitative & Statistical Audit
-    //              (Stage 01e–01fd + Stage 02a Exact Numbers Forensics)
-    //   • Pass 2B: Blue Team Defense, Adjudication & Senior Editorial Synthesis
-    //              (Stage 01i–01n, 02c–03c, 04a–09c)
+    //   • Pass 2A: Specialist 8-Pillar Quantitative & Statistical Audit
+    //   • Pass 2B: Source-Grounded Verification, Structured Findings & Synthesis
     // ==========================================================================
     onStageUpdate(
       "01e-03c",
       if (options.enableMathAudit) {
-        "Stage 01e–03c: Running Deep Quantitative/Statistical Audit & Blue Team Adjudication$providerLabel..."
+        "Stage 01e–03c: Running Deep Quantitative Audit & Source-Grounded Verification$providerLabel..."
       } else {
-        "Stage 02a–03c: Running Blue Team Defense & Calibrated Adjudication$providerLabel..."
+        "Stage 02a–03c: Running Blue Team Defense & Source-Grounded Adjudication$providerLabel..."
       },
-      0.58f
+      0.56f
     )
 
     val pass2Prompt = buildPass2VerificationPrompt(
@@ -861,11 +908,11 @@ class Reviewer2PipelineService {
       year = resolvedYear,
       venueOrCitation = resolvedVenue,
       studyDesignLabel = extractedDesign,
-      manuscriptText = condensedManuscript,
-      replicationCodeText = replicationCodeText.take(5_000),
+      manuscriptText = primaryPrepared.text,
+      replicationCodeText = replicationCodeText.take(12_000),
       forensicContext = forensicContext,
       coreContributions = coreContributions,
-      compiledRedTeamReport = compiledRedTeamReport.take(5_000),
+      compiledRedTeamReport = compiledRedTeamReport.take(6_500),
       reviewStrictness = reviewStrictness,
       options = options
     )
@@ -875,19 +922,19 @@ class Reviewer2PipelineService {
       year = resolvedYear,
       venueOrCitation = resolvedVenue,
       studyDesignLabel = extractedDesign,
-      manuscriptText = compactManuscript,
-      replicationCodeText = replicationCodeText.take(2_500),
-      forensicContext = forensicContext.take(2_200),
-      coreContributions = coreContributions.take(1_200),
-      compiledRedTeamReport = compiledRedTeamReport.take(3_200),
+      manuscriptText = compactPrepared.text,
+      replicationCodeText = replicationCodeText.take(5_000),
+      forensicContext = forensicContext.take(4_500),
+      coreContributions = coreContributions.take(1_800),
+      compiledRedTeamReport = compiledRedTeamReport.take(4_500),
       reviewStrictness = reviewStrictness,
       options = options
     )
-    val pass2KeysSpec = "Return ONLY a valid JSON object with exact keys: credibilityScore (int 0-100), refereeConfidence (int 1-5), noveltyScore (int 1-10), methodologyScore (int 1-10), mathRigorScore (int 1-10), reproducibilityScore (int 1-10), clarityScore (int 1-10), significanceScore (int 1-10), verdict (ACCEPT|MINOR_REVISION|MAJOR_REVISION|REJECT_AND_RESUBMIT|REJECT), rubricRationaleSummary, stage01eTo01fdMathAudit, stage01iTo01nCodeAndDataAudit, stage02aNumbersCheck, stage02cBlueTeamDefense, stage02eTo03cVerifiedListV2, stage04aIsItCredibleEssay, stage08aTo08bAlchemistEditorNote, stage09aTo09cCopyeditReport, fortifyReviewerQuestions."
+    val pass2KeysSpec = "Return ONLY a valid JSON object with exact keys: credibilityScore (int 0-100), refereeConfidence (int 1-5), noveltyScore (int 1-10), methodologyScore (int 1-10), mathRigorScore (int 1-10), reproducibilityScore (int 1-10), clarityScore (int 1-10), significanceScore (int 1-10), verdict, rubricRationaleSummary, structuredFindings (array of objects with id, title, allegation, severity, status, pageNumber, section, supportingQuote, counterEvidenceQuote, methodologicalJustification, recommendedCorrection), stage01eTo01fdMathAudit, stage01iTo01nCodeAndDataAudit, stage02aNumbersCheck, stage02cBlueTeamDefense, stage02eTo03cVerifiedListV2, stage04aIsItCredibleEssay, stage08aTo08bAlchemistEditorNote, stage09aTo09cCopyeditReport, fortifyReviewerQuestions."
 
     val quantKeysSpec = "Return ONLY a valid JSON object with exact keys: quantitativeRigorScore (int 1-10), estimatorAndModelAudit, numericAndStatcheckAudit, powerAndMultiplicityAudit, biasHeterogeneityAudit, formalMathRederivation, quantAuditMatrixRows, sensitivityPrescriptions, soberVerificationSummary."
 
-    val (pass2Json, quantJsonOrNull) = coroutineScope {
+    val (pass2Result, quantResultOrNull) = coroutineScope {
       val quantDeferred = if (options.enableMathAudit) {
         async {
           runCatching {
@@ -895,20 +942,20 @@ class Reviewer2PipelineService {
               title = resolvedTitle,
               studyDesignLabel = extractedDesign,
               studyDesignArchetype = forensicReport.studyDesign,
-              manuscriptText = condensedManuscript,
-              replicationCodeText = replicationCodeText.take(4_000),
+              manuscriptText = primaryPrepared.text,
+              replicationCodeText = replicationCodeText.take(8_000),
               forensicReport = forensicReport,
-              redTeamExcerpt = compiledRedTeamReport.take(2_800),
+              redTeamExcerpt = compiledRedTeamReport.take(3_500),
               reviewStrictness = reviewStrictness
             )
             val quantCompactPrompt = buildPass2QuantAuditPrompt(
               title = resolvedTitle,
               studyDesignLabel = extractedDesign,
               studyDesignArchetype = forensicReport.studyDesign,
-              manuscriptText = compactManuscript,
-              replicationCodeText = replicationCodeText.take(1_800),
+              manuscriptText = compactPrepared.text,
+              replicationCodeText = replicationCodeText.take(4_000),
               forensicReport = forensicReport,
-              redTeamExcerpt = compiledRedTeamReport.take(1_600),
+              redTeamExcerpt = compiledRedTeamReport.take(2_400),
               reviewStrictness = reviewStrictness
             )
             executeResilientJsonPass(
@@ -921,7 +968,7 @@ class Reviewer2PipelineService {
               attachedBitmaps = pass2Bitmaps,
               stageCode = "01e-01fd",
               stageTitle = "Stage 01e–01fd Deep Quantitative Audit",
-              startProgress = 0.58f,
+              startProgress = 0.56f,
               endProgress = 0.88f,
               externalProvider = externalProvider,
               useExternalProvider = useExternalProvider,
@@ -952,8 +999,8 @@ class Reviewer2PipelineService {
           } else {
             "Stage 02a–09c Verification & Synthesis$providerLabel"
           },
-          startProgress = 0.58f,
-          endProgress = 0.91f,
+          startProgress = 0.56f,
+          endProgress = 0.90f,
           externalProvider = externalProvider,
           useExternalProvider = useExternalProvider,
           externalSystemPrompt = pass2KeysSpec,
@@ -967,56 +1014,82 @@ class Reviewer2PipelineService {
       synth to quant
     }
 
+    val pass2Json = pass2Result.json
+    val quantJsonOrNull = quantResultOrNull?.json
+
     onStageUpdate(
       "04a-09c",
-      "Stage 04a–09c: 'Is It Credible?' Reviewer Essay, Stage 06 Legal Pass & Alchemist...",
+      "Stage 04a–09c: Running Cross-Pass Source Adjudication & Rubric Reconciliation...",
       0.93f
     )
 
-    val noveltyScore = pass2Json.optInt("noveltyScore", 7).coerceIn(1, 10)
-    val methodologyScore = pass2Json.optInt("methodologyScore", 7).coerceIn(1, 10)
+    val rawNoveltyScore = pass2Json.optInt("noveltyScore", 7).coerceIn(1, 10)
+    val rawMethodologyScore = pass2Json.optInt("methodologyScore", 7).coerceIn(1, 10)
     val pass2MathScore = pass2Json.optInt("mathRigorScore", 7).coerceIn(1, 10)
     val specialistQuantScore = quantJsonOrNull?.optInt("quantitativeRigorScore", -1)?.takeIf { it in 1..10 }
-    val mathRigorScore = if (specialistQuantScore != null) {
-      ((pass2MathScore + specialistQuantScore * 2) / 3.0).toInt().coerceIn(1, 10)
+    val reconciledMathScore = if (specialistQuantScore != null) {
+      ((pass2MathScore + specialistQuantScore * 2) / 3.0).roundToInt().coerceIn(1, 10)
     } else {
       pass2MathScore
     }
-    val reproducibilityScore = pass2Json.optInt("reproducibilityScore", 6).coerceIn(1, 10)
-    val clarityScore = pass2Json.optInt("clarityScore", 8).coerceIn(1, 10)
-    val significanceScore = pass2Json.optInt("significanceScore", 7).coerceIn(1, 10)
+    val rawReproducibilityScore = pass2Json.optInt("reproducibilityScore", 6).coerceIn(1, 10)
+    val rawClarityScore = pass2Json.optInt("clarityScore", 8).coerceIn(1, 10)
+    val rawSignificanceScore = pass2Json.optInt("significanceScore", 7).coerceIn(1, 10)
     val refereeConfidence = pass2Json.optInt("refereeConfidence", 4).coerceIn(1, 5)
 
-    // Calibrate overall credibilityScore so it stays mathematically coherent with the 6-axis weighted rubric
-    val weightedRubricScore = (
-      methodologyScore * 2.5 +
-        significanceScore * 2.0 +
-        clarityScore * 1.5 +
-        noveltyScore * 1.5 +
-        mathRigorScore * 1.5 +
-        reproducibilityScore * 1.0
-      ).toInt().coerceIn(0, 100)
-    val rawCredibility = pass2Json.optInt("credibilityScore", weightedRubricScore).coerceIn(0, 100)
-    val credibilityScore = if (kotlin.math.abs(rawCredibility - weightedRubricScore) > 10) {
-      ((rawCredibility + weightedRubricScore) / 2).toLong().coerceIn(0L, 100L)
-    } else {
-      rawCredibility.toLong()
-    }
+    // Parse LLM structuredFindings and run deterministic cross-pass adjudication + source-quote verification
+    val rawStructuredFindings = parseStructuredFindingsFromJson(pass2Json.optJSONArray("structuredFindings"))
+    val adjudicated = adjudicateFindingsAndScores(
+      rawFindings = rawStructuredFindings,
+      manuscriptText = manuscriptText,
+      forensicReport = forensicReport,
+      methodologyScore = rawMethodologyScore,
+      significanceScore = rawSignificanceScore,
+      clarityScore = rawClarityScore,
+      originalityScore = rawNoveltyScore,
+      mathRigorScore = reconciledMathScore,
+      reproducibilityScore = rawReproducibilityScore,
+      rawVerdict = pass2Json.optString("verdict", ""),
+      reviewMode = options.reviewMode
+    )
 
-    val rawVerdict = pass2Json.optString("verdict", "MAJOR_REVISION").trim().uppercase(Locale.US)
-    val verdict = if (rawVerdict in setOf("ACCEPT", "MINOR_REVISION", "MAJOR_REVISION", "REJECT_AND_RESUBMIT", "REJECT")) {
-      rawVerdict
-    } else {
-      when {
-        credibilityScore >= 85 -> "ACCEPT"
-        credibilityScore >= 72 -> "MINOR_REVISION"
-        credibilityScore >= 55 -> "MAJOR_REVISION"
-        credibilityScore >= 40 -> "REJECT_AND_RESUBMIT"
-        else -> "REJECT"
+    val credibilityScore = adjudicated.weightedCredibilityScore.toLong()
+    val verdict = adjudicated.resolvedVerdict
+    val structuredFindingsJson = ReviewFindingCodec.encode(adjudicated.adjudicatedFindings)
+
+    // Determine separated extractionConfidence & validationStatus transparently
+    val extractionConfidence = coverageReport?.extractionConfidence ?: when {
+      manuscriptText.length >= 4_000 -> 5
+      manuscriptText.length >= 1_200 -> 4
+      manuscriptText.length >= 300 -> 3
+      else -> 2
+    }
+    val anyJsonRepaired = pass1Result.wasRepaired || pass2Result.wasRepaired || (quantResultOrNull?.wasRepaired == true)
+    val validationStatus = when {
+      anyJsonRepaired -> "PARTIALLY_VALIDATED"
+      primaryPrepared.wasTrimmed || extractionConfidence <= 2 -> "PARTIALLY_VALIDATED"
+      adjudicated.adjudicatedFindings.any { it.status == FindingStatus.CONTRADICTED || it.status == FindingStatus.UNVERIFIED } ->
+        "ADJUDICATED_WITH_CAVEATS"
+      else -> "VERIFIED"
+    }
+    val coverageDisclosure = buildString {
+      if (coverageReport != null) {
+        append(coverageReport.toDisclosureLine())
+      } else {
+        val wordCnt = if (manuscriptText.isBlank()) 0 else manuscriptText.trim().split(Regex("""\s+""")).size
+        append("Direct text input • %,d words • %,d chars • Extraction Confidence: %d/5".format(Locale.US, wordCnt, manuscriptText.length, extractionConfidence))
+      }
+      if (primaryPrepared.wasTrimmed && primaryPrepared.trimmedNote.isNotBlank()) {
+        append(" • ${primaryPrepared.trimmedNote}")
+      }
+      if (anyJsonRepaired) {
+        append(" • Note: Partial JSON repair applied on an AI stage; inspect findings carefully.")
       }
     }
 
     val rubricRationaleSummary = pass2Json.optString("rubricRationaleSummary", "").trim()
+    val parsedRationales = extractRubricRationales(rubricRationaleSummary)
+
     val stage01eTo01fdMathAudit = com.example.util.DossierFormattingEngine.cleanAcademicProse(
       pass2Json.optString("stage01eTo01fdMathAudit", "")
     )
@@ -1045,10 +1118,51 @@ class Reviewer2PipelineService {
       pass2Json.optString("fortifyReviewerQuestions", "")
     )
 
+    val methodologyJustification = parsedRationales["methodology"]
+      ?: "Evaluated design rigor, bias controls, and synthesis alignment (${forensicReport.studyDesign.riskOfBiasInstrument})."
+    val significanceJustification = parsedRationales["significance"]
+      ?: "Evaluated scientific contribution, generalizability, and clinical/policy utility."
+    val clarityJustification = parsedRationales["clarity"]
+      ?: "Evaluated reporting completeness (${forensicReport.studyDesign.reportingGuideline}), structure, and table/text precision."
+    val originalityJustification = parsedRationales["originality"]
+      ?: "Evaluated originality of the research question, dataset scope, and analytical contribution."
+    val mathRigorJustification = parsedRationales["math"]
+      ?: "Evaluated statistical estimation, CI geometry, heterogeneity/variance reporting, and numerical consistency."
+    val reproducibilityJustification = parsedRationales["reproducibility"]
+      ?: "Evaluated protocol transparency, search/code provenance, and replication readiness."
+
     val compiledBlueTeamCascade = buildString {
       appendLine("[STAGE 02e–03c — ADJUDICATED FINDINGS MATRIX & VERIFIED LIST v2]")
-      appendLine(stage02eTo03cVerifiedListV2.trim())
-      appendLine()
+      if (adjudicated.adjudicatedFindings.isNotEmpty()) {
+        adjudicated.adjudicatedFindings.forEach { f ->
+          val badge = when (f.status) {
+            FindingStatus.CONTRADICTED -> "[DISMISSED]"
+            else -> "[${f.severity}]"
+          }
+          val pg = f.supportingEvidence.firstOrNull()?.pageNumber?.takeIf { it > 0 }?.let { " (Page $it)" } ?: ""
+          appendLine("$badge [${f.id} • ${f.status.displayBadge}]$pg ${f.title} — ${f.allegation}")
+          val quote = f.supportingEvidence.firstOrNull()?.exactQuote?.trim().orEmpty()
+          if (quote.isNotBlank()) {
+            appendLine("• Source Quote$pg: \"$quote\"")
+          }
+          val counter = f.counterEvidence.firstOrNull()?.exactQuote?.trim().orEmpty()
+          if (counter.isNotBlank()) {
+            val cpg = f.counterEvidence.firstOrNull()?.pageNumber?.takeIf { it > 0 }?.let { " (Page $it)" } ?: ""
+            appendLine("• Counterevidence$cpg: \"$counter\"")
+          }
+          if (f.verificationNotes.isNotBlank()) {
+            appendLine("• Verification Audit: ${f.verificationNotes}")
+          }
+          if (f.recommendedCorrection.isNotBlank() && f.status != FindingStatus.CONTRADICTED) {
+            appendLine("• Recommended Remedy: ${f.recommendedCorrection}")
+          }
+        }
+        appendLine()
+      }
+      if (stage02eTo03cVerifiedListV2.isNotBlank()) {
+        appendLine(stage02eTo03cVerifiedListV2.trim())
+        appendLine()
+      }
       appendLine("[STAGE 02a — QUANTITATIVE & NUMBERS VERIFICATION]")
       appendLine(stage02aNumbersCheck.trim())
       appendLine()
@@ -1062,7 +1176,7 @@ class Reviewer2PipelineService {
         quantJson = quantJsonOrNull,
         fallbackMathAudit = stage01eTo01fdMathAudit,
         fallbackNumbersCheck = stage02aNumbersCheck,
-        calibratedQuantScore = mathRigorScore
+        calibratedQuantScore = adjudicated.mathRigorScore
       )
     } else {
       "Quantitative, Statistical & Mathematical Audit (Stages 01e–01fd) skipped by user configuration."
@@ -1077,6 +1191,13 @@ class Reviewer2PipelineService {
           }
           appendLine()
         }
+        if (forensicReport.clinicalApplicabilityNotes.isNotEmpty()) {
+          appendLine("[CLINICAL & POLICY APPLICABILITY LENS]")
+          forensicReport.clinicalApplicabilityNotes.forEach { note ->
+            appendLine("• $note")
+          }
+          appendLine()
+        }
         appendLine("[STAGE 01i–01n & 07b — REPRODUCIBILITY, PROVENANCE & METHODOLOGY X-RAY]")
         appendLine(stage01iTo01nCodeAndDataAudit.trim())
       }.trim()
@@ -1085,20 +1206,25 @@ class Reviewer2PipelineService {
     }
 
     val compiledEditorAndReviewerNote = buildString {
-      appendLine("[6-AXIS CALIBRATED SCORECARD: Credibility=$credibilityScore/100 | Methodology=$methodologyScore/10 | Clarity=$clarityScore/10 | Significance=$significanceScore/10 | Novelty=$noveltyScore/10 | Math=$mathRigorScore/10 | Reproducibility=$reproducibilityScore/10]")
-      appendLine("[CONFIDENCE:$refereeConfidence/5]")
-      if (rubricRationaleSummary.isNotBlank()) {
-        rubricRationaleSummary.lines()
-          .map { it.trim() }
-          .filter { it.startsWith("[RUBRIC:", ignoreCase = true) }
-          .forEach { appendLine(it) }
-      }
+      appendLine(
+        "[6-AXIS CALIBRATED SCORECARD: Credibility=$credibilityScore/100 | " +
+          "Methodology=${adjudicated.methodologyScore}/10 | Significance=${adjudicated.significanceScore}/10 | " +
+          "Clarity=${adjudicated.clarityScore}/10 | Novelty=${adjudicated.originalityScore}/10 | " +
+          "Math=${adjudicated.mathRigorScore}/10 | Reproducibility=${adjudicated.reproducibilityScore}/10]"
+      )
+      appendLine("[CONFIDENCE:$refereeConfidence/5] [EXTRACTION_CONFIDENCE:$extractionConfidence/5] [MODE:${options.reviewMode.name}] [STATUS:$validationStatus]")
+      appendLine("[RUBRIC:Methodology] $methodologyJustification")
+      appendLine("[RUBRIC:Significance] $significanceJustification")
+      appendLine("[RUBRIC:Clarity] $clarityJustification")
+      appendLine("[RUBRIC:Originality] $originalityJustification")
+      appendLine("[RUBRIC:Math] $mathRigorJustification")
+      appendLine("[RUBRIC:Reproducibility] $reproducibilityJustification")
       appendLine()
       appendLine("[STAGE 04a — 'IS IT CREDIBLE?' ASSESSMENT & BOTTOM LINE (Stage 06 Legal-Checked)]")
       appendLine(stage04aIsItCredibleEssay.trim())
       if (options.enableEditorNote) {
         appendLine()
-        appendLine("[STAGE 08a–08b — SENIOR EDITOR DECISION MEMO & PRIORITIZED REVISION ROADMAP]")
+        appendLine("[STAGE 08a–08b — APPRAISAL DECISION MEMO & PRIORITIZED ACTION ROADMAP]")
         appendLine(stage08aTo08bAlchemistEditorNote.trim())
       }
     }.trim()
@@ -1112,7 +1238,7 @@ class Reviewer2PipelineService {
       "Author-Facing Proofreading & Copyedit (Stages 09a–09c) skipped by user configuration."
     }
 
-    onStageUpdate("10_render", "Stage 07 & 10: Formatting 'IS IT CREDIBLE?' Plain-Text Dossier...", 0.96f)
+    onStageUpdate("10_render", "Stage 07 & 10: Assembling Evidence-Grounded Appraisal Dossier...", 0.97f)
 
     val formattedDossier = renderPlainTextDossier(
       title = resolvedTitle,
@@ -1121,11 +1247,11 @@ class Reviewer2PipelineService {
       venueOrCitation = resolvedVenue,
       isEmpirical = options.isEmpirical,
       credibilityScore = credibilityScore,
-      noveltyScore = noveltyScore,
-      methodologyScore = methodologyScore,
-      mathRigorScore = mathRigorScore,
-      reproducibilityScore = reproducibilityScore,
-      clarityScore = clarityScore,
+      noveltyScore = adjudicated.originalityScore,
+      methodologyScore = adjudicated.methodologyScore,
+      mathRigorScore = adjudicated.mathRigorScore,
+      reproducibilityScore = adjudicated.reproducibilityScore,
+      clarityScore = adjudicated.clarityScore,
       verdict = verdict,
       forensicReport = forensicReport,
       abstractSummary = abstractSummary,
@@ -1141,7 +1267,7 @@ class Reviewer2PipelineService {
       reviewerQuestions = fortifyReviewerQuestions
     )
 
-    onStageUpdate("DONE", "30-Stage Dossier Complete", 1.0f)
+    onStageUpdate("DONE", "Appraisal Dossier Complete", 1.0f)
 
     return PaperReview(
       title = resolvedTitle,
@@ -1151,6 +1277,24 @@ class Reviewer2PipelineService {
       isEmpirical = options.isEmpirical,
       credibilityScore = credibilityScore,
       verdict = verdict,
+      methodologyScore = adjudicated.methodologyScore,
+      significanceScore = adjudicated.significanceScore,
+      clarityScore = adjudicated.clarityScore,
+      originalityScore = adjudicated.originalityScore,
+      mathRigorScore = adjudicated.mathRigorScore,
+      reproducibilityScore = adjudicated.reproducibilityScore,
+      methodologyJustification = methodologyJustification,
+      significanceJustification = significanceJustification,
+      clarityJustification = clarityJustification,
+      originalityJustification = originalityJustification,
+      mathRigorJustification = mathRigorJustification,
+      reproducibilityJustification = reproducibilityJustification,
+      refereeConfidence = refereeConfidence,
+      extractionConfidence = extractionConfidence,
+      reviewMode = options.reviewMode.name,
+      coverageDisclosure = coverageDisclosure,
+      validationStatus = validationStatus,
+      structuredFindingsJson = structuredFindingsJson,
       abstractSummary = abstractSummary,
       researchQuestion = researchQuestion,
       keyMethodology = keyMethodology,
@@ -1473,24 +1617,34 @@ class Reviewer2PipelineService {
     options: PipelineOptions
   ): String {
     val trackDescription = if (options.isEmpirical) {
-      "EMPIRICAL MANUSCRIPT — Execute full Stage 01a (The Breaker), Stage 01b (The Butcher), Stage 01c (The Shredder), Stage 01d (The Collector), and Stage 01g (The Void)."
+      "EMPIRICAL MANUSCRIPT — Execute Stage 01a (Conceptual Foundations), Stage 01b (Design, Identification & Construct Validity), Stage 01c (Procedural & Sample/Protocol Audit), Stage 01d (Tables, Figures & Cross-References), and Stage 01g (Unmeasured Confounds & External Validity)."
     } else {
-      "THEORETICAL / FORMAL MANUSCRIPT — Execute Stage 01a (The Breaker), Stage 01a_2 (Non-Empirical Formal Deep-Dive in place of 01b), Stage 01c (The Shredder on proof/definition consistency), Stage 01d (The Collector), and Stage 01g (The Void)."
+      "THEORETICAL / FORMAL MANUSCRIPT — Execute Stage 01a (Foundations), Stage 01a_2 (Formal Deep-Dive), Stage 01c (Proof/Definition Consistency), Stage 01d (Cross-References), and Stage 01g (Boundary Conditions)."
+    }
+
+    val modeDirective = when (options.reviewMode) {
+      ReviewMode.POST_PUBLICATION_APPRAISAL ->
+        "APPRAISAL MODE: POST-PUBLICATION CRITICAL APPRAISAL. This work may already be published; evaluate methodological rigor, factual/numerical accuracy (including potential errata), strength of evidence, and practical applicability rather than framing feedback as a journal rejection letter."
+      ReviewMode.CLINICAL_EVIDENCE_APPRAISAL ->
+        "APPRAISAL MODE: CLINICAL & POLICY EVIDENCE APPRAISAL. Prioritize clinical/policy utility, patient/population representativeness, harms vs. benefits, resource-constrained/LMIC transferability, and GRADE certainty of evidence."
+      ReviewMode.JOURNAL_REFEREE ->
+        "APPRAISAL MODE: JOURNAL PEER-REVIEW REFEREE. Evaluate submission readiness, methodological validity, and concrete revision requirements for publication."
     }
 
     val strictnessDirective = when (reviewStrictness) {
       "CONSTRUCTIVE_MENTOR" ->
-        "Maintain high analytical rigor while framing each Red Team critique clearly so the author can diagnose and repair it."
-      "BALANCED_AREA_CHAIR" ->
-        "Operate at Senior Area Chair rigor: uncompromising on identification, leakage, and math errors, while proportionate on minor stylistic items."
+        "Maintain high analytical rigor while framing each critique clearly and proportionally so researchers can verify and address it."
+      "AGGRESSIVE_REVIEWER2" ->
+        "Adopt an exacting, skeptical Reviewer 2 posture: interrogate every assumption, table, figure, and calculation—while strictly adhering to verified evidence from the manuscript text (never fabricate omissions)."
       else ->
-        "Adopt the authentic 'Yell at It / Reviewer 2' hostile adversarial Red Team posture: assume zero benefit of the doubt, interrogate every assumption, table, equation, and split, and surface every candidate flaw for downstream verification."
+        "Operate at Senior Statistical Editor & Area Chair rigor: strictly evidence-grounded, uncompromising on verified arithmetic/methodological flaws, and proportionate on minor reporting items."
     }
 
     return """
-      You are PASS 1 (Stage 00 Ingestion + Stage 01 Adversarial Red Team) of the upgraded 'isitcredible/reviewer2' & 'phd-skills' peer-review engine.
+      You are PASS 1 (Stage 00 Ingestion + Stage 01 Candidate Critique) of Paper Critic, a publication-grade critical appraisal engine.
+      $modeDirective
       $strictnessDirective
-      ${if (attachedPageCount > 0) "IMPORTANT: $attachedPageCount rendered PDF page images are attached. Visually inspect titles, authors, equations, tables, figures, and footnotes directly alongside the extracted text." else ""}
+      ${if (attachedPageCount > 0) "IMPORTANT: $attachedPageCount rendered PDF page images are attached. Visually inspect titles, authors, equations, tables, figures, and footnotes directly alongside the [PAGE N]-anchored text." else ""}
 
       MANUSCRIPT METADATA HINTS (VERIFY & OVERRIDE FROM PAPER IF BLANK OR RAW FILENAME):
       - Title Hint: ${title.ifBlank { "Extract exact title from manuscript" }}
@@ -1501,29 +1655,26 @@ class Reviewer2PipelineService {
 
       $forensicContext
 
-      STRICT EDITORIAL STRUCTURE & TYPOGRAPHY CONTRACT:
-      - DOMAIN PRECISION: Strictly apply the Detected Study Design audit standards above. NEVER inject irrelevant critiques (e.g., do NOT ask a bibliographic systematic review/meta-analysis for ML random seeds or neural network train/test splits).
-      - CLEAN TYPOGRAPHY: NEVER wrap plain abbreviations or units (IQR, IQRs, CI, SD, OR, RR, HIC, LMIC, PRISMA, PROSPERO) in LaTeX $ dollar signs. Use crisp Unicode symbols (≤, ≥, ±, ×, κ, I², τ², β) in prose.
-      - STRUCTURED NEWLINE BULLETS: Put EVERY contribution ([C1], [C2], [C3]) and EVERY Red Team finding (• [RT-1] ..., • [RT-2] ...) on its OWN NEWLINE (\n). Never run multiple numbered points together into one paragraph.
+      CRITICAL EVIDENCE-GROUNDING RULES (NON-NEGOTIABLE):
+      1. NEVER CLAIM AN ABSENCE WITHOUT CHECKING THE FULL TEXT: Before claiming that random-effects pooling, I², meta-regression, quality appraisal, or independent extraction is "missing", verify across ALL [PAGE N] sections, tables, and figures. If the paper used a quality-scoring scheme rather than a validated RoB tool (e.g., RoB 2/NOS/JBI), critique the *choice of instrument* accurately—do NOT falsely claim quality appraisal was absent.
+      2. DISTINGUISH REPORTING GUIDELINES vs. RISK-OF-BIAS TOOLS vs. CERTAINTY FRAMEWORKS (e.g., PRISMA is a reporting guideline, NOT a bias tool; GRADE assesses certainty of evidence).
+      3. CITE EXACT [PAGE N] ANCHORS AND VERBATIM NUMBERS whenever flagging discrepancies (e.g., text-vs-figure confidence interval mismatches).
+      4. CLEAN TYPOGRAPHY: NEVER wrap plain abbreviations or units (IQR, CI, SD, OR, RR, HIC, LMIC, PRISMA, PROSPERO) in LaTeX $ dollar signs. Use crisp Unicode symbols (≤, ≥, ±, ×, κ, I², τ², β) in prose.
+      5. STRUCTURED NEWLINE BULLETS: Put EVERY contribution ([C1], [C2], [C3]) and EVERY finding (• [RT-1] ..., • [RT-2] ...) on its OWN NEWLINE (\n).
 
       EXECUTE STAGES 00a–01g WITH SURGICAL PRECISION:
       1. STAGE 00a–00b (Canonical Metadata, Executive Summary, Research Question & Methodology):
-         - Extract `extractedTitle` (proper Title Case), `extractedAuthors` (real authors from paper), `extractedYear`, and `studyDesignType`.
+         - Extract `extractedTitle` (proper Title Case), `extractedAuthors`, `extractedYear`, and `studyDesignType`.
          - Write a concise, exact executive summary, primary research question, and bulleted methodology.
       2. STAGE 00c (Claimed Contributions):
          - Enumerate concrete claimed contributions on separate lines: [C1] ..., [C2] ..., [C3] ...
-      3. STAGE 01a — THE BREAKER (Theoretical & Conceptual Foundations):
-         - 2–3 newline-separated bullets (`• [RT-1] ...`) attacking conceptual definitions, core assumptions, and framing validity.
-      4. STAGE 01b — THE BUTCHER (Design, Identification / Synthesis & Construct Validity):
-         - 2–3 newline-separated bullets (`• [RT-2] ...`) dissecting construct-to-measure mapping, pooling/identification validity, heterogeneity, confounders, or baseline fairness.
-      5. STAGE 01c — THE SHREDDER (Procedural, Sample & Protocol Rigor):
-         - 2–3 newline-separated bullets (`• [RT-3] ...`) auditing study/sample counts, screening/split rigor, attrition, risk-of-bias/protocol registration, and internal numeric alignment.
-      6. STAGE 01d — THE COLLECTOR (Tables, Footnotes & Missingness Disclosures):
-         - 2–3 newline-separated bullets (`• [RT-4] ...`) inspecting table structure, weighting disclosures, missing data ('ND'), and cross-reference accuracy.
-      7. STAGE 01g — THE VOID (Omissions, Confounds & External Validity):
-         - 2–3 newline-separated bullets (`• [RT-5] ...`) exposing omitted outcomes, unmeasured confounds, geographic/demographic skew, and generalizability boundaries.
+      3. STAGE 01a — CONCEPTUAL & THEORETICAL FOUNDATIONS: 2–3 newline bullets (`• [RT-1] ...`).
+      4. STAGE 01b — DESIGN, IDENTIFICATION / SYNTHESIS & CONSTRUCT VALIDITY: 2–3 newline bullets (`• [RT-2] ...`).
+      5. STAGE 01c — PROCEDURAL, SAMPLE & PROTOCOL RIGOR: 2–3 newline bullets (`• [RT-3] ...`).
+      6. STAGE 01d — TABLES, FIGURES, FOOTNOTES & TEXT-VS-FIGURE CONSISTENCY: 2–3 newline bullets (`• [RT-4] ...`).
+      7. STAGE 01g — OMISSIONS, CONFOUNDS & CLINICAL/POLICY EXTERNAL VALIDITY: 2–3 newline bullets (`• [RT-5] ...`).
 
-      MANUSCRIPT TEXT:
+      MANUSCRIPT TEXT (WITH [PAGE N] COORDINATES):
       $manuscriptText
     """.trimIndent()
   }
@@ -1542,14 +1693,24 @@ class Reviewer2PipelineService {
     reviewStrictness: String,
     options: PipelineOptions
   ): String {
+    val verdictScaleGuidance = when (options.reviewMode) {
+      ReviewMode.POST_PUBLICATION_APPRAISAL ->
+        "ReviewMode = POST_PUBLICATION_APPRAISAL. Choose `verdict` ONLY from: HIGH_CREDIBILITY (≥85), SOUND_WITH_CAVEATS (70–84), REQUIRES_CORRECTION (55–69 or verified factual/numerical erratum), MAJOR_CONCERNS (40–54), LOW_CREDIBILITY (<40)."
+      ReviewMode.CLINICAL_EVIDENCE_APPRAISAL ->
+        "ReviewMode = CLINICAL_EVIDENCE_APPRAISAL. Choose `verdict` ONLY from: HIGH_CERTAINTY (≥85), MODERATE_CERTAINTY (68–84), LOW_CERTAINTY (48–67), VERY_LOW_CERTAINTY (<48)."
+      ReviewMode.JOURNAL_REFEREE ->
+        "ReviewMode = JOURNAL_REFEREE. Choose `verdict` ONLY from: ACCEPT (≥85), MINOR_REVISION (72–84), MAJOR_REVISION (55–71), REJECT_AND_RESUBMIT (40–54), REJECT (<40)."
+    }
+
     return """
-      You are PASS 2 (Verification Cascade, Adjudication & Senior Editorial Synthesis) of the upgraded 'isitcredible/reviewer2' & 'phd-skills' peer-review engine.
+      You are PASS 2 (Source-Grounded Verification, Cross-Pass Adjudication & Senior Synthesis) of Paper Critic.
 
       MANUSCRIPT:
       - Title: ${title.ifBlank { "Untitled Academic Manuscript" }}
       - Authors: ${authors.ifBlank { "Authors Not Disclosed" }} ($year)
       - Study Design: $studyDesignLabel
       - Venue: ${venueOrCitation.ifBlank { options.targetVenue }}
+      - Active Appraisal Mode: ${options.reviewMode.displayTitle}
       - Strictness Calibration: $reviewStrictness
 
       $forensicContext
@@ -1557,32 +1718,37 @@ class Reviewer2PipelineService {
       STAGE 00c CLAIMED CONTRIBUTIONS:
       $coreContributions
 
-      STAGE 01 RED TEAM CANDIDATE FINDINGS (FROM PASS 1):
+      STAGE 01 CANDIDATE CRITIQUE FINDINGS (FROM PASS 1 — VERIFY OR DISMISS AGAINST SOURCE TEXT):
       $compiledRedTeamReport
 
-      MANDATORY COHERENCE, SCORING & FORMATTING CONTRACT:
-      1. STRICT SCORE-VERDICT-SEVERITY COHERENCE:
-         - Weighted Composite = 2.5×Methodology + 2.0×Significance + 1.5×Clarity + 1.5×Originality + 1.5×MathRigor + 1.0×Reproducibility (0–100 scale).
-         - Set `credibilityScore` within ±5 points of the Weighted Composite.
-         - Align `verdict` coherently: ACCEPT (≥85, 0 critical/major flaws), MINOR_REVISION (72–84, 0 critical, ≤2 fixable major reporting flaws), MAJOR_REVISION (55–71, ≥2 substantive methodological/major flaws), REJECT_AND_RESUBMIT (40–54, severe flaw requiring redesign), REJECT (<40, fatal unfixable flaws).
-         - In `rubricRationaleSummary`, provide 6 newline-separated 1-line rationales prefixed strictly with:
+      MANDATORY VERIFICATION, EVIDENCE-LEDGER & SCORING CONTRACT:
+      1. EXACT WEIGHTED RUBRIC RECONCILIATION:
+         - Weighted Composite = round(2.5×Methodology + 2.0×Significance + 1.5×Clarity + 1.5×Originality + 1.5×MathRigor + 1.0×Reproducibility).
+         - Set `credibilityScore` EXACTLY equal to this weighted composite.
+         - $verdictScaleGuidance
+         - In `rubricRationaleSummary`, provide 6 complete, concise 1–2 sentence rationales prefixed strictly with:
            [RUBRIC:Methodology] ...
            [RUBRIC:Significance] ...
            [RUBRIC:Clarity] ...
            [RUBRIC:Originality] ...
            [RUBRIC:Math] ...
            [RUBRIC:Reproducibility] ...
-      2. CLEAN TYPOGRAPHY: NEVER wrap plain acronyms/units (IQR, IQRs, CI, SD, OR, RR, HIC, LMIC, PRISMA) in $ LaTeX dollar signs. Use Unicode symbols (≤, ≥, ±, ×, κ, I², τ², β) cleanly.
-      3. DOMAIN-EXACT AUDITING: Strictly apply $studyDesignLabel methodological criteria. Do NOT mention ML random seeds, neural hyperparameters, or train/test splits unless this manuscript actually uses machine learning.
-      4. STRUCTURED NEWLINE OUTPUT FOR EVERY FIELD:
-         - `stage02eTo03cVerifiedListV2`: Put EACH surviving verified issue on its OWN NEWLINE prefixed with `[CRITICAL]`, `[MAJOR]`, or `[MINOR]` using the format `[SEVERITY] [F1] Short Title — Exact finding, manuscript evidence anchor, and required remedy.` Then put EACH rejected Red Team false positive on its OWN NEWLINE prefixed with `[DISMISSED]`.
-         - `stage04aIsItCredibleEssay`: Structure into three crisp newline-separated blocks prefixed exactly with `Executive Assessment:`, `The Bottom Line:`, and `Future Research Agenda:`. Enforce all 4 Stage 06 Legal Red Lines (critique only the work, never impute intent or misconduct).
-         - `stage08aTo08bAlchemistEditorNote`: Start with `Editorial Decision Rationale:` (2–3 sentences explicitly reconciling the verdict and 6-axis scores), followed by newline-separated prioritized actions prefixed with `[MUST FIX]`, `[SHOULD FIX]`, or `[RECOMMENDED]`.
-         - `fortifyReviewerQuestions`: Put 4–5 sharp, specific questions each on its OWN NEWLINE (`1. ...`, `2. ...`, `3. ...`, `4. ...`), followed by `Recommended Sensitivity & Robustness Checks:` with 2–3 newline bullets.
-         - `stage09aTo09cCopyeditReport`: Two clearly labeled sections: `Extraction / Typesetting Artifacts:` and `Substantive Prose Improvements:` with concise newline bullets.
-         - `stage01eTo01fdMathAudit`, `stage01iTo01nCodeAndDataAudit`, `stage02aNumbersCheck`, `stage02cBlueTeamDefense`: Use clean newline bullets (`• ...`) with concrete evidence anchors.
+      2. STRUCTURED EVIDENCE LEDGER (`structuredFindings` array — 4 to 8 highest-priority findings):
+         - Give each finding a clean code (`M-01`, `Q-01`, `R-01`, `C-01`), exact `pageNumber` from `[PAGE N]`, `section`, and a SHORT VERBATIM `supportingQuote` copied DIRECTLY from the manuscript text below.
+         - NEVER mark a finding `VERIFIED` if you cannot copy a real verbatim quote from the manuscript or if it falsely claims something is absent when the text actually reports it. Use `CONTRADICTED` if Pass 1 made a false absence claim, and quote the paper's actual passage in `counterEvidenceQuote`!
+         - Include any verified arithmetic/CI discrepancy from the deterministic pre-flight forensics (e.g., an impossible 95% CI in prose that conflicts with a Figure/Table) as a high-priority `Q-01` finding!
+      3. DOMAIN-EXACT & CLINICAL/POLICY APPLICABILITY AUDITING:
+         - Strictly apply $studyDesignLabel standards. Distinguish reporting guidelines (PRISMA/CONSORT/STROBE) from risk-of-bias tools (RoB 2/NOS/JBI/AMSTAR-2) and certainty frameworks (GRADE).
+         - In `stage01iTo01nCodeAndDataAudit`, include both reproducibility/provenance AND clinical/policy applicability (population representativeness, HIC vs LMIC transferability, real-world decision utility).
+      4. CLEAN TYPOGRAPHY & NEWLINE STRUCTURE:
+         - NEVER wrap plain acronyms/units (IQR, CI, SD, OR, RR, HIC, LMIC, PRISMA) in $ dollar signs. Use Unicode symbols (≤, ≥, ±, ×, κ, I², τ², β).
+         - `stage02eTo03cVerifiedListV2`: Put EACH surviving verified issue on its OWN NEWLINE prefixed with `[CRITICAL]`, `[MAJOR]`, or `[MINOR]` and EACH rejected Pass 1 false positive prefixed with `[DISMISSED]`.
+         - `stage04aIsItCredibleEssay`: Three newline-separated blocks prefixed exactly with `Executive Assessment:`, `The Bottom Line:`, and `Future Research Agenda:`. Critique strictly the scientific work, never impute intent or misconduct.
+         - `stage08aTo08bAlchemistEditorNote`: Start with `Editorial Decision Rationale:` followed by prioritized actions prefixed with `[MUST FIX]`, `[SHOULD FIX]`, or `[RECOMMENDED]`.
+         - `fortifyReviewerQuestions`: 4–5 sharp questions numbered `1. `..`5. ` each on its own line, followed by `Recommended Sensitivity & Robustness Checks:` with 2–3 bullets.
+         - `stage09aTo09cCopyeditReport`: Two sections prefixed with `Extraction / Typesetting Artifacts:` and `Substantive Prose Improvements:`.
 
-      ORIGINAL MANUSCRIPT TEXT FOR FACT-CHECKING (STAGE 03a):
+      ORIGINAL MANUSCRIPT TEXT FOR VERBATIM SOURCE VERIFICATION (STAGE 03a):
       $manuscriptText
       ${if (replicationCodeText.isNotBlank()) "\nATTACHED REPLICATION CODE PACKAGE:\n$replicationCodeText" else ""}
     """.trimIndent()
@@ -1772,7 +1938,454 @@ class Reviewer2PipelineService {
     }
   }.trim()
 
+  internal data class PromptPreparedManuscript(
+    val text: String,
+    val wasTrimmed: Boolean,
+    val trimmedNote: String
+  )
+
+  internal data class AdjudicationResult(
+    val adjudicatedFindings: List<ReviewFinding>,
+    val methodologyScore: Int,
+    val significanceScore: Int,
+    val clarityScore: Int,
+    val originalityScore: Int,
+    val mathRigorScore: Int,
+    val reproducibilityScore: Int,
+    val weightedCredibilityScore: Int,
+    val resolvedVerdict: String
+  )
+
   companion object {
+    /**
+     * Preserves the complete manuscript body (Introduction, Methods, Results, Tables, Figures,
+     * Discussion) without middle truncation. Only when a very long manuscript exceeds [maxChars]
+     * does it trim the trailing References/Bibliography list first, disclosing any trim explicitly.
+     */
+    internal fun prepareManuscriptForPrompt(
+      raw: String,
+      maxChars: Int = 160_000
+    ): PromptPreparedManuscript {
+      val clean = raw.trim()
+      if (clean.length <= maxChars) {
+        return PromptPreparedManuscript(clean, wasTrimmed = false, trimmedNote = "")
+      }
+
+      // First try trimming only the trailing References/Bibliography section (systematic reviews often have large bibliographies starting around 40-60%)
+      val refHeaderRegex = Regex("""(?im)^\s*(?:references|bibliography|works\s+cited)\s*$""")
+      val refMatch = refHeaderRegex.findAll(clean).lastOrNull { it.range.first >= (clean.length * 0.35).toInt() }
+      if (refMatch != null) {
+        val bodyPart = clean.substring(0, refMatch.range.first).trimEnd()
+        val refPart = clean.substring(refMatch.range.first)
+        if (bodyPart.length <= maxChars - 300) {
+          val remainingForRefs = (maxChars - bodyPart.length - 160).coerceAtLeast(0)
+          val assembled = buildString {
+            append(bodyPart)
+            append("\n\n")
+            if (remainingForRefs > 400) {
+              append(refPart.take(remainingForRefs))
+              append("\n[... Trailing bibliography entries omitted (${refPart.length - remainingForRefs} chars); full main body preserved ...]")
+            } else {
+              append("[... References list omitted (${refPart.length} chars); full main body preserved ...]")
+            }
+          }
+          return PromptPreparedManuscript(
+            text = assembled,
+            wasTrimmed = true,
+            trimmedNote = "Full main body preserved; trailing bibliography trimmed to fit prompt window."
+          )
+        }
+      }
+
+      val truncated = clean.take(maxChars - 160) +
+        "\n\n[... Tail of document truncated (${clean.length - (maxChars - 160)} chars) after preserving complete opening ${maxChars - 160} characters ...]"
+      return PromptPreparedManuscript(
+        text = truncated,
+        wasTrimmed = true,
+        trimmedNote = "Document tail trimmed at %,d chars (no middle sections omitted).".format(Locale.US, maxChars)
+      )
+    }
+
+    internal fun extractRubricRationales(summary: String): Map<String, String> {
+      if (summary.isBlank()) return emptyMap()
+      val result = mutableMapOf<String, String>()
+      val regex = Regex("""\[RUBRIC:\s*([A-Za-z]+)\]\s*(.+)""", RegexOption.IGNORE_CASE)
+      summary.lines().forEach { line ->
+        val m = regex.find(line.trim()) ?: return@forEach
+        val key = m.groupValues[1].trim().lowercase(Locale.US)
+        val value = com.example.util.DossierFormattingEngine.cleanAcademicProse(m.groupValues[2].trim())
+        if (value.isNotBlank()) {
+          when {
+            key.startsWith("method") -> result["methodology"] = value
+            key.startsWith("signif") -> result["significance"] = value
+            key.startsWith("clar") -> result["clarity"] = value
+            key.startsWith("orig") || key.startsWith("novel") -> result["originality"] = value
+            key.startsWith("math") || key.startsWith("quant") || key.startsWith("stat") -> result["math"] = value
+            key.startsWith("repro") -> result["reproducibility"] = value
+          }
+        }
+      }
+      return result
+    }
+
+    internal fun parseStructuredFindingsFromJson(arr: JSONArray?): List<ReviewFinding> {
+      if (arr == null || arr.length() == 0) return emptyList()
+      return buildList {
+        for (i in 0 until arr.length()) {
+          val obj = arr.optJSONObject(i) ?: continue
+          val id = obj.optString("id", "F-${i + 1}").trim().ifBlank { "F-${i + 1}" }
+          val title = com.example.util.DossierFormattingEngine.cleanAcademicProse(
+            obj.optString("title", "Appraisal Finding ${i + 1}")
+          )
+          val allegation = com.example.util.DossierFormattingEngine.cleanAcademicProse(
+            obj.optString("allegation", "")
+          )
+          if (allegation.isBlank()) continue
+          val severity = obj.optString("severity", "MAJOR").trim().uppercase(Locale.US).let {
+            if (it in setOf("CRITICAL", "MAJOR", "MINOR", "INFO")) it else "MAJOR"
+          }
+          val status = FindingStatus.fromNameOrDefault(obj.optString("status", "UNVERIFIED"))
+          val pageNum = obj.optInt("pageNumber", 0).coerceAtLeast(0)
+          val section = obj.optString("section", "").trim().takeIf { it.isNotBlank() }
+          val quote = obj.optString("supportingQuote", "").trim()
+          val counter = obj.optString("counterEvidenceQuote", "").trim()
+          val justification = com.example.util.DossierFormattingEngine.cleanAcademicProse(
+            obj.optString("methodologicalJustification", "")
+          )
+          val remedy = com.example.util.DossierFormattingEngine.cleanAcademicProse(
+            obj.optString("recommendedCorrection", "")
+          )
+          add(
+            ReviewFinding(
+              id = id,
+              title = title,
+              allegation = allegation,
+              severity = severity,
+              status = status,
+              supportingEvidence = if (quote.isNotBlank() || pageNum > 0) {
+                listOf(EvidenceAnchor(pageNumber = pageNum, section = section, exactQuote = quote))
+              } else emptyList(),
+              counterEvidence = if (counter.isNotBlank()) {
+                listOf(EvidenceAnchor(pageNumber = pageNum, section = section, exactQuote = counter))
+              } else emptyList(),
+              methodologicalJustification = justification,
+              recommendedCorrection = remedy
+            )
+          )
+        }
+      }
+    }
+
+    /**
+     * Verifies whether a cited quote genuinely appears in [manuscriptText] using normalized
+     * substring matching or ≥60% content-token overlap, preventing hallucinated VERIFIED claims.
+     */
+    internal fun verifyQuoteInManuscript(quote: String, manuscriptText: String): Pair<Boolean, Int> {
+      val cleanQuote = quote.trim().trim('"', '“', '”', '\'')
+      if (cleanQuote.length < 8 || manuscriptText.isBlank()) return false to 0
+
+      val normDoc = manuscriptText.lowercase(Locale.US).replace(Regex("""\s+"""), " ")
+      val normQuote = cleanQuote.lowercase(Locale.US).replace(Regex("""\s+"""), " ")
+
+      val exactIdx = normDoc.indexOf(normQuote)
+      if (exactIdx >= 0) {
+        val rawIdx = approximateOffsetInRaw(manuscriptText, cleanQuote.take(24))
+        val page = QuantitativeForensicAnalyzer.resolvePageNumberAtOffset(manuscriptText, rawIdx)
+        return true to page
+      }
+
+      // Relaxed token-overlap check (handles OCR hyphens, Unicode minus vs ASCII dash, minor spacing)
+      val stopWords = setOf("the", "and", "for", "with", "that", "this", "from", "were", "was", "are", "not", "but", "into", "their", "have", "has", "also")
+      val quoteTokens = normQuote.split(Regex("""[^a-z0-9.²]+"""))
+        .filter { it.length >= 3 && it !in stopWords }
+        .distinct()
+      if (quoteTokens.size < 2) return false to 0
+
+      val matchedTokens = quoteTokens.count { tok -> normDoc.contains(tok) }
+      val ratio = matchedTokens.toDouble() / quoteTokens.size.toDouble()
+      if (ratio >= 0.62) {
+        val anchorTok = quoteTokens.maxByOrNull { it.length } ?: ""
+        val rawIdx = manuscriptText.indexOf(anchorTok, ignoreCase = true).coerceAtLeast(0)
+        val page = QuantitativeForensicAnalyzer.resolvePageNumberAtOffset(manuscriptText, rawIdx)
+        return true to page
+      }
+      return false to 0
+    }
+
+    private fun approximateOffsetInRaw(raw: String, prefix: String): Int {
+      if (prefix.isBlank()) return 0
+      val direct = raw.indexOf(prefix, ignoreCase = true)
+      if (direct >= 0) return direct
+      val firstWord = prefix.split(Regex("""\s+""")).firstOrNull { it.length >= 4 } ?: return 0
+      return raw.indexOf(firstWord, ignoreCase = true).coerceAtLeast(0)
+    }
+
+    /**
+     * Cross-Pass Adjudicator:
+     * 1. Verifies every LLM finding's supporting quote against the actual source text (downgrading ungrounded VERIFIED claims to UNVERIFIED).
+     * 2. Rejects false absence claims (e.g., claiming random-effects meta-analysis, I², meta-regression, or independent extraction is absent when explicit counterevidence exists in the text).
+     * 3. Injects confirmed deterministic QuantitativeForensicAnalyzer FAIL discrepancies (e.g., impossible CI bounds cross-referenced with Figures) as VERIFIED findings.
+     * 4. Reconciles the headline credibilityScore strictly to PaperReviewRubric.computeWeightedScore(...) and aligns the verdict to [reviewMode].
+     */
+    internal fun adjudicateFindingsAndScores(
+      rawFindings: List<ReviewFinding>,
+      manuscriptText: String,
+      forensicReport: ForensicPreFlightReport?,
+      methodologyScore: Int,
+      significanceScore: Int,
+      clarityScore: Int,
+      originalityScore: Int,
+      mathRigorScore: Int,
+      reproducibilityScore: Int,
+      rawVerdict: String,
+      reviewMode: ReviewMode
+    ): AdjudicationResult {
+      val absenceCounterChecks = listOf(
+        Triple(
+          Regex("""(?i)\b(?:no|lack(?:s|ed|ing)?|absent|missing|without|fail(?:ed|s)?\s+to\s+(?:perform|conduct|use|run)|unweighted)\b[^.\n]{0,65}\b(?:random[\s-]?effects?|meta[\s-]?analys|inverse[\s-]?variance|pooled\s+estimate)\b"""),
+          Regex("""(?i)\b(?:random[\s-]?effects?(?:\s+meta[\s-]?analys(?:is|es))?|inverse[\s-]?variance|DerSimonian|REML)\b"""),
+          "Manuscript explicitly reports random-effects meta-analysis"
+        ),
+        Triple(
+          Regex("""(?i)\b(?:no|lack(?:s|ed|ing)?|absent|missing|omit(?:ted|s|ting)?|without|fail(?:ed|s)?\s+to\s+report)\b[^.\n]{0,65}\b(?:heterogeneity|I[²2]|tau[\s-]?squared|τ²)\b"""),
+          Regex("""(?i)(?:I\s*[²2]\s*(?:[-–—]?\s*statistic\s*)?(?:=|≥|>|was|of|above|exceeded)?\s*\d{1,3}(?:\.\d+)?\s*%|\btau[\s-]?squared\b|\bheterogeneity\s+(?:was|exceeded|across))"""),
+          "Manuscript explicitly reports I² heterogeneity statistics"
+        ),
+        Triple(
+          Regex("""(?i)\b(?:no|lack(?:s|ed|ing)?|absent|missing|without|fail(?:ed|s)?\s+to\s+perform)\b[^.\n]{0,65}\b(?:meta[\s-]?regression|moderator\s+analys|subgroup\s+analys)\b"""),
+          Regex("""(?i)\b(?:meta[\s-]?regression|subgroup\s+analys(?:is|es)|moderator\s+analys)\b"""),
+          "Manuscript explicitly performs meta-regression or subgroup analysis"
+        ),
+        Triple(
+          Regex("""(?i)\b(?:single\s+(?:reviewer|extractor)|no\s+independent\s+(?:extraction|screening)|did\s+not\s+(?:independently|double)\s+(?:extract|screen))\b"""),
+          Regex("""(?i)\b(?:independently\s+(?:extracted|screened|reviewed|assessed)|(?:two|three|2|3)\s+(?:independent\s+)?(?:authors|reviewers|raters))\b"""),
+          "Manuscript explicitly states multi-author independent extraction/screening"
+        )
+      )
+
+      val verifiedFindings = rawFindings.map { finding ->
+        var updatedStatus = finding.status
+        val notes = mutableListOf<String>()
+        if (finding.verificationNotes.isNotBlank()) notes.add(finding.verificationNotes)
+        var updatedSupporting = finding.supportingEvidence
+        val updatedCounter = finding.counterEvidence.toMutableList()
+
+        // 1. Check false absence allegations against full manuscript text
+        val combinedClaim = "${finding.title}. ${finding.allegation}"
+        for ((allegationRegex, counterRegex, reasonLabel) in absenceCounterChecks) {
+          if (allegationRegex.containsMatchIn(combinedClaim)) {
+            val counterMatch = counterRegex.find(manuscriptText)
+            if (counterMatch != null) {
+              val snippetStart = (counterMatch.range.first - 60).coerceAtLeast(0)
+              val snippetEnd = (counterMatch.range.last + 110).coerceAtMost(manuscriptText.length)
+              val snippet = manuscriptText.substring(snippetStart, snippetEnd)
+                .replace(Regex("""\s+"""), " ")
+                .trim()
+              val counterPage = QuantitativeForensicAnalyzer.resolvePageNumberAtOffset(manuscriptText, counterMatch.range.first)
+              updatedCounter.add(
+                EvidenceAnchor(
+                  pageNumber = counterPage,
+                  section = if (counterPage > 0) "Page $counterPage" else "Manuscript text",
+                  exactQuote = snippet
+                )
+              )
+              updatedStatus = FindingStatus.CONTRADICTED
+              notes.add("Contradicted by source text: $reasonLabel.")
+              break
+            }
+          }
+        }
+
+        // 2. Verify supporting quote grounding for any finding still marked VERIFIED
+        if (updatedStatus == FindingStatus.VERIFIED) {
+          val primaryAnchor = updatedSupporting.firstOrNull()
+          val quote = primaryAnchor?.exactQuote.orEmpty()
+          if (quote.isBlank()) {
+            updatedStatus = FindingStatus.UNVERIFIED
+            notes.add("Downgraded from VERIFIED: no verbatim manuscript quote provided.")
+          } else {
+            val (matched, resolvedPage) = verifyQuoteInManuscript(quote, manuscriptText)
+            if (!matched) {
+              updatedStatus = FindingStatus.UNVERIFIED
+              notes.add("Downgraded from VERIFIED: cited quote could not be verified in extracted source text.")
+            } else if (primaryAnchor != null && primaryAnchor.pageNumber == 0 && resolvedPage > 0) {
+              updatedSupporting = listOf(primaryAnchor.copy(pageNumber = resolvedPage)) + updatedSupporting.drop(1)
+            }
+          }
+        }
+
+        finding.copy(
+          status = updatedStatus,
+          supportingEvidence = updatedSupporting,
+          counterEvidence = updatedCounter.distinctBy { it.exactQuote },
+          verificationNotes = notes.joinToString(" ").trim()
+        )
+      }.toMutableList()
+
+      // 3. Auto-inject deterministic QuantitativeForensicAnalyzer confirmed FAIL findings (e.g., impossible CI)
+      if (forensicReport != null) {
+        var nextQuantIdx = 1
+        forensicReport.quantForensics.confidenceIntervalChecks
+          .filter { it.status == QuantFindingStatus.FAIL }
+          .forEach { ci ->
+            val alreadyCovered = verifiedFindings.any { existing ->
+              existing.allegation.contains(ci.rawClaim.take(18), ignoreCase = true) ||
+                (existing.title.contains("confidence interval", ignoreCase = true) &&
+                  existing.supportingEvidence.any { it.pageNumber == ci.pageNumber && ci.pageNumber > 0 })
+            }
+            if (!alreadyCovered) {
+              val detail = buildString {
+                append(ci.note)
+                if (ci.crossReferenceNote.isNotBlank()) {
+                  append(" Cross-reference: ${ci.crossReferenceNote}")
+                }
+              }
+              verifiedFindings.add(
+                0,
+                ReviewFinding(
+                  id = "Q-0$nextQuantIdx",
+                  title = "Mathematically Impossible Confidence Interval (${ci.rawClaim})",
+                  allegation = detail,
+                  severity = "CRITICAL",
+                  status = FindingStatus.VERIFIED,
+                  supportingEvidence = listOf(
+                    EvidenceAnchor(
+                      pageNumber = ci.pageNumber,
+                      section = if (ci.pageNumber > 0) "Page ${ci.pageNumber}" else "Results",
+                      exactQuote = ci.rawClaim
+                    )
+                  ),
+                  methodologicalJustification = "A point estimate must lie strictly within its reported 95% confidence interval [lower, upper]. An out-of-bounds CI indicates a reporting error, unit/scale mismatch, or transcription error.",
+                  recommendedCorrection = "Verify raw pooled estimate and confidence bounds against primary tables/figures and issue a numerical correction or erratum.",
+                  verificationNotes = "Verified deterministically by Paper Critic CI Geometry Engine."
+                )
+              )
+              nextQuantIdx++
+            }
+          }
+
+        forensicReport.quantForensics.statcheckResults
+          .filter { it.status == QuantFindingStatus.FAIL }
+          .take(2)
+          .forEach { st ->
+            val alreadyCovered = verifiedFindings.any { it.allegation.contains(st.rawClaim.take(16), ignoreCase = true) }
+            if (!alreadyCovered) {
+              verifiedFindings.add(
+                0,
+                ReviewFinding(
+                  id = "Q-0$nextQuantIdx",
+                  title = "Statcheck p-Value Discrepancy (${st.rawClaim})",
+                  allegation = "${st.note} (Recomputed two-tailed p = ${String.format(Locale.US, "%.4f", st.recomputedP)}).",
+                  severity = "CRITICAL",
+                  status = FindingStatus.VERIFIED,
+                  supportingEvidence = listOf(
+                    EvidenceAnchor(
+                      pageNumber = st.pageNumber,
+                      section = if (st.pageNumber > 0) "Page ${st.pageNumber}" else "Statistical Results",
+                      exactQuote = st.rawClaim
+                    )
+                  ),
+                  methodologicalJustification = "Exact test-statistic recomputation disagrees with the reported significance threshold.",
+                  recommendedCorrection = "Recompute test statistic, degrees of freedom, and exact two-tailed p-value from primary data.",
+                  verificationNotes = "Verified deterministically by Paper Critic Statcheck Engine."
+                )
+              )
+              nextQuantIdx++
+            }
+          }
+      }
+
+      // 4. Authoritative 6-axis weighted rubric computation (ZERO arithmetic mismatch allowed)
+      val m = methodologyScore.coerceIn(1, 10)
+      val s = significanceScore.coerceIn(1, 10)
+      val c = clarityScore.coerceIn(1, 10)
+      val o = originalityScore.coerceIn(1, 10)
+      val math = mathRigorScore.coerceIn(1, 10)
+      val r = reproducibilityScore.coerceIn(1, 10)
+      val exactComposite = PaperReviewRubric.computeWeightedScore(
+        methodology = m,
+        significance = s,
+        clarity = c,
+        originality = o,
+        mathematicalRigor = math,
+        reproducibility = r
+      )
+
+      val hasVerifiedCriticalError = verifiedFindings.any {
+        it.status == FindingStatus.VERIFIED && it.severity == "CRITICAL"
+      }
+      val resolvedVerdict = resolveVerdictForMode(
+        rawVerdict = rawVerdict,
+        compositeScore = exactComposite,
+        reviewMode = reviewMode,
+        hasVerifiedCriticalError = hasVerifiedCriticalError
+      )
+
+      return AdjudicationResult(
+        adjudicatedFindings = verifiedFindings,
+        methodologyScore = m,
+        significanceScore = s,
+        clarityScore = c,
+        originalityScore = o,
+        mathRigorScore = math,
+        reproducibilityScore = r,
+        weightedCredibilityScore = exactComposite,
+        resolvedVerdict = resolvedVerdict
+      )
+    }
+
+    internal fun resolveVerdictForMode(
+      rawVerdict: String,
+      compositeScore: Int,
+      reviewMode: ReviewMode,
+      hasVerifiedCriticalError: Boolean = false
+    ): String {
+      val upper = rawVerdict.trim().uppercase(Locale.US)
+      return when (reviewMode) {
+        ReviewMode.POST_PUBLICATION_APPRAISAL -> {
+          val allowed = setOf("HIGH_CREDIBILITY", "SOUND_WITH_CAVEATS", "REQUIRES_CORRECTION", "MAJOR_CONCERNS", "LOW_CREDIBILITY")
+          if (upper in allowed && !(hasVerifiedCriticalError && upper == "HIGH_CREDIBILITY")) {
+            upper
+          } else {
+            when {
+              compositeScore >= 85 && !hasVerifiedCriticalError -> "HIGH_CREDIBILITY"
+              compositeScore >= 70 && !hasVerifiedCriticalError -> "SOUND_WITH_CAVEATS"
+              compositeScore >= 55 || hasVerifiedCriticalError -> "REQUIRES_CORRECTION"
+              compositeScore >= 40 -> "MAJOR_CONCERNS"
+              else -> "LOW_CREDIBILITY"
+            }
+          }
+        }
+        ReviewMode.CLINICAL_EVIDENCE_APPRAISAL -> {
+          val allowed = setOf("HIGH_CERTAINTY", "MODERATE_CERTAINTY", "LOW_CERTAINTY", "VERY_LOW_CERTAINTY")
+          if (upper in allowed && !(hasVerifiedCriticalError && upper == "HIGH_CERTAINTY")) {
+            upper
+          } else {
+            when {
+              compositeScore >= 85 && !hasVerifiedCriticalError -> "HIGH_CERTAINTY"
+              compositeScore >= 68 -> "MODERATE_CERTAINTY"
+              compositeScore >= 48 -> "LOW_CERTAINTY"
+              else -> "VERY_LOW_CERTAINTY"
+            }
+          }
+        }
+        ReviewMode.JOURNAL_REFEREE -> {
+          val allowed = setOf("ACCEPT", "MINOR_REVISION", "MAJOR_REVISION", "REJECT_AND_RESUBMIT", "REJECT")
+          if (upper in allowed && !(hasVerifiedCriticalError && upper == "ACCEPT")) {
+            upper
+          } else {
+            when {
+              compositeScore >= 85 && !hasVerifiedCriticalError -> "ACCEPT"
+              compositeScore >= 72 && !hasVerifiedCriticalError -> "MINOR_REVISION"
+              compositeScore >= 55 -> "MAJOR_REVISION"
+              compositeScore >= 40 -> "REJECT_AND_RESUBMIT"
+              else -> "REJECT"
+            }
+          }
+        }
+      }
+    }
+
     /**
      * Unwraps nested FirebaseAIException / UnknownException cause chains so users and logs
      * always see the concrete underlying failure instead of an opaque "Something unexpected happened.".

@@ -90,7 +90,9 @@ import androidx.compose.ui.unit.sp
 import com.example.data.ai.ChatbotRolePersona
 import com.example.data.ai.GeminiModelTier
 import com.example.data.ai.GroundedWebSource
+import com.example.data.model.FindingStatus
 import com.example.data.model.PaperReview
+import com.example.data.model.ReviewFinding
 import com.example.ui.components.IosCredibilityArcGauge
 import com.example.ui.components.IosGroupedCard
 import com.example.ui.components.IosInsetDivider
@@ -117,6 +119,7 @@ import com.example.ui.viewmodel.RefereeChatUiState
 import com.example.ui.viewmodel.SearchGroundingUiState
 import com.example.util.CalloutTone
 import com.example.util.DossierFormattingEngine
+import com.example.util.PdfExportScope
 import com.example.util.PdfReportExporter
 import com.example.util.ReportBlock
 import com.example.util.SeverityLevel
@@ -545,6 +548,43 @@ fun DossierDetailView(
           )
         }
 
+        if (review.coverageDisclosure.isNotBlank() || review.validationStatus.isNotBlank()) {
+          Spacer(modifier = Modifier.height(6.dp))
+          val valColor = when (review.validationStatus.uppercase(Locale.US)) {
+            "VERIFIED" -> CupertinoGreen
+            "ADJUDICATED_WITH_CAVEATS" -> CupertinoBlue
+            else -> CupertinoAmber
+          }
+          val valShape = SquircleShape(cornerRadius = 6.dp, smoothing = 0.88f)
+          Column(
+            modifier = Modifier
+              .fillMaxWidth()
+              .clip(valShape)
+              .background(valColor.copy(alpha = 0.08f))
+              .border(0.6.dp, valColor.copy(alpha = 0.28f), valShape)
+              .padding(horizontal = 9.dp, vertical = 5.dp)
+              .testTag("dossier_provenance_banner"),
+            verticalArrangement = Arrangement.spacedBy(2.dp)
+          ) {
+            Text(
+              text = "${review.resolvedReviewMode().displayTitle.uppercase(Locale.US)} • ${review.validationStatus.replace('_', ' ')}",
+              style = MaterialTheme.typography.labelSmall,
+              fontFamily = JetBrainsMonoFamily,
+              fontSize = 9.sp,
+              fontWeight = FontWeight.Bold,
+              color = valColor
+            )
+            if (review.coverageDisclosure.isNotBlank()) {
+              Text(
+                text = review.coverageDisclosure,
+                style = MaterialTheme.typography.labelSmall,
+                fontSize = 10.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+              )
+            }
+          }
+        }
+
         Spacer(modifier = Modifier.height(8.dp))
 
         val normalizedDisplayTitle = remember(review.title) {
@@ -796,6 +836,17 @@ fun DossierDetailView(
             item {
               RefereeDimensionBreakdownCard(review = review)
             }
+            item {
+              val structuredFindings = remember(review.id, review.structuredFindingsJson) {
+                review.parsedFindings()
+              }
+              if (structuredFindings.isNotEmpty()) {
+                EvidenceLedgerCard(
+                  findings = structuredFindings,
+                  textScale = reportTextScale
+                )
+              }
+            }
           }
           1 -> {
             item {
@@ -1001,11 +1052,11 @@ fun DossierDetailView(
             review = review,
             isCachedOffline = isCachedOffline,
             isExportingPdf = isExportingPdf,
-            onSharePdf = {
+            onSharePdf = { exportScope ->
               if (!isExportingPdf) {
                 isExportingPdf = true
                 scope.launch {
-                  val res = PdfReportExporter.exportAndSharePdf(context, review)
+                  val res = PdfReportExporter.exportAndSharePdf(context, review, exportScope)
                   isExportingPdf = false
                   res.onFailure { err ->
                     Toast.makeText(
@@ -1571,9 +1622,13 @@ fun VerdictSquircleBadge(decision: String) {
   val palette = LocalNeumorphicPalette.current
   val normalized = decision.uppercase()
   val (textColor, icon) = when {
-    normalized.contains("REJECT") -> CupertinoRed to Icons.Default.ReportProblem
-    normalized.contains("MAJOR") -> CupertinoAmber to Icons.Default.Shield
-    else -> CupertinoGreen to Icons.Default.Verified
+    normalized in setOf("ACCEPT", "HIGH_CREDIBILITY", "HIGH_CERTAINTY") ->
+      CupertinoGreen to Icons.Default.Verified
+    normalized in setOf("MINOR_REVISION", "SOUND_WITH_CAVEATS", "MODERATE_CERTAINTY") ->
+      CupertinoBlue to Icons.Default.Verified
+    normalized in setOf("MAJOR_REVISION", "REQUIRES_CORRECTION", "LOW_CERTAINTY") ->
+      CupertinoAmber to Icons.Default.Shield
+    else -> CupertinoRed to Icons.Default.ReportProblem
   }
 
   val pillRadius = 11.dp
@@ -1668,13 +1723,20 @@ private fun IosScorePill(
 
 @Composable
 private fun RefereeDimensionBreakdownCard(review: PaperReview) {
-  val rubric = remember(review.id, review.editorNote, review.credibilityScore) {
+  val rubric = remember(
+    review.id,
+    review.editorNote,
+    review.credibilityScore,
+    review.methodologyScore,
+    review.mathRigorScore,
+    review.reproducibilityScore
+  ) {
     review.toRubric()
   }
   val criteria = remember(rubric) { rubric.criteriaList() }
 
   IosGroupedCard(
-    header = "Structured Paper Review Rubric (6-Axis Evaluation)"
+    header = "Structured Appraisal Rubric (6-Axis Weighted Composite)"
   ) {
     Row(
       modifier = Modifier.fillMaxWidth(),
@@ -1682,25 +1744,41 @@ private fun RefereeDimensionBreakdownCard(review: PaperReview) {
       verticalAlignment = Alignment.CenterVertically
     ) {
       Text(
-        text = "CALIBRATED REFEREE SCORECARD",
+        text = "WEIGHTED ${rubric.overallCredibilityScore}/100",
         style = MaterialTheme.typography.labelSmall,
         fontFamily = JetBrainsMonoFamily,
         fontWeight = FontWeight.Bold,
         color = CupertinoBlue
       )
-      Box(
-        modifier = Modifier
-          .clip(SquircleShape(cornerRadius = 6.dp, smoothing = 0.88f))
-          .background(CupertinoIndigo.copy(alpha = 0.12f))
-          .padding(horizontal = 8.dp, vertical = 3.dp)
-      ) {
-        Text(
-          text = "CONFIDENCE ${rubric.refereeConfidence}/5",
-          style = MaterialTheme.typography.labelSmall,
-          fontFamily = JetBrainsMonoFamily,
-          fontWeight = FontWeight.Bold,
-          color = CupertinoIndigo
-        )
+      Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        Box(
+          modifier = Modifier
+            .clip(SquircleShape(cornerRadius = 6.dp, smoothing = 0.88f))
+            .background(CupertinoIndigo.copy(alpha = 0.12f))
+            .padding(horizontal = 7.dp, vertical = 3.dp)
+        ) {
+          Text(
+            text = "SCI ${rubric.refereeConfidence}/5",
+            style = MaterialTheme.typography.labelSmall,
+            fontFamily = JetBrainsMonoFamily,
+            fontWeight = FontWeight.Bold,
+            color = CupertinoIndigo
+          )
+        }
+        Box(
+          modifier = Modifier
+            .clip(SquircleShape(cornerRadius = 6.dp, smoothing = 0.88f))
+            .background(CupertinoGreen.copy(alpha = 0.12f))
+            .padding(horizontal = 7.dp, vertical = 3.dp)
+        ) {
+          Text(
+            text = "EXT ${rubric.extractionConfidence}/5",
+            style = MaterialTheme.typography.labelSmall,
+            fontFamily = JetBrainsMonoFamily,
+            fontWeight = FontWeight.Bold,
+            color = CupertinoGreen
+          )
+        }
       }
     }
     Spacer(modifier = Modifier.height(10.dp))
@@ -2205,25 +2283,192 @@ private fun AuthorRevisionNotesCard(
 }
 
 @Composable
+private fun EvidenceLedgerCard(
+  findings: List<ReviewFinding>,
+  textScale: Float = 1.0f
+) {
+  val verifiedCount = findings.count { it.status == FindingStatus.VERIFIED }
+  val contradictedCount = findings.count { it.status == FindingStatus.CONTRADICTED }
+  val unverifiedCount = findings.count { it.status == FindingStatus.UNVERIFIED }
+
+  IosGroupedCard(
+    header = "Source-Anchored Evidence Ledger (${findings.size} Findings)",
+    footer = "$verifiedCount Verified • $unverifiedCount Unverified • $contradictedCount Contradicted/Dismissed. Every VERIFIED finding is checked against extracted manuscript text."
+  ) {
+    Column(
+      verticalArrangement = Arrangement.spacedBy(10.dp),
+      modifier = Modifier.testTag("evidence_ledger_card")
+    ) {
+      findings.forEach { finding ->
+        val accent = when {
+          finding.status == FindingStatus.CONTRADICTED -> MaterialTheme.colorScheme.onSurfaceVariant
+          finding.severity.equals("CRITICAL", ignoreCase = true) -> CupertinoRed
+          finding.severity.equals("MAJOR", ignoreCase = true) -> CupertinoAmber
+          finding.severity.equals("MINOR", ignoreCase = true) -> CupertinoIndigo
+          else -> CupertinoBlue
+        }
+        val statusColor = when (finding.status) {
+          FindingStatus.VERIFIED -> CupertinoGreen
+          FindingStatus.PARTIALLY_SUPPORTED -> CupertinoBlue
+          FindingStatus.UNVERIFIED -> CupertinoAmber
+          FindingStatus.CONTRADICTED, FindingStatus.NOT_APPLICABLE -> MaterialTheme.colorScheme.onSurfaceVariant
+        }
+        val cardShape = SquircleShape(cornerRadius = 10.dp, smoothing = 0.88f)
+        Column(
+          modifier = Modifier
+            .fillMaxWidth()
+            .clip(cardShape)
+            .background(accent.copy(alpha = 0.07f))
+            .border(0.75.dp, accent.copy(alpha = 0.30f), cardShape)
+            .padding(11.dp),
+          verticalArrangement = Arrangement.spacedBy(5.dp)
+        ) {
+          Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+          ) {
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+              Box(
+                modifier = Modifier
+                  .clip(SquircleShape(cornerRadius = 4.dp, smoothing = 0.88f))
+                  .background(accent)
+                  .padding(horizontal = 6.dp, vertical = 2.dp)
+              ) {
+                Text(
+                  text = "${finding.id} • ${finding.severity}",
+                  style = MaterialTheme.typography.labelSmall,
+                  fontFamily = JetBrainsMonoFamily,
+                  fontSize = 9.sp,
+                  fontWeight = FontWeight.Bold,
+                  color = Color.White
+                )
+              }
+              Box(
+                modifier = Modifier
+                  .clip(SquircleShape(cornerRadius = 4.dp, smoothing = 0.88f))
+                  .background(statusColor)
+                  .padding(horizontal = 6.dp, vertical = 2.dp)
+              ) {
+                Text(
+                  text = finding.status.displayBadge,
+                  style = MaterialTheme.typography.labelSmall,
+                  fontFamily = JetBrainsMonoFamily,
+                  fontSize = 9.sp,
+                  fontWeight = FontWeight.Bold,
+                  color = Color.White
+                )
+              }
+            }
+            val pageNum = finding.supportingEvidence.firstOrNull()?.pageNumber ?: 0
+            if (pageNum > 0) {
+              Text(
+                text = "PAGE $pageNum",
+                style = MaterialTheme.typography.labelSmall,
+                fontFamily = JetBrainsMonoFamily,
+                fontSize = 9.5.sp,
+                fontWeight = FontWeight.Bold,
+                color = CupertinoBlue
+              )
+            }
+          }
+
+          Text(
+            text = finding.title,
+            style = MaterialTheme.typography.bodyMedium.copy(
+              fontSize = (13.5f * textScale).sp,
+              fontWeight = FontWeight.Bold
+            ),
+            color = MaterialTheme.colorScheme.onSurface
+          )
+
+          Text(
+            text = finding.allegation,
+            style = MaterialTheme.typography.bodySmall.copy(
+              fontSize = (12.5f * textScale).sp,
+              lineHeight = (18f * textScale).sp
+            ),
+            color = MaterialTheme.colorScheme.onSurface
+          )
+
+          val quote = finding.supportingEvidence.firstOrNull()?.exactQuote?.trim().orEmpty()
+          if (quote.isNotBlank()) {
+            Box(
+              modifier = Modifier
+                .fillMaxWidth()
+                .clip(SquircleShape(cornerRadius = 6.dp, smoothing = 0.88f))
+                .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.65f))
+                .padding(horizontal = 8.dp, vertical = 6.dp)
+            ) {
+              Text(
+                text = "Source Quote: \"$quote\"",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+              )
+            }
+          }
+
+          val counter = finding.counterEvidence.firstOrNull()?.exactQuote?.trim().orEmpty()
+          if (counter.isNotBlank()) {
+            Box(
+              modifier = Modifier
+                .fillMaxWidth()
+                .clip(SquircleShape(cornerRadius = 6.dp, smoothing = 0.88f))
+                .background(CupertinoGreen.copy(alpha = 0.10f))
+                .padding(horizontal = 8.dp, vertical = 6.dp)
+            ) {
+              Text(
+                text = "Counterevidence: \"$counter\"",
+                style = MaterialTheme.typography.labelSmall,
+                color = CupertinoGreen
+              )
+            }
+          }
+
+          if (finding.verificationNotes.isNotBlank()) {
+            Text(
+              text = "Audit: ${finding.verificationNotes}",
+              style = MaterialTheme.typography.labelSmall,
+              fontFamily = JetBrainsMonoFamily,
+              fontSize = 10.sp,
+              color = statusColor
+            )
+          }
+
+          if (finding.recommendedCorrection.isNotBlank() && finding.status != FindingStatus.CONTRADICTED) {
+            Text(
+              text = "Action: ${finding.recommendedCorrection}",
+              style = MaterialTheme.typography.labelSmall,
+              color = CupertinoBlue
+            )
+          }
+        }
+      }
+    }
+  }
+}
+
+@Composable
 private fun PdfAndOfflineExportCard(
   review: PaperReview,
   isCachedOffline: Boolean,
   isExportingPdf: Boolean,
-  onSharePdf: () -> Unit,
+  onSharePdf: (PdfExportScope) -> Unit,
   onSaveOfflineCache: () -> Unit
 ) {
   val context = LocalContext.current
   val scope = rememberCoroutineScope()
   var isSavingPdf by remember { mutableStateOf(false) }
+  var selectedExportScope by rememberSaveable { mutableStateOf(PdfExportScope.SCIENTIFIC_APPRAISAL_REPORT) }
 
-  val suggestedFileName = remember(review.title) {
+  val suggestedFileName = remember(review.title, selectedExportScope) {
     val slug = review.title
       .lowercase(Locale.US)
       .replace(Regex("""[^a-z0-9]+"""), "_")
       .trim('_')
-      .take(40)
+      .take(38)
       .ifBlank { "paper_critic_dossier" }
-    "${slug}_referee_report.pdf"
+    "${slug}_${selectedExportScope.fileSuffix}.pdf"
   }
 
   val savePdfLauncher = rememberLauncherForActivityResult(
@@ -2232,10 +2477,10 @@ private fun PdfAndOfflineExportCard(
     if (uri != null) {
       isSavingPdf = true
       scope.launch {
-        val res = PdfReportExporter.writePdfToUri(context, review, uri)
+        val res = PdfReportExporter.writePdfToUri(context, review, uri, selectedExportScope)
         isSavingPdf = false
         res.onSuccess {
-          Toast.makeText(context, "Saved PDF referee report to device", Toast.LENGTH_SHORT).show()
+          Toast.makeText(context, "Saved ${selectedExportScope.displayName} (.pdf)", Toast.LENGTH_SHORT).show()
         }.onFailure { err ->
           Toast.makeText(context, "PDF save failed: ${err.localizedMessage}", Toast.LENGTH_SHORT).show()
         }
@@ -2244,8 +2489,8 @@ private fun PdfAndOfflineExportCard(
   }
 
   IosGroupedCard(
-    header = "Export & Share Professional PDF Dossier",
-    footer = "Generates a formatted multi-page A4 PDF with the 6-axis scorecard and all 30 referee stages."
+    header = "Export & Share Publication-Grade PDF",
+    footer = "Scientific Appraisal Report exports a focused evidence-first A4 report (zero rubric truncation, widow/orphan pagination). Full Appendix also appends raw Stage 01 Red Team, Fortify Q&A, and Copyedit logs."
   ) {
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
       Row(
@@ -2260,17 +2505,29 @@ private fun PdfAndOfflineExportCard(
         )
         Column(modifier = Modifier.weight(1f)) {
           Text(
-            text = "Publication-Grade PDF Export",
+            text = selectedExportScope.displayName,
             style = MaterialTheme.typography.titleSmall,
             fontWeight = FontWeight.Bold
           )
           Text(
-            text = "Includes Executive Verdict, Credibility Scorecard, Red/Blue Cascade, Math & Copyedit.",
+            text = if (selectedExportScope == PdfExportScope.SCIENTIFIC_APPRAISAL_REPORT) {
+              "Evidence-first A4 report: Coverage disclosure, untruncated 6-axis rubric, Findings Ledger & Quantitative Audit."
+            } else {
+              "Complete archive including full Scientific Appraisal Report plus raw Stage 01, Reviewer 2 Q&A & Copyedit appendices."
+            },
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
           )
         }
       }
+
+      val scopes = PdfExportScope.entries
+      IosSegmentedControl(
+        items = scopes.map { it.shortLabel },
+        selectedIndex = scopes.indexOf(selectedExportScope).coerceAtLeast(0),
+        onSelect = { idx -> selectedExportScope = scopes[idx] },
+        modifier = Modifier.testTag("pdf_export_scope_selector")
+      )
 
       Row(
         modifier = Modifier.fillMaxWidth(),
@@ -2278,7 +2535,7 @@ private fun PdfAndOfflineExportCard(
       ) {
         IosSquircleButton(
           text = if (isExportingPdf) "Rendering PDF..." else "Share PDF",
-          onClick = onSharePdf,
+          onClick = { onSharePdf(selectedExportScope) },
           enabled = !isExportingPdf,
           icon = Icons.Default.Share,
           containerColor = CupertinoRed,

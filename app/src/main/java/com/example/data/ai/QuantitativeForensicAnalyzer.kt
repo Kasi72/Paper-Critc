@@ -20,7 +20,9 @@ data class QuantDiagnosticFinding(
   val metricOrCheck: String,
   val reportedEvidence: String,
   val status: QuantFindingStatus,
-  val diagnosticDetail: String
+  val diagnosticDetail: String,
+  val pageNumber: Int = 0,
+  val isAbsenceHeuristic: Boolean = false
 )
 
 data class StatcheckResult(
@@ -29,7 +31,8 @@ data class StatcheckResult(
   val reportedP: String,
   val recomputedP: Double,
   val status: QuantFindingStatus,
-  val note: String
+  val note: String,
+  val pageNumber: Int = 0
 )
 
 data class ConfidenceIntervalCheck(
@@ -40,7 +43,9 @@ data class ConfidenceIntervalCheck(
   val upper: Double,
   val impliedSe: Double?,
   val status: QuantFindingStatus,
-  val note: String
+  val note: String,
+  val pageNumber: Int = 0,
+  val crossReferenceNote: String = ""
 )
 
 data class MedianIqrCheck(
@@ -50,7 +55,8 @@ data class MedianIqrCheck(
   val q3: Double,
   val bowleySkewness: Double,
   val status: QuantFindingStatus,
-  val note: String
+  val note: String,
+  val pageNumber: Int = 0
 )
 
 data class QuantitativeForensicReport(
@@ -68,7 +74,7 @@ data class QuantitativeForensicReport(
       heterogeneitySignals.size + powerAndMultiplicityAlerts.size + algebraicAndMetricAlerts.size
 
   val criticalDiscrepancyCount: Int
-    get() = diagnosticTable.count { it.status == QuantFindingStatus.FAIL }
+    get() = diagnosticTable.count { it.status == QuantFindingStatus.FAIL && !it.isAbsenceHeuristic }
 
   val warningCount: Int
     get() = diagnosticTable.count { it.status == QuantFindingStatus.WARN }
@@ -79,17 +85,23 @@ data class QuantitativeForensicReport(
       "Summary: ${statcheckResults.size} statcheck recomputation(s), " +
         "${confidenceIntervalChecks.size} CI geometry check(s), " +
         "${medianIqrChecks.size} Median/IQR skewness check(s), " +
-        "$criticalDiscrepancyCount FAIL flag(s), $warningCount WARN flag(s)."
+        "$criticalDiscrepancyCount confirmed numerical FAIL flag(s), $warningCount WARN flag(s)."
+    )
+    appendLine(
+      "IMPORTANT RULE: Confirmed numerical FAIL flags above (e.g., impossible CI bounds, statcheck decision conflict) are verified arithmetic errors. " +
+        "Absence-of-keyword notes are ONLY prompts to verify in the complete manuscript, tables, and figures — NEVER treat a missing keyword as proof that an analysis was omitted!"
     )
 
     if (statcheckResults.isNotEmpty()) {
       appendLine("  Statcheck Test-Statistic Recalculations:")
-      statcheckResults.take(10).forEach { r ->
+      statcheckResults.take(12).forEach { r ->
+        val pg = if (r.pageNumber > 0) " [Page ${r.pageNumber}]" else ""
         appendLine(
           String.format(
             Locale.US,
-            "  * [%s] %s -> Recomputed two-tailed p = %.4f (%s)",
+            "  * [%s]%s %s -> Recomputed two-tailed p = %.4f (%s)",
             r.status.name,
+            pg,
             r.rawClaim,
             r.recomputedP,
             r.note
@@ -99,21 +111,25 @@ data class QuantitativeForensicReport(
     }
 
     if (confidenceIntervalChecks.isNotEmpty()) {
-      appendLine("  Confidence Interval Geometry & Implied SE Checks:")
-      confidenceIntervalChecks.take(10).forEach { c ->
+      appendLine("  Confidence Interval Geometry, Implied SE & Cross-Reference Checks:")
+      confidenceIntervalChecks.take(12).forEach { c ->
+        val pg = if (c.pageNumber > 0) " [Page ${c.pageNumber}]" else ""
         val seText = c.impliedSe?.let { String.format(Locale.US, "implied SE=%.4f", it) } ?: "SE n/a"
-        appendLine("  * [${c.status.name}] ${c.rawClaim} ($seText) -> ${c.note}")
+        val xref = if (c.crossReferenceNote.isNotBlank()) " | CROSS-REF: ${c.crossReferenceNote}" else ""
+        appendLine("  * [${c.status.name}]$pg ${c.rawClaim} ($seText) -> ${c.note}$xref")
       }
     }
 
     if (medianIqrChecks.isNotEmpty()) {
       appendLine("  Non-Parametric Median / IQR & Bowley Skewness Diagnostics:")
       medianIqrChecks.take(8).forEach { m ->
+        val pg = if (m.pageNumber > 0) " [Page ${m.pageNumber}]" else ""
         appendLine(
           String.format(
             Locale.US,
-            "  * [%s] %s | Bowley skew = %.2f -> %s",
+            "  * [%s]%s %s | Bowley skew = %.2f -> %s",
             m.status.name,
+            pg,
             m.rawClaim,
             m.bowleySkewness,
             m.note
@@ -147,10 +163,11 @@ data class QuantitativeForensicReport(
     appendLine("[PRE-FLIGHT DETERMINISTIC STATISTICAL FORENSICS (${diagnosticTable.size} Automated Checks)]")
     appendLine("| Check Domain | Reported Evidence | Status | Exact Mathematical Finding |")
     appendLine("|---|---|---|---|")
-    diagnosticTable.take(10).forEach { row ->
-      val safeCat = row.category.replace("|", "/")
-      val safeEv = row.reportedEvidence.replace("|", "/").take(68)
-      val safeDetail = row.diagnosticDetail.replace("|", "/").take(140)
+    diagnosticTable.take(12).forEach { row ->
+      val pg = if (row.pageNumber > 0) " (P${row.pageNumber})" else ""
+      val safeCat = (row.category + pg).replace("|", "/")
+      val safeEv = row.reportedEvidence.replace("|", "/").take(76)
+      val safeDetail = row.diagnosticDetail.replace("|", "/").take(220)
       appendLine("| $safeCat | $safeEv | ${row.status.name} | $safeDetail |")
     }
   }.trim()
@@ -159,11 +176,14 @@ data class QuantitativeForensicReport(
 /**
  * Pure-Kotlin deterministic statistical & mathematical forensics engine.
  * Implements exact CDF/survival functions (Normal, Student-t, Chi-Square, F) for statcheck
- * test-statistic recalculation, confidence interval symmetry/log-symmetry geometry checks,
- * Bowley IQR skewness diagnostics, meta-analysis heterogeneity/Egger audits, FWER inflation
- * checks, and algebraic metric plausibility bounds.
+ * test-statistic recalculation, parenthesized & narrative confidence interval geometry checks
+ * with cross-reference discrepancy linking (e.g., narrative vs. Figure 2), Bowley IQR skewness
+ * diagnostics, context-aware heterogeneity audits (recognizing inequalities like I² > 99% and
+ * text mentions like I2-statistic), FWER inflation checks, and algebraic metric bounds.
  */
 object QuantitativeForensicAnalyzer {
+
+  private val pageMarkerRegex = Regex("""\[PAGE\s+(\d+)\]""", RegexOption.IGNORE_CASE)
 
   // --- Regex Extractors ---
   private val tStatRegex = Regex(
@@ -187,8 +207,16 @@ object QuantitativeForensicAnalyzer {
     RegexOption.IGNORE_CASE
   )
 
-  private val ciRegex = Regex(
-    """\b(OR|aOR|RR|aRR|HR|aHR|IRR|SMD|MD|WMD|beta|β|mean|median|rate|estimate)?\s*[=:]?\s*([-+]?\d+(?:\.\d+)?)\s*\(\s*(?:95%\s*)?(?:CI|CrI|UI)\s*[:=]?\s*([-+]?\d+(?:\.\d+)?)\s*(?:to|–|—|-|,)\s*([-+]?\d+(?:\.\d+)?)\s*\)""",
+  // Standard parenthesized CI: "OR = 2.40 (95% CI 0.90–1.80)" or "9 (95% CI 3–15)"
+  private val ciParenRegex = Regex(
+    """\b(OR|aOR|RR|aRR|HR|aHR|IRR|SMD|MD|WMD|beta|β|mean|median|rate|estimate|pooled)?\s*(?:of\s*|was\s*|[=:]\s*)?([-+]?\d+(?:\.\d+)?)\s*\(\s*(?:95%\s*)?(?:CI|CrI|UI|confidence\s+interval)\s*(?:of\s*)?[:=]?\s*([-+]?\d+(?:\.\d+)?)\s*(?:to|–|—|-|,)\s*([-+]?\d+(?:\.\d+)?)\s*\)""",
+    RegexOption.IGNORE_CASE
+  )
+
+  // Narrative / comma-separated CI: "pooled long-stay bed estimate of 9, 95% CI 1.26 to 2.35"
+  // or "estimate of 9, with a 95% CI of 1.26–2.35"
+  private val ciNarrativeRegex = Regex(
+    """\b(OR|aOR|RR|aRR|HR|aHR|IRR|SMD|MD|WMD|beta|β|mean|median|rate|estimate|beds?)\s*(?:of\s*|was\s*|[=:]\s*)\s*([-+]?\d+(?:\.\d+)?)\s*[,;]\s*(?:with\s+(?:a\s+)?)?(?:95%\s*)?(?:CI|CrI|UI|confidence\s+interval)\s*(?:of\s*)?[:=]?\s*([-+]?\d+(?:\.\d+)?)\s*(?:to|–|—|-)\s*([-+]?\d+(?:\.\d+)?)""",
     RegexOption.IGNORE_CASE
   )
 
@@ -197,13 +225,14 @@ object QuantitativeForensicAnalyzer {
     RegexOption.IGNORE_CASE
   )
 
+  // Captures I² = 84%, I² > 99%, I2 >= 95%, I² above 99%, I2 exceeded 90%, I² of 88%
   private val iSquaredRegex = Regex(
-    """\bI(?:\^2|²|2)\s*[=≈]\s*(\d+(?:\.\d+)?)\s*%""",
+    """\bI(?:\^2|²|2)(?:\s*-?\s*statistic)?\s*(?:[=≈<>≤≥]|>=|<=|above|over|exceeded|exceeding|of|was|were)\s*(\d+(?:\.\d+)?)\s*%""",
     RegexOption.IGNORE_CASE
   )
 
   private val kStudiesRegex = Regex(
-    """\b(?:k\s*=\s*(\d+)|(\d+)\s+(?:included\s+)?studies)\b""",
+    """\b(?:k\s*=\s*(\d+)|(\d+)\s+(?:included\s+)?(?:studies|publications|articles|trials))\b""",
     RegexOption.IGNORE_CASE
   )
 
@@ -211,6 +240,13 @@ object QuantitativeForensicAnalyzer {
   private val aucRegex = Regex("""\b(?:AUC|AUROC)\s*=\s*([-+]?\d+(?:\.\d+)?)""", RegexOption.IGNORE_CASE)
   private val pValueLooseRegex = Regex("""\bp\s*([=<>≤≥])\s*([-+]?\d*\.?\d+)""", RegexOption.IGNORE_CASE)
   private val clusterCountRegex = Regex("""(\d+)\s+(?:clusters|states|countries|clinics|hospitals|schools|firms)\b""", RegexOption.IGNORE_CASE)
+
+  internal fun resolvePageNumberAtOffset(text: String, offset: Int): Int {
+    if (offset <= 0 || text.isEmpty()) return 0
+    val prefix = text.substring(0, offset.coerceAtMost(text.length))
+    val lastMatch = pageMarkerRegex.findAll(prefix).lastOrNull()
+    return lastMatch?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
+  }
 
   fun analyze(
     text: String,
@@ -236,20 +272,29 @@ object QuantitativeForensicAnalyzer {
           metricOrCheck = s.testType,
           reportedEvidence = s.rawClaim,
           status = s.status,
-          diagnosticDetail = String.format(Locale.US, "Recomputed p=%.4f. %s", s.recomputedP, s.note)
+          diagnosticDetail = String.format(Locale.US, "Recomputed p=%.4f. %s", s.recomputedP, s.note),
+          pageNumber = s.pageNumber,
+          isAbsenceHeuristic = false
         )
       )
     }
 
     ciChecks.forEach { c ->
       if (c.status != QuantFindingStatus.PASS || diagnosticTable.size < 6) {
+        val fullDetail = if (c.crossReferenceNote.isNotBlank()) {
+          "${c.note} ${c.crossReferenceNote}"
+        } else {
+          c.note
+        }
         diagnosticTable.add(
           QuantDiagnosticFinding(
-            category = "CI Geometry",
+            category = if (c.crossReferenceNote.isNotBlank()) "CI Cross-Ref" else "CI Geometry",
             metricOrCheck = c.metricLabel.ifBlank { "95% CI" },
             reportedEvidence = c.rawClaim,
             status = c.status,
-            diagnosticDetail = c.note
+            diagnosticDetail = fullDetail,
+            pageNumber = c.pageNumber,
+            isAbsenceHeuristic = false
           )
         )
       }
@@ -262,12 +307,19 @@ object QuantitativeForensicAnalyzer {
           metricOrCheck = "Median (IQR)",
           reportedEvidence = m.rawClaim,
           status = m.status,
-          diagnosticDetail = String.format(Locale.US, "Bowley skew=%.2f. %s", m.bowleySkewness, m.note)
+          diagnosticDetail = String.format(Locale.US, "Bowley skew=%.2f. %s", m.bowleySkewness, m.note),
+          pageNumber = m.pageNumber,
+          isAbsenceHeuristic = false
         )
       )
     }
 
     heterogeneitySignals.forEach { sig ->
+      val isAbsence = sig.contains("VERIFY", ignoreCase = true) ||
+        sig.contains("OMISSION", ignoreCase = true) ||
+        sig.contains("MISSING", ignoreCase = true) ||
+        sig.contains("UNWEIGHTED", ignoreCase = true) ||
+        sig.contains("PUBLICATION BIAS", ignoreCase = true)
       val status = when {
         sig.contains("FAIL", ignoreCase = true) || sig.contains("MISMATCH", ignoreCase = true) -> QuantFindingStatus.FAIL
         sig.contains("WARN", ignoreCase = true) || sig.contains("HIGH", ignoreCase = true) || sig.contains("MISSING", ignoreCase = true) -> QuantFindingStatus.WARN
@@ -276,10 +328,11 @@ object QuantitativeForensicAnalyzer {
       diagnosticTable.add(
         QuantDiagnosticFinding(
           category = "Meta-Synthesis",
-          metricOrCheck = "Heterogeneity / Bias",
+          metricOrCheck = "Heterogeneity / Synthesis",
           reportedEvidence = studyDesign.displayName,
           status = status,
-          diagnosticDetail = sig.replace(Regex("""^\[[^\]]+\]\s*"""), "")
+          diagnosticDetail = sig.replace(Regex("""^\[[^\]]+\]\s*"""), ""),
+          isAbsenceHeuristic = isAbsence
         )
       )
     }
@@ -292,7 +345,8 @@ object QuantitativeForensicAnalyzer {
           metricOrCheck = "Error Control",
           reportedEvidence = "Study inference",
           status = status,
-          diagnosticDetail = alert.replace(Regex("""^\[[^\]]+\]\s*"""), "")
+          diagnosticDetail = alert.replace(Regex("""^\[[^\]]+\]\s*"""), ""),
+          isAbsenceHeuristic = alert.contains("without", ignoreCase = true)
         )
       )
     }
@@ -304,14 +358,15 @@ object QuantitativeForensicAnalyzer {
           metricOrCheck = "Range / Plausibility",
           reportedEvidence = "Reported statistic",
           status = QuantFindingStatus.FAIL,
-          diagnosticDetail = alert
+          diagnosticDetail = alert,
+          isAbsenceHeuristic = false
         )
       )
     }
 
     val precisionMetrics = buildList {
       statchecks.forEach { add("${it.testType}: ${it.rawClaim}") }
-      ciChecks.take(4).forEach { add(it.rawClaim) }
+      ciChecks.take(6).forEach { add(it.rawClaim) }
       iqrChecks.take(4).forEach { add(it.rawClaim) }
     }
 
@@ -323,11 +378,13 @@ object QuantitativeForensicAnalyzer {
       powerAndMultiplicityAlerts = powerAlerts,
       algebraicAndMetricAlerts = metricAlerts,
       diagnosticTable = diagnosticTable.sortedBy {
-        when (it.status) {
-          QuantFindingStatus.FAIL -> 0
-          QuantFindingStatus.WARN -> 1
-          QuantFindingStatus.INFO -> 2
-          QuantFindingStatus.PASS -> 3
+        when {
+          it.status == QuantFindingStatus.FAIL && !it.isAbsenceHeuristic -> 0
+          it.status == QuantFindingStatus.FAIL -> 1
+          it.status == QuantFindingStatus.WARN && !it.isAbsenceHeuristic -> 2
+          it.status == QuantFindingStatus.WARN -> 3
+          it.status == QuantFindingStatus.INFO -> 4
+          else -> 5
         }
       },
       extractedPrecisionMetrics = precisionMetrics
@@ -340,43 +397,42 @@ object QuantitativeForensicAnalyzer {
   private fun runStatcheckAudit(text: String): List<StatcheckResult> {
     val results = mutableListOf<StatcheckResult>()
 
-    // Student's t(df) = val, p ...
-    tStatRegex.findAll(text).take(8).forEach { m ->
+    tStatRegex.findAll(text).take(10).forEach { m ->
       val df = m.groupValues[1].toDoubleOrNull() ?: return@forEach
       val tVal = m.groupValues[2].toDoubleOrNull() ?: return@forEach
       val op = m.groupValues[3]
       val repP = m.groupValues[4].toDoubleOrNull() ?: return@forEach
       if (df > 0.0 && repP in 0.0..1.0) {
         val calcP = studentTTwoTailedP(abs(tVal), df)
-        results.add(evaluateStatcheck(m.value.trim(), "t($df)", op, repP, calcP))
+        val pg = resolvePageNumberAtOffset(text, m.range.first)
+        results.add(evaluateStatcheck(m.value.trim(), "t($df)", op, repP, calcP, pg))
       }
     }
 
-    // Standard Normal z = val, p ...
-    zStatRegex.findAll(text).take(8).forEach { m ->
+    zStatRegex.findAll(text).take(10).forEach { m ->
       val zVal = m.groupValues[1].toDoubleOrNull() ?: return@forEach
       val op = m.groupValues[2]
       val repP = m.groupValues[3].toDoubleOrNull() ?: return@forEach
       if (repP in 0.0..1.0) {
         val calcP = normalTwoTailedP(abs(zVal))
-        results.add(evaluateStatcheck(m.value.trim(), "z", op, repP, calcP))
+        val pg = resolvePageNumberAtOffset(text, m.range.first)
+        results.add(evaluateStatcheck(m.value.trim(), "z", op, repP, calcP, pg))
       }
     }
 
-    // Chi-Square chi²(df) = val, p ...
-    chiSqRegex.findAll(text).take(8).forEach { m ->
+    chiSqRegex.findAll(text).take(10).forEach { m ->
       val df = m.groupValues[1].toDoubleOrNull() ?: return@forEach
       val chiVal = m.groupValues[2].toDoubleOrNull() ?: return@forEach
       val op = m.groupValues[3]
       val repP = m.groupValues[4].toDoubleOrNull() ?: return@forEach
       if (df > 0.0 && chiVal >= 0.0 && repP in 0.0..1.0) {
         val calcP = chiSquareUpperTailP(chiVal, df)
-        results.add(evaluateStatcheck(m.value.trim(), "χ²($df)", op, repP, calcP))
+        val pg = resolvePageNumberAtOffset(text, m.range.first)
+        results.add(evaluateStatcheck(m.value.trim(), "χ²($df)", op, repP, calcP, pg))
       }
     }
 
-    // F(df1, df2) = val, p ...
-    fStatRegex.findAll(text).take(8).forEach { m ->
+    fStatRegex.findAll(text).take(10).forEach { m ->
       val df1 = m.groupValues[1].toDoubleOrNull() ?: return@forEach
       val df2 = m.groupValues[2].toDoubleOrNull() ?: return@forEach
       val fVal = m.groupValues[3].toDoubleOrNull() ?: return@forEach
@@ -384,12 +440,12 @@ object QuantitativeForensicAnalyzer {
       val repP = m.groupValues[5].toDoubleOrNull() ?: return@forEach
       if (df1 > 0.0 && df2 > 0.0 && fVal >= 0.0 && repP in 0.0..1.0) {
         val calcP = fDistUpperTailP(fVal, df1, df2)
-        results.add(evaluateStatcheck(m.value.trim(), "F($df1,$df2)", op, repP, calcP))
+        val pg = resolvePageNumberAtOffset(text, m.range.first)
+        results.add(evaluateStatcheck(m.value.trim(), "F($df1,$df2)", op, repP, calcP, pg))
       }
     }
 
-    // Pearson r(df) = val, p ...
-    rStatRegex.findAll(text).take(8).forEach { m ->
+    rStatRegex.findAll(text).take(10).forEach { m ->
       val df = m.groupValues[1].toDoubleOrNull() ?: return@forEach
       val rVal = m.groupValues[2].toDoubleOrNull() ?: return@forEach
       val op = m.groupValues[3]
@@ -397,7 +453,8 @@ object QuantitativeForensicAnalyzer {
       if (df > 0.0 && abs(rVal) < 1.0 && repP in 0.0..1.0) {
         val tEquiv = abs(rVal) * sqrt(df / (1.0 - rVal * rVal))
         val calcP = studentTTwoTailedP(tEquiv, df)
-        results.add(evaluateStatcheck(m.value.trim(), "r($df)", op, repP, calcP))
+        val pg = resolvePageNumberAtOffset(text, m.range.first)
+        results.add(evaluateStatcheck(m.value.trim(), "r($df)", op, repP, calcP, pg))
       }
     }
 
@@ -409,7 +466,8 @@ object QuantitativeForensicAnalyzer {
     testType: String,
     op: String,
     reportedP: Double,
-    recomputedP: Double
+    recomputedP: Double,
+    pageNumber: Int
   ): StatcheckResult {
     val reportedSig = when (op) {
       "<", "≤" -> reportedP <= 0.05
@@ -431,7 +489,8 @@ object QuantitativeForensicAnalyzer {
         reportedP = "$op $reportedP",
         recomputedP = recomputedP,
         status = QuantFindingStatus.FAIL,
-        note = "GROSS DECISION DISCREPANCY: Reported significance at α=0.05 conflicts with exact two-tailed recalculation (verify one-tailed test, rounding, or transcription error)."
+        note = "GROSS DECISION DISCREPANCY: Reported significance at α=0.05 conflicts with exact two-tailed recalculation (verify one-tailed test, rounding, or transcription error).",
+        pageNumber = pageNumber
       )
       !isConsistent -> StatcheckResult(
         rawClaim = rawClaim,
@@ -439,7 +498,8 @@ object QuantitativeForensicAnalyzer {
         reportedP = "$op $reportedP",
         recomputedP = recomputedP,
         status = QuantFindingStatus.WARN,
-        note = "Numerical p-value discrepancy between reported statistic and exact two-tailed p (check df, continuity correction, or one-sided test)."
+        note = "Numerical p-value discrepancy between reported statistic and exact two-tailed p (check df, continuity correction, or one-sided test).",
+        pageNumber = pageNumber
       )
       else -> StatcheckResult(
         rawClaim = rawClaim,
@@ -447,55 +507,115 @@ object QuantitativeForensicAnalyzer {
         reportedP = "$op $reportedP",
         recomputedP = recomputedP,
         status = QuantFindingStatus.PASS,
-        note = "Test statistic and reported p-value are mathematically consistent."
+        note = "Test statistic and reported p-value are mathematically consistent.",
+        pageNumber = pageNumber
       )
     }
   }
 
   // ============================================================================
-  // 2. CONFIDENCE INTERVAL GEOMETRY, SYMMETRY & IMPLIED SE AUDIT
+  // 2. CONFIDENCE INTERVAL GEOMETRY, NARRATIVE CI & CROSS-REFERENCE LINKING
   // ============================================================================
-  private fun runConfidenceIntervalAudit(text: String): List<ConfidenceIntervalCheck> {
-    val checks = mutableListOf<ConfidenceIntervalCheck>()
-    val ratioMetrics = setOf("or", "aor", "rr", "arr", "hr", "ahr", "irr")
+  private data class RawCiCandidate(
+    val raw: String,
+    val label: String,
+    val point: Double,
+    val lower: Double,
+    val upper: Double,
+    val offset: Int,
+    val pageNumber: Int,
+    val contextSnippet: String
+  )
 
-    ciRegex.findAll(text).take(10).forEach { m ->
+  private fun runConfidenceIntervalAudit(text: String): List<ConfidenceIntervalCheck> {
+    val ratioMetrics = setOf("or", "aor", "rr", "arr", "hr", "ahr", "irr")
+    val candidates = mutableListOf<RawCiCandidate>()
+
+    fun collectMatch(m: MatchResult) {
       val label = m.groupValues[1].trim()
-      val pt = m.groupValues[2].toDoubleOrNull() ?: return@forEach
-      val low = m.groupValues[3].toDoubleOrNull() ?: return@forEach
-      val high = m.groupValues[4].toDoubleOrNull() ?: return@forEach
-      val raw = m.value.trim()
+      val pt = m.groupValues[2].toDoubleOrNull() ?: return
+      val low = m.groupValues[3].toDoubleOrNull() ?: return
+      val high = m.groupValues[4].toDoubleOrNull() ?: return
+      val start = (m.range.first - 55).coerceAtLeast(0)
+      val end = (m.range.last + 45).coerceAtMost(text.length)
+      val snippet = text.substring(start, end).replace(Regex("""\s+"""), " ").trim()
+      candidates.add(
+        RawCiCandidate(
+          raw = m.value.trim(),
+          label = label,
+          point = pt,
+          lower = low,
+          upper = high,
+          offset = m.range.first,
+          pageNumber = resolvePageNumberAtOffset(text, m.range.first),
+          contextSnippet = snippet
+        )
+      )
+    }
+
+    ciParenRegex.findAll(text).take(20).forEach(::collectMatch)
+    ciNarrativeRegex.findAll(text).take(20).forEach(::collectMatch)
+
+    val deduped = candidates.distinctBy { "${it.point}|${it.lower}|${it.upper}|${it.pageNumber}" }
+    val checks = mutableListOf<ConfidenceIntervalCheck>()
+
+    for (cand in deduped) {
+      val pt = cand.point
+      val low = cand.lower
+      val high = cand.upper
+      val label = cand.label
 
       if (low > high) {
         checks.add(
           ConfidenceIntervalCheck(
-            rawClaim = raw,
+            rawClaim = cand.raw,
             metricLabel = label,
             pointEstimate = pt,
             lower = low,
             upper = high,
             impliedSe = null,
             status = QuantFindingStatus.FAIL,
-            note = "Inverted confidence interval: lower bound ($low) exceeds upper bound ($high)."
+            note = "Inverted confidence interval: lower bound ($low) exceeds upper bound ($high).",
+            pageNumber = cand.pageNumber
           )
         )
-        return@forEach
+        continue
       }
 
       if (pt < low - 1e-6 || pt > high + 1e-6) {
+        // Cross-reference search: look for another valid CI in the same manuscript for the same point estimate
+        // (e.g., Page 8 narrative "9, 95% CI 1.26 to 2.35" vs. Page 9 Figure 2 "9 (95% CI 3–15)")
+        val matchingAlternate = deduped.firstOrNull { other ->
+          other !== cand &&
+            abs(other.point - pt) <= 0.05 &&
+            other.point >= other.lower - 1e-6 &&
+            other.point <= other.upper + 1e-6
+        }
+        val xrefNote = if (matchingAlternate != null) {
+          val altPage = if (matchingAlternate.pageNumber > 0) "Page ${matchingAlternate.pageNumber}" else "another section/figure"
+          val mentionsFigOrTable = Regex("""\b(?:figure|fig\.|table)\s*\d*\b""", RegexOption.IGNORE_CASE)
+            .find(matchingAlternate.contextSnippet)?.value
+          val locDesc = listOfNotNull(mentionsFigOrTable, altPage).joinToString(" / ")
+          "Cross-reference discrepancy: $locDesc reports a compatible interval for the same point estimate (${matchingAlternate.raw}). Verify intended confidence limits and correct the transcription error if confirmed."
+        } else {
+          ""
+        }
+
         checks.add(
           ConfidenceIntervalCheck(
-            rawClaim = raw,
+            rawClaim = cand.raw,
             metricLabel = label,
             pointEstimate = pt,
             lower = low,
             upper = high,
             impliedSe = null,
             status = QuantFindingStatus.FAIL,
-            note = "Impossible CI geometry: point estimate ($pt) falls OUTSIDE its own reported interval [$low, $high]."
+            note = "Impossible CI geometry: reported point estimate ($pt) falls OUTSIDE its own interval [$low, $high].",
+            pageNumber = cand.pageNumber,
+            crossReferenceNote = xrefNote
           )
         )
-        return@forEach
+        continue
       }
 
       val isRatio = label.lowercase(Locale.US) in ratioMetrics
@@ -517,14 +637,14 @@ object QuantitativeForensicAnalyzer {
         val note = if (status == QuantFindingStatus.WARN) {
           String.format(
             Locale.US,
-            "Log-scale asymmetry (%.0f%%) in %s 95%% CI; check exact profile-likelihood method or rounding/typo.",
+            "Log-scale asymmetry (%.0f%%) in %s 95%% CI; verify exact profile-likelihood method or rounding.",
             asymRatio * 100.0,
             label.uppercase(Locale.US)
           )
         } else {
           String.format(Locale.US, "Log-symmetric ratio CI (implied SE[ln]=%.3f).", seLn)
         }
-        checks.add(ConfidenceIntervalCheck(raw, label, pt, low, high, seLn, status, note))
+        checks.add(ConfidenceIntervalCheck(cand.raw, label, pt, low, high, seLn, status, note, cand.pageNumber))
       } else {
         val halfLow = pt - low
         val halfHigh = high - pt
@@ -546,11 +666,11 @@ object QuantitativeForensicAnalyzer {
         } else {
           String.format(Locale.US, "Consistent interval geometry (implied SE=%.3f).", impliedSe)
         }
-        checks.add(ConfidenceIntervalCheck(raw, label, pt, low, high, impliedSe, status, note))
+        checks.add(ConfidenceIntervalCheck(cand.raw, label, pt, low, high, impliedSe, status, note, cand.pageNumber))
       }
     }
 
-    return checks.distinctBy { it.rawClaim }
+    return checks.distinctBy { "${it.rawClaim}|${it.pageNumber}" }
   }
 
   // ============================================================================
@@ -558,11 +678,12 @@ object QuantitativeForensicAnalyzer {
   // ============================================================================
   private fun runMedianIqrAudit(text: String): List<MedianIqrCheck> {
     val checks = mutableListOf<MedianIqrCheck>()
-    medianIqrRegex.findAll(text).take(8).forEach { m ->
+    medianIqrRegex.findAll(text).take(10).forEach { m ->
       val med = m.groupValues[1].toDoubleOrNull() ?: return@forEach
       val q1 = m.groupValues[2].toDoubleOrNull() ?: return@forEach
       val q3 = m.groupValues[3].toDoubleOrNull() ?: return@forEach
       val raw = m.value.trim()
+      val pg = resolvePageNumberAtOffset(text, m.range.first)
 
       if (q1 > q3 || med < q1 || med > q3) {
         checks.add(
@@ -573,7 +694,8 @@ object QuantitativeForensicAnalyzer {
             q3 = q3,
             bowleySkewness = 0.0,
             status = QuantFindingStatus.FAIL,
-            note = "Quantile monotonicity violated: median ($med) must lie within [Q1=$q1, Q3=$q3] (or verify if Q3–Q1 difference vs bounds is reported)."
+            note = "Quantile monotonicity violated: median ($med) must lie within [Q1=$q1, Q3=$q3] (or verify if Q3–Q1 difference vs bounds is reported).",
+            pageNumber = pg
           )
         )
       } else {
@@ -583,18 +705,18 @@ object QuantitativeForensicAnalyzer {
         val status = if (absSkew >= 0.35) QuantFindingStatus.WARN else QuantFindingStatus.PASS
         val note = if (absSkew >= 0.35) {
           val dir = if (bowley > 0) "right-skewed" else "left-skewed"
-          "Substantially $dir empirical distribution; parametric normal approximations (mean/SD or Wan-Luo conversion) risk severe bias without log-transformation."
+          "Substantially $dir empirical distribution; parametric normal approximations risk bias without transformation."
         } else {
           "Quantiles ordered and reasonably symmetric across IQR."
         }
-        checks.add(MedianIqrCheck(raw, med, q1, q3, bowley, status, note))
+        checks.add(MedianIqrCheck(raw, med, q1, q3, bowley, status, note, pg))
       }
     }
     return checks.distinctBy { it.rawClaim }
   }
 
   // ============================================================================
-  // 4. META-ANALYSIS, HETEROGENEITY & SYNTHESIS DIAGNOSTICS
+  // 4. META-ANALYSIS, HETEROGENEITY & SYNTHESIS DIAGNOSTICS (PRECISION-GATED)
   // ============================================================================
   private fun runHeterogeneityAndSynthesisAudit(
     text: String,
@@ -612,37 +734,80 @@ object QuantitativeForensicAnalyzer {
       .toList()
     val maxK = kValues.maxOrNull()
 
+    val hasRandomEffects = lower.contains("random-effect") ||
+      lower.contains("random effect") ||
+      lower.contains("dersimonian") ||
+      lower.contains("reml") ||
+      lower.contains("paule-mandel") ||
+      lower.contains("inverse-variance") ||
+      lower.contains("meta-regression") ||
+      lower.contains("meta regression")
+
+    val hasFixedEffectOnly = (lower.contains("fixed-effect") || lower.contains("fixed effect")) && !hasRandomEffects
+
+    val mentionsHeterogeneityStatistic = i2Values.isNotEmpty() ||
+      lower.contains("i²") ||
+      lower.contains("i^2") ||
+      lower.contains("i2-statistic") ||
+      lower.contains("i2 statistic") ||
+      Regex("""\bi2\b""").containsMatchIn(lower) ||
+      lower.contains("tau²") ||
+      lower.contains("tau-squared") ||
+      lower.contains("τ²") ||
+      lower.contains("cochran") ||
+      (lower.contains("heterogeneity") && (lower.contains("figure") || lower.contains("table") || lower.contains("forest plot") || lower.contains("meta-regression")))
+
     if (i2Values.isNotEmpty()) {
       val maxI2 = i2Values.maxOrNull() ?: 0.0
       if (maxI2 > 100.0) {
         signals.add("[FAIL] Impossible heterogeneity statistic: reported I² = $maxI2% exceeds theoretical upper bound of 100%.")
       } else if (maxI2 >= 75.0) {
-        val usesFixed = lower.contains("fixed-effect") || lower.contains("fixed effect")
-        val usesRandom = lower.contains("random-effect") || lower.contains("random effect") || lower.contains("dersimonian") || lower.contains("reml")
-        if (usesFixed && !usesRandom) {
-          signals.add("[MODEL MISMATCH FAIL] Extreme heterogeneity (I² = ${maxI2.roundToInt()}%) paired with a Fixed-Effect pooling model; fixed-effect CIs severely understate uncertainty under τ² > 0.")
+        if (hasFixedEffectOnly) {
+          signals.add("[MODEL MISMATCH FAIL] Extreme heterogeneity (I² ≥ ${maxI2.roundToInt()}%) paired with a Fixed-Effect pooling model; fixed-effect CIs severely understate uncertainty under τ² > 0.")
         } else {
-          signals.add("[HIGH HETEROGENEITY WARN] Substantial cross-study heterogeneity detected (I² = ${maxI2.roundToInt()}%); verify whether 95% Prediction Intervals, τ² estimator (REML/HKSJ), and subgroup meta-regression explain variance.")
+          signals.add("[HIGH HETEROGENEITY INFO] Very high between-study heterogeneity quantified (I² ≥ ${maxI2.roundToInt()}%); interpret pooled point estimates cautiously and evaluate 95% Prediction Intervals and subgroup/meta-regression moderators.")
         }
       }
       if (maxI2 >= 50.0 && !lower.contains("prediction interval")) {
-        signals.add("[MISSING PREDICTION INTERVAL WARN] Moderate-to-high heterogeneity (I² ≥ 50%) reported without 95% Prediction Intervals to convey true range of expected effects in new settings.")
+        signals.add("[MISSING PREDICTION INTERVAL WARN] Substantial heterogeneity (I² ≥ 50%) is reported without 95% Prediction Intervals conveying the expected range of values in new clinical/policy settings.")
       }
     } else if (studyDesign == StudyDesignArchetype.SYSTEMATIC_REVIEW_META_ANALYSIS) {
-      if ((lower.contains("median") && lower.contains("iqr")) &&
-        !lower.contains("inverse-variance") && !lower.contains("random-effect") && !lower.contains("dersimonian") && !lower.contains("reml")
-      ) {
-        signals.add("[UNWEIGHTED SYNTHESIS WARN] Quantitative synthesis relies on unweighted medians/IQRs rather than precision-weighted (inverse-variance / REML) or quality-weighted meta-analytic estimators; small, low-rigor estimates receive equal weight to large national studies.")
+      // Only raise UNWEIGHTED SYNTHESIS when median/IQR is explicitly used AND no random-effects/weighted pooling is reported
+      if ((lower.contains("median") && (lower.contains("iqr") || lower.contains("interquartile"))) && !hasRandomEffects) {
+        signals.add("[UNWEIGHTED SYNTHESIS WARN] Quantitative synthesis appears to rely on unweighted medians/IQRs without precision-weighted (random-effects / inverse-variance) pooling; verify in Methods/Tables whether weighted pooling was performed.")
       }
-      if (!lower.contains("tau") && !lower.contains("τ") && !lower.contains("i²") && !lower.contains("i2") && !lower.contains("cochran")) {
-        signals.add("[HETEROGENEITY OMISSION WARN] No formal between-study variance quantification (I², τ², Cochran's Q) detected in this systematic review / meta-analysis.")
+      // Only raise HETEROGENEITY OMISSION when NO heterogeneity metric or figure/table heterogeneity reference appears anywhere
+      if (!mentionsHeterogeneityStatistic) {
+        signals.add("[HETEROGENEITY VERIFY WARN] No explicit between-study variance metric (I², τ², Cochran's Q) matched in extracted text; inspect figures, forest plots, and supplementary tables before concluding heterogeneity was omitted.")
       }
     }
 
+    // Precision-gated Publication Bias check: only warn about Egger/funnel plots when the review pools
+    // comparative effect sizes or intervention estimates with standard errors (avoid false alarms on
+    // descriptive consensus/normative bed-need surveys where funnel asymmetry tests may be inappropriate).
+    val isComparativeEffectPooling = lower.contains("odds ratio") ||
+      lower.contains("risk ratio") ||
+      lower.contains("hazard ratio") ||
+      lower.contains("standardized mean difference") ||
+      lower.contains("standardised mean difference") ||
+      lower.contains("hedges") ||
+      lower.contains("cohen's d") ||
+      lower.contains("randomized controlled") ||
+      lower.contains("randomised controlled") ||
+      lower.contains("effect size") ||
+      lower.contains("fixed-effect") ||
+      Regex("""\b(?:OR|RR|HR|SMD|WMD)\s*[=:]""").containsMatchIn(text)
+
+    val isNormativeConsensusSurvey = lower.contains("bed need") ||
+      lower.contains("psychiatric beds") ||
+      lower.contains("expert consensus") ||
+      lower.contains("delphi") ||
+      lower.contains("normative need")
+
     if (studyDesign == StudyDesignArchetype.SYSTEMATIC_REVIEW_META_ANALYSIS && maxK != null) {
       val hasEggerOrFunnel = lower.contains("egger") || lower.contains("funnel") || lower.contains("begg") || lower.contains("trim-and-fill") || lower.contains("publication bias")
-      if (maxK >= 10 && !hasEggerOrFunnel) {
-        signals.add("[PUBLICATION BIAS WARN] Sufficient study count detected (k = $maxK ≥ 10), yet no small-study / publication bias diagnostic (funnel plot, Egger's regression, Peters test, or trim-and-fill) was detected.")
+      if (maxK >= 10 && !hasEggerOrFunnel && isComparativeEffectPooling && !isNormativeConsensusSurvey) {
+        signals.add("[PUBLICATION BIAS WARN] Comparative synthesis includes k = $maxK ≥ 10 studies without a detected small-study / publication-bias assessment (funnel plot, Egger's regression, or Peters test); verify in Supplementary Materials.")
       } else if (maxK < 10 && (lower.contains("egger") || lower.contains("begg"))) {
         signals.add("[UNDERPOWERED BIAS TEST WARN] Egger's/Begg's asymmetry test referenced with k = $maxK < 10 studies (Cochrane Handbook cautions statistical power is too low to distinguish chance from real asymmetry).")
       }
@@ -669,7 +834,7 @@ object QuantitativeForensicAnalyzer {
 
     val borderlinePs = allPValues.count { it in 0.040..0.050 }
     if (borderlinePs >= 2) {
-      alerts.add("[P-CURVE FRAGILITY WARN] $borderlinePs p-values cluster narrowly in [0.040, 0.050]; high evidential fragility to minor covariate changes, outlier removal, or multiplicity control.")
+      alerts.add("[P-CURVE FRAGILITY WARN] $borderlinePs p-values cluster narrowly in [0.040, 0.050]; elevated evidential fragility to minor covariate changes, outlier removal, or multiplicity control.")
     }
 
     if (allPValues.size >= 4) {
@@ -690,7 +855,7 @@ object QuantitativeForensicAnalyzer {
         .toList()
       if (clusterCounts.isNotEmpty() && lower.contains("cluster") && !lower.contains("wild") && !lower.contains("bootstrap")) {
         val minClusters = clusterCounts.minOrNull() ?: 0
-        alerts.add("[SMALL-CLUSTER SE WARN] Clustered inference with G = $minClusters < 42 clusters without wild cluster bootstrap or Bell-McCaffrey degrees-of-freedom correction risks severe over-rejection.")
+        alerts.add("[SMALL-CLUSTER SE WARN] Clustered inference with G = $minClusters < 42 clusters without wild cluster bootstrap or Bell-McCaffrey degrees-of-freedom correction risks over-rejection.")
       }
     }
 
@@ -768,7 +933,6 @@ object QuantitativeForensicAnalyzer {
     return regularizedIncompleteBeta(df2 / 2.0, df1 / 2.0, x).coerceIn(0.0, 1.0)
   }
 
-  /** Complementary error function erfc(x) via Abramowitz & Stegun 7.1.26 (max error < 1.5e-7). */
   private fun erfc(x: Double): Double {
     val z = abs(x)
     val t = 1.0 / (1.0 + 0.5 * z)
@@ -794,7 +958,6 @@ object QuantitativeForensicAnalyzer {
     return if (x >= 0.0) ans else 2.0 - ans
   }
 
-  /** Lanczos approximation for ln(Gamma(z)). */
   private fun logGamma(z: Double): Double {
     val coeffs = doubleArrayOf(
       76.18009172947146,
@@ -816,7 +979,6 @@ object QuantitativeForensicAnalyzer {
     return -tmp + ln(2.5066282746310005 * ser / x)
   }
 
-  /** Regularized incomplete beta function I_x(a, b) via Lentz's continued fraction. */
   private fun regularizedIncompleteBeta(a: Double, b: Double, x: Double): Double {
     if (x <= 0.0) return 0.0
     if (x >= 1.0) return 1.0
@@ -862,13 +1024,11 @@ object QuantitativeForensicAnalyzer {
     return h
   }
 
-  /** Upper regularized incomplete gamma function Q(a, x) = 1 - P(a, x). */
   private fun regularizedGammaQ(a: Double, x: Double): Double {
     if (x < 0.0 || a <= 0.0) return 1.0
     if (x == 0.0) return 1.0
     val gln = logGamma(a)
     return if (x < a + 1.0) {
-      // Series representation for P(a, x)
       var ap = a
       var sum = 1.0 / a
       var del = sum
@@ -881,7 +1041,6 @@ object QuantitativeForensicAnalyzer {
       val p = sum * exp(-x + a * ln(x) - gln)
       (1.0 - p).coerceIn(0.0, 1.0)
     } else {
-      // Continued fraction for Q(a, x)
       val fpMin = 1.0e-30
       var b = x + 1.0 - a
       var c = 1.0 / fpMin

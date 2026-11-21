@@ -95,7 +95,7 @@ fun ApiKeysAndProvidersSettingsContent(
     // 1. Master AI Provider Routing Card (iOS Cupertino Switches)
     IosGroupedCard(
       header = "AI Analysis Routing & Free API Key Controls",
-      footer = "By default, Paper Critic uses Built-in Keyless Firebase AI Logic (zero API key required). Toggle custom routing below whenever you want to run analyses using your own Free API services or personal API keys."
+      footer = "By default, Paper Critic uses Built-in Keyless Firebase AI Logic. Personal API keys are encrypted at rest with Android Keystore AES-256-GCM and excluded from cloud backups."
     ) {
       Row(
         verticalAlignment = Alignment.CenterVertically,
@@ -129,7 +129,7 @@ fun ApiKeysAndProvidersSettingsContent(
         icon = Icons.Default.Key,
         iconTint = CupertinoBlue,
         title = "Use Custom / Free API Key Service",
-        subtitle = "Route 30-stage reviews & chat through your selected API key provider below",
+        subtitle = "Route reviews & chat strictly through your selected API key provider below",
         checked = settingsState.useCustomApiProvider,
         onCheckedChange = { enabled ->
           onUpdateSettings { current ->
@@ -156,8 +156,8 @@ fun ApiKeysAndProvidersSettingsContent(
       IosSettingToggleRow(
         icon = Icons.Default.Security,
         iconTint = CupertinoGreen,
-        title = "Auto-Fallback to Built-in Keyless Engine",
-        subtitle = "Automatically fall back to built-in Firebase AI Logic if a free API key hits rate limits",
+        title = "Permit Fallback to Built-in Engine",
+        subtitle = "Off by default for confidentiality. Enable only if you consent to routing failed custom-provider requests to Firebase AI Logic",
         checked = settingsState.autoFallbackToKeylessEngine,
         onCheckedChange = { enabled ->
           onUpdateSettings { it.copy(autoFallbackToKeylessEngine = enabled) }

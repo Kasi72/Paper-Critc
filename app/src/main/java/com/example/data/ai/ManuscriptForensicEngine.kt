@@ -6,30 +6,51 @@ import kotlin.math.roundToInt
 
 enum class StudyDesignArchetype(
   val displayName: String,
+  val reportingGuideline: String,
+  val riskOfBiasInstrument: String,
+  val certaintyFramework: String,
   val auditGuidance: String
 ) {
   SYSTEMATIC_REVIEW_META_ANALYSIS(
     displayName = "Systematic Review & Meta-Analysis",
-    auditGuidance = "Audit against PRISMA 2020, PROSPERO registration, search reproducibility, inter-rater screening reliability (Cohen's κ), Risk-of-Bias assessment (RoB2/NOS/JBI), heterogeneity (I²/τ²/subgroup sensitivity), and case-mix/construct harmonization. Do NOT critique absence of ML random seeds or neural network training splits."
+    reportingGuideline = "PRISMA 2020 (Reporting Completeness)",
+    riskOfBiasInstrument = "AMSTAR-2 / ROBIS (Review Quality) & RoB 2 / NOS / JBI (Primary Study Risk of Bias)",
+    certaintyFramework = "GRADE (Certainty of Evidence)",
+    auditGuidance = "Distinguish reporting guidelines (PRISMA 2020), review/primary-study risk-of-bias tools (AMSTAR-2, ROBIS, RoB 2, NOS, JBI), and certainty-of-evidence frameworks (GRADE) — do NOT treat them as interchangeable. Audit PROSPERO registration, search cutoff & reproducibility, dual/independent screening & extraction, heterogeneity (I²/τ²/meta-regression/Prediction Intervals), case-mix/construct harmonization, and clinical/policy transferability (including HIC vs. LMIC skew and need vs. utilization). Do NOT critique absence of ML random seeds or neural network splits."
   ),
   CLINICAL_EPIDEMIOLOGICAL(
     displayName = "Clinical / Epidemiological Study",
-    auditGuidance = "Audit against CONSORT/STROBE reporting, inclusion/exclusion criteria, selection/attrition bias, confounding & adjustment sets, measurement validity, sample power, and clinical generalizability. Do NOT apply ML hyperparameter or random-seed critiques unless predictive modeling is explicitly used."
+    reportingGuideline = "CONSORT (Trials) / STROBE (Observational)",
+    riskOfBiasInstrument = "RoB 2 (RCTs) / ROBINS-I / Newcastle-Ottawa Scale",
+    certaintyFramework = "GRADE Clinical Certainty & Minimal Important Difference (MID)",
+    auditGuidance = "Distinguish reporting (CONSORT/STROBE) from internal validity (RoB 2/ROBINS-I) and clinical utility. Audit patient representativeness, clinical vs. statistical significance (ARR, NNT, MID), benefits vs. harms balance, confounding & adjustment sets, attrition/missingness, and transferability to resource-constrained settings."
   ),
   MACHINE_LEARNING_AI(
     displayName = "Machine Learning / Computational Modeling",
-    auditGuidance = "Audit train/validation/test split hygiene, entity/subject leakage, hyperparameter tuning on test sets, baseline fairness, statistical significance across multiple seeds, ablation rigor, and replication code availability."
+    reportingGuideline = "TRIPOD+AI / CLAIM / NeurIPS Reproducibility Checklist",
+    riskOfBiasInstrument = "PROBAST+AI / Leakage & Generalization Audit",
+    certaintyFramework = "Out-of-Sample Calibration & External Validation",
+    auditGuidance = "Audit train/validation/test split hygiene, entity/subject/temporal leakage, hyperparameter tuning on evaluation sets, baseline fairness, statistical significance across multiple seeds, calibration (ECE/Brier), and replication code availability."
   ),
   ECONOMETRICS_CAUSAL(
     displayName = "Econometrics & Causal Inference",
-    auditGuidance = "Audit identification assumptions (parallel trends, exclusion restriction, conditional independence), bad controls/collider bias, look-ahead or survivorship bias, standard error clustering, and specification robustness."
+    reportingGuideline = "AEA / JPE Empirical Transparency Standards",
+    riskOfBiasInstrument = "Identification Strategy & Sensitivity Analysis (Oster / Rambachan-Roth)",
+    certaintyFramework = "Causal Credibility & External Validity",
+    auditGuidance = "Audit identification assumptions (parallel trends, exclusion restriction, conditional independence), bad controls/collider bias, look-ahead or survivorship bias, standard error clustering (G < 42), and specification robustness."
   ),
   THEORETICAL_FORMAL(
     displayName = "Theoretical / Formal Mathematical Paper",
+    reportingGuideline = "Formal Proof & Notation Standards",
+    riskOfBiasInstrument = "Axiomatic & Boundary-Condition Audit",
+    certaintyFramework = "Deductive Validity & Tightness of Bounds",
     auditGuidance = "Audit axioms, regularity/convexity/boundary assumptions, step-by-step proof completeness, notation/index consistency, edge cases, and non-triviality of theorems."
   ),
   GENERAL_EMPIRICAL(
     displayName = "Empirical & Methodological Research",
+    reportingGuideline = "Discipline-Appropriate Transparency Checklist",
+    riskOfBiasInstrument = "Construct, Internal & External Validity Appraisal",
+    certaintyFramework = "Evidential Strength & Replicability",
     auditGuidance = "Audit construct-to-measure validity, sampling/selection bias, quantitative consistency, omitted confounds, transparent reporting, and reproducibility."
   )
 }
@@ -47,6 +68,7 @@ data class ForensicPreFlightReport(
   val statisticalClaims: List<String>,
   val grimAndNumericAlerts: List<String>,
   val proceduralLeakageAlerts: List<String>,
+  val clinicalApplicabilityNotes: List<String> = emptyList(),
   val citationAlerts: List<String>,
   val replicationCodeAlerts: List<String>,
   val citationCountEstimate: Int,
@@ -62,13 +84,16 @@ data class ForensicPreFlightReport(
   )
 ) {
   fun toStructuredPromptContext(): String = buildString {
-    appendLine("=== DETERMINISTIC FORENSIC PRE-FLIGHT SCAN (STAGE 00a / 01c / 01e / 01i / 02a / 03b) ===")
+    appendLine("=== DETERMINISTIC FORENSIC PRE-FLIGHT SCAN ===")
     appendLine("Word Count: $wordCount words (~$estimatedPages pages) | Detected Domain: $detectedDiscipline")
     appendLine("Detected Study Design: ${studyDesign.displayName}")
+    appendLine("  • Reporting Guideline: ${studyDesign.reportingGuideline}")
+    appendLine("  • Risk-of-Bias / Quality Instrument: ${studyDesign.riskOfBiasInstrument}")
+    appendLine("  • Certainty-of-Evidence Framework: ${studyDesign.certaintyFramework}")
     appendLine("Domain-Exact Audit Mandate: ${studyDesign.auditGuidance}")
     appendLine("Signal Balance: Empirical markers=$empiricalSignalsCount, Theoretical markers=$theoreticalSignalsCount | Citations detected: ~$citationCountEstimate")
 
-    appendLine("\n[1. EXTRACTED EQUATIONS & NOTATION INVENTORY (Stage 01e–01fd Input)]")
+    appendLine("\n[1. EXTRACTED EQUATIONS & NOTATION INVENTORY]")
     if (extractedEquations.isEmpty()) {
       appendLine("- No explicit LaTeX or symbolic display equations detected in plain text.")
     } else {
@@ -81,35 +106,40 @@ data class ForensicPreFlightReport(
       symbolAndNotationAlerts.forEach { appendLine("  * [MATH-ALERT] $it") }
     }
 
-    appendLine("\n[2. SAMPLE SIZES, TEST STATISTICS & GRIM CONSISTENCY (Stage 02a Numbers Input)]")
+    appendLine("\n[2. SAMPLE SIZES, TEST STATISTICS & GRIM CONSISTENCY]")
     if (extractedSampleSizes.isEmpty()) {
       appendLine("- No explicit sample size declarations (N = ...) matched.")
     } else {
       appendLine("  Sample Sizes Found: ${extractedSampleSizes.joinToString(", ")}")
     }
     if (statisticalClaims.isNotEmpty()) {
-      appendLine("  Statistical Claims Found: ${statisticalClaims.take(12).joinToString(" | ")}")
+      appendLine("  Statistical Claims Found: ${statisticalClaims.take(14).joinToString(" | ")}")
     }
     if (grimAndNumericAlerts.isNotEmpty()) {
       appendLine("  Quantitative / GRIM / Consistency Alerts:")
       grimAndNumericAlerts.forEach { appendLine("  * [NUMBERS-ALERT] $it") }
     }
 
-    appendLine("\n[3. PROCEDURAL, IDENTIFICATION & DATA LEAKAGE HAZARDS (Stage 01b/01c/01i Input)]")
+    appendLine("\n[3. DESIGN-SPECIFIC METHODOLOGICAL & REPORTING CHECKS (Verify in Complete Text)]")
     if (proceduralLeakageAlerts.isEmpty()) {
-      appendLine("- No immediate regex-level leakage strings matched; perform deep semantic audit.")
+      appendLine("- No immediate keyword-level methodological gaps flagged; perform deep full-text semantic appraisal.")
     } else {
-      proceduralLeakageAlerts.forEach { appendLine("  * [FORENSIC-FLAG] $it") }
+      proceduralLeakageAlerts.forEach { appendLine("  * [CHECK] $it") }
+    }
+
+    if (clinicalApplicabilityNotes.isNotEmpty()) {
+      appendLine("\n[4. CLINICAL & POLICY APPLICABILITY LENS]")
+      clinicalApplicabilityNotes.forEach { appendLine("  * [CLINICAL/POLICY] $it") }
     }
 
     if (citationAlerts.isNotEmpty()) {
-      appendLine("\n[4. CITATION & BIBLIOGRAPHY CROSS-CHECK (Stage 03b External Check Input)]")
+      appendLine("\n[5. CITATION & BIBLIOGRAPHY CROSS-CHECK]")
       citationAlerts.forEach { appendLine("  * [CITATION-ALERT] $it") }
     }
 
     if (replicationCodeAlerts.isNotEmpty()) {
-      appendLine("\n[5. REPLICATION CODE PACKAGE STATIC AUDIT (Stage 00_prep_code / 01i–01n / 07b Input)]")
-      replicationCodeAlerts.forEach { appendLine("  * [CODE-GONZO-FLAG] $it") }
+      appendLine("\n[6. REPLICATION CODE PACKAGE STATIC AUDIT]")
+      replicationCodeAlerts.forEach { appendLine("  * [CODE-FLAG] $it") }
     }
 
     appendLine()
@@ -236,7 +266,7 @@ object ManuscriptForensicEngine {
       if (claim !in statClaims) statClaims.add(claim)
     }
 
-    // GRIM (Granularity-Related Inconsistency of Means) check when N < 100
+    // GRIM check when N < 100
     val smallSampleN = numericSampleValues.filter { it in 5..95 }
     if (smallSampleN.isNotEmpty()) {
       val nRef = smallSampleN.first()
@@ -249,7 +279,7 @@ object ManuscriptForensicEngine {
             grimAlerts.add(
               String.format(
                 Locale.US,
-                "GRIM Granularity Check: Reported %.2f%% with N=%d implies %.2f observations (non-integer/non-half count unless denominator differs).",
+                "GRIM Granularity Check: Reported %.2f%% with N=%d implies %.2f observations (verify exact denominator).",
                 pct,
                 nRef,
                 impliedCount
@@ -260,11 +290,12 @@ object ManuscriptForensicEngine {
       }
     }
 
-    // 4. Study Design Archetype Classification (drives domain-exact auditing)
+    // 4. Study Design Archetype Classification
     val lower = cleanText.lowercase(Locale.US)
     val isSystematicReview = lower.contains("systematic review") ||
       lower.contains("meta-analysis") ||
       lower.contains("meta analysis") ||
+      lower.contains("meta-analyses") ||
       lower.contains("prisma") ||
       (lower.contains("pubmed") && (lower.contains("embase") || lower.contains("psycinfo") || lower.contains("cochrane")))
     val isMlPaper = lower.contains("neural network") ||
@@ -307,34 +338,54 @@ object ManuscriptForensicEngine {
       else -> StudyDesignArchetype.GENERAL_EMPIRICAL
     }
 
-    // 5. Study-Design-Aware Procedural, Methodological & Reproducibility Forensic Checks
+    // 5. Study-Design-Aware Methodological, Reporting & Risk-of-Bias Checks (nuanced, non-overclaiming)
     val leakageAlerts = mutableListOf<String>()
 
     when (studyDesign) {
       StudyDesignArchetype.SYSTEMATIC_REVIEW_META_ANALYSIS -> {
         if (!lower.contains("prospero") && !lower.contains("pre-regist") && !lower.contains("preregist") && !lower.contains("osf.io") && !lower.contains("protocol")) {
           leakageAlerts.add(
-            "[PROTOCOL REGISTRATION GAP] No PROSPERO, OSF, or a priori protocol registration identifier detected for this systematic review."
+            "[PROTOCOL REGISTRATION CHECK] No PROSPERO, OSF, or a priori protocol identifier matched in extracted text; confirm in Methods/Supplement."
           )
         }
-        if (!lower.contains("kappa") && !lower.contains("inter-rater") && !lower.contains("interrater") && !lower.contains("independent reviewer")) {
+        val hasIndependentScreeningOrExtraction = lower.contains("kappa") ||
+          lower.contains("inter-rater") ||
+          lower.contains("interrater") ||
+          lower.contains("independent reviewer") ||
+          lower.contains("independently extracted") ||
+          lower.contains("independently screened") ||
+          lower.contains("two reviewers") ||
+          lower.contains("two authors") ||
+          lower.contains("three authors") ||
+          lower.contains("duplicate extraction")
+        if (!hasIndependentScreeningOrExtraction) {
           leakageAlerts.add(
-            "[SCREENING RELIABILITY GAP] No explicit inter-rater reliability metric (e.g., Cohen's κ) or dual independent screening discrepancy protocol detected."
+            "[SCREENING / EXTRACTION RELIABILITY CHECK] No explicit independent/duplicate screening or inter-rater reliability (Cohen's κ) statement matched; verify in Methods."
           )
         }
-        if (!lower.contains("risk of bias") && !lower.contains("newcastle-ottawa") && !lower.contains("cochrane") && !lower.contains("rob2") && !lower.contains("quality assessment") && !lower.contains("jbi")) {
+
+        val hasValidatedRobTool = lower.contains("rob 2") || lower.contains("rob2") ||
+          lower.contains("robins-i") || lower.contains("newcastle-ottawa") ||
+          lower.contains("jbi") || lower.contains("amstar") || lower.contains("cochrane risk of bias")
+        val hasCustomQualityScore = lower.contains("quality score") ||
+          lower.contains("quality-scoring") ||
+          lower.contains("quality scoring") ||
+          lower.contains("quality assessment") ||
+          lower.contains("quality appraisal") ||
+          lower.contains("risk of bias")
+        if (!hasValidatedRobTool && hasCustomQualityScore) {
           leakageAlerts.add(
-            "[RISK-OF-BIAS GAP] No formal study quality or Risk-of-Bias appraisal framework (e.g., RoB 2, Newcastle-Ottawa, JBI, AMSTAR-2) detected."
+            "[QUALITY APPRAISAL INSTRUMENT NOTE] A study quality-scoring approach is described, rather than a validated domain-based Risk-of-Bias instrument (e.g., RoB 2, ROBINS-I, NOS, JBI, AMSTAR-2); note limitations of composite quality scores without claiming appraisal was absent."
+          )
+        } else if (!hasValidatedRobTool && !hasCustomQualityScore) {
+          leakageAlerts.add(
+            "[RISK-OF-BIAS INSTRUMENT CHECK] No primary-study Risk-of-Bias tool (RoB 2, NOS, JBI) or quality-scoring procedure matched in extracted text; verify Methods & Supplement."
           )
         }
-        if (!lower.contains("sensitivity analysis") && !lower.contains("subgroup") && !lower.contains("i2") && !lower.contains("i^2") && !lower.contains("heterogeneity")) {
+
+        if (!lower.contains("grade ") && !lower.contains("certainty of evidence")) {
           leakageAlerts.add(
-            "[HETEROGENEITY CHECK] Verify whether cross-study heterogeneity (I² / τ² / stratified sensitivity analysis) is formally quantified."
-          )
-        }
-        if (!lower.contains("github.com") && !lower.contains("osf.io") && !lower.contains("supplementary") && !lower.contains("extraction") && replicationCode.isBlank()) {
-          leakageAlerts.add(
-            "[DATA PROVENANCE GAP] No open-access extraction spreadsheet, screening log, or synthesis script repository link detected."
+            "[CERTAINTY OF EVIDENCE (GRADE)] No formal GRADE certainty-of-evidence rating detected (distinct from PRISMA reporting compliance and primary-study quality scoring)."
           )
         }
       }
@@ -417,7 +468,27 @@ object ManuscriptForensicEngine {
       }
     }
 
-    // 6. Stage 03b External Citation & Bibliography Cross-Checker
+    // 6. Clinical & Health-Policy Applicability Checks (for biomedical / psychiatric / clinical reviews)
+    val clinicalNotes = mutableListOf<String>()
+    if (isClinicalPaper || studyDesign == StudyDesignArchetype.CLINICAL_EPIDEMIOLOGICAL ||
+      (studyDesign == StudyDesignArchetype.SYSTEMATIC_REVIEW_META_ANALYSIS && isClinicalPaper)
+    ) {
+      if (lower.contains("high-income") || lower.contains("hic") || lower.contains("low- and middle-income") || lower.contains("lmic")) {
+        clinicalNotes.add(
+          "Geographic & Resource-Setting Transferability: Evaluate whether high-income country (HIC) dominance limits applicability to low- and middle-income (LMIC) health systems."
+        )
+      }
+      if (lower.contains("psychiatric bed") || lower.contains("inpatient bed") || lower.contains("bed need")) {
+        clinicalNotes.add(
+          "Need vs. Utilization Distinction: Distinguish normative/expert bed-need benchmarks from observed bed utilization, community mental health alternatives, case-mix acuity, length of stay, and local capacity constraints."
+        )
+      }
+      clinicalNotes.add(
+        "Clinical Utility & Certainty: Evaluate patient representativeness, whether outcome definitions are clinically meaningful, balance of benefits vs. harms, and justified certainty of evidence."
+      )
+    }
+
+    // 7. Citation & Bibliography Cross-Checker
     val citationAlerts = mutableListOf<String>()
     val numberedCitations = citationBracketRegex.findAll(cleanText)
       .flatMap { m -> m.groupValues[1].split(",").mapNotNull { it.trim().toIntOrNull() } }
@@ -438,13 +509,13 @@ object ManuscriptForensicEngine {
       }
     }
     if (wordCount > 150 && totalCitations == 0 && !lower.contains("references") && !lower.contains("bibliography")) {
-      citationAlerts.add("Manuscript body contains zero formal numbered [N] or (Author, Year) literature citations; Stage 03b External Check will audit prior-art grounding.")
+      citationAlerts.add("Manuscript body contains zero formal numbered [N] or (Author, Year) literature citations; verify prior-art grounding.")
     }
 
-    // 7. Stage 00_prep_code / 01i–01n Replication Code Static Analyzer
+    // 8. Replication Code Static Analyzer
     val codeAlerts = analyzeReplicationCode(replicationCode, numericSampleValues)
 
-    // 8. Discipline Classification
+    // 9. Discipline Classification
     val discipline = when {
       lower.contains("psychiatric") || lower.contains("mental health") || lower.contains("deinstitutionalization") || lower.contains("inpatient bed") ->
         "Psychiatry, Public Health & Health Services Research"
@@ -463,7 +534,7 @@ object ManuscriptForensicEngine {
       else -> "Empirical & Methodological Research"
     }
 
-    // 9. Deep Deterministic Quantitative & Statistical Forensics (Statcheck, CI, IQR, Heterogeneity, FWER)
+    // 10. Deep Deterministic Quantitative & Statistical Forensics
     val quantForensics = QuantitativeForensicAnalyzer.analyze(
       text = cleanText,
       studyDesign = studyDesign,
@@ -483,6 +554,7 @@ object ManuscriptForensicEngine {
       statisticalClaims = statClaims.distinct(),
       grimAndNumericAlerts = grimAlerts.distinct(),
       proceduralLeakageAlerts = leakageAlerts.distinct(),
+      clinicalApplicabilityNotes = clinicalNotes.distinct(),
       citationAlerts = citationAlerts.distinct(),
       replicationCodeAlerts = codeAlerts.distinct(),
       citationCountEstimate = totalCitations,
@@ -498,37 +570,33 @@ object ManuscriptForensicEngine {
     val alerts = mutableListOf<String>()
     val lower = code.lowercase(Locale.US)
 
-    // Check for fit_transform before train_test_split
     val fitTransformIdx = lower.indexOf("fit_transform")
     val splitIdx = lower.indexOf("train_test_split")
     if (fitTransformIdx >= 0 && splitIdx >= 0 && fitTransformIdx < splitIdx) {
-      alerts.add("[CODE LEAKAGE — Stage 01i] `fit_transform()` is called BEFORE `train_test_split()`, leaking test-set mean/variance into training features.")
+      alerts.add("[CODE LEAKAGE] `fit_transform()` is called BEFORE `train_test_split()`, leaking test-set mean/variance into training features.")
     }
 
-    // Check for silent observation dropping
     if (lower.contains("dropna(") || lower.contains("na.omit(") || lower.contains("drop if missing")) {
-      alerts.add("[SAMPLE ATTRITION — Stage 01i/01k] Replication code drops missing observations (`dropna` / `na.omit` / `drop if`); verify whether dropped rows match manuscript sample size N.")
+      alerts.add("[SAMPLE ATTRITION] Replication code drops missing observations (`dropna` / `na.omit` / `drop if`); verify whether dropped rows match manuscript sample size N.")
     }
 
-    // Check for random seed setting
     val hasSeed = lower.contains("random_state") ||
       lower.contains("set.seed") ||
       lower.contains("manual_seed") ||
       lower.contains("np.random.seed") ||
       lower.contains("set seed")
     if (!hasSeed) {
-      alerts.add("[NON-DETERMINISTIC CODE — Stage 01j] Replication scripts do not set an explicit random seed (`random_state`, `set.seed`, `manual_seed`).")
+      alerts.add("[NON-DETERMINISTIC CODE] Replication scripts do not set an explicit random seed (`random_state`, `set.seed`, `manual_seed`).")
     }
 
-    // Check for test-set peeking in hyperparameter tuning
     if ((lower.contains("gridsearchcv") || lower.contains("optuna") || lower.contains("cross_val")) &&
       (lower.contains("x_test") || lower.contains("test_df") || lower.contains("test_loader"))
     ) {
-      alerts.add("[TEST-SET PEEKING — Stage 01i] Hyperparameter search or cross-validation block references test-set variables (`X_test` / `test_df`).")
+      alerts.add("[TEST-SET PEEKING] Hyperparameter search or cross-validation block references test-set variables (`X_test` / `test_df`).")
     }
 
     if (alerts.isEmpty()) {
-      alerts.add("Replication code package attached (${code.lines().size} lines); Stage 01i Divergence Hunter & Stage 07b Data Editor will cross-examine code vs. paper claims.")
+      alerts.add("Replication code package attached (${code.lines().size} lines); cross-examining code vs. paper claims.")
     }
     return alerts
   }

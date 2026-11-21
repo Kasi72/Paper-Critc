@@ -6,12 +6,180 @@ import com.google.firebase.firestore.Exclude
 import com.google.firebase.firestore.IgnoreExtraProperties
 import com.google.firebase.firestore.PropertyName
 import com.google.firebase.firestore.ServerTimestamp
+import kotlin.math.roundToInt
+import org.json.JSONArray
+import org.json.JSONObject
+
+/**
+ * Appraisal framing mode for Paper Critic.
+ * - [POST_PUBLICATION_APPRAISAL]: Default for already published articles (evaluates methodological rigor,
+ *   factual/numerical accuracy, applicability, and errata/caveats rather than journal Accept/Reject).
+ * - [JOURNAL_REFEREE]: Peer-review referee decision mode (Accept, Minor Revision, Major Revision, etc.).
+ * - [CLINICAL_EVIDENCE_APPRAISAL]: Biomedical/clinical utility lens evaluating patient representativeness,
+ *   patient-important outcomes, benefits vs. harms, resource-constrained/LMIC transferability, and GRADE certainty.
+ */
+enum class ReviewMode(
+  val shortLabel: String,
+  val displayTitle: String,
+  val description: String
+) {
+  POST_PUBLICATION_APPRAISAL(
+    shortLabel = "Post-Pub",
+    displayTitle = "Post-Publication Critical Appraisal",
+    description = "Evidence-grounded appraisal of published articles (credibility, errata & applicability)"
+  ),
+  JOURNAL_REFEREE(
+    shortLabel = "Referee",
+    displayTitle = "Journal Peer-Review Referee",
+    description = "Formal editorial submission review with Accept / Revision / Reject decision"
+  ),
+  CLINICAL_EVIDENCE_APPRAISAL(
+    shortLabel = "Clinical",
+    displayTitle = "Clinical & Policy Evidence Appraisal",
+    description = "Patient representativeness, harms vs. benefits, LMIC transferability & GRADE certainty"
+  );
+
+  companion object {
+    fun fromNameOrDefault(name: String?): ReviewMode =
+      entries.firstOrNull { it.name.equals(name, ignoreCase = true) } ?: POST_PUBLICATION_APPRAISAL
+  }
+}
+
+/**
+ * Source-document coordinate anchor linking every finding directly to an exact passage and page.
+ */
+data class EvidenceAnchor(
+  val documentId: String = "",
+  val pageNumber: Int = 0,
+  val section: String? = null,
+  val exactQuote: String = "",
+  val startOffset: Int? = null,
+  val endOffset: Int? = null,
+  val boundingBox: List<Float>? = null
+)
+
+enum class FindingStatus(val displayBadge: String) {
+  VERIFIED("VERIFIED"),
+  PARTIALLY_SUPPORTED("PARTIALLY SUPPORTED"),
+  CONTRADICTED("CONTRADICTED"),
+  UNVERIFIED("UNVERIFIED"),
+  NOT_APPLICABLE("NOT APPLICABLE");
+
+  companion object {
+    fun fromNameOrDefault(raw: String?): FindingStatus =
+      entries.firstOrNull { it.name.equals(raw?.trim()?.replace(' ', '_'), ignoreCase = true) }
+        ?: UNVERIFIED
+  }
+}
+
+/**
+ * Structured, evidence-anchored critical appraisal finding (e.g., M-01, Q-01, R-01).
+ * A finding cannot remain [FindingStatus.VERIFIED] unless its supporting evidence passes
+ * source-document grounding verification.
+ */
+data class ReviewFinding(
+  val id: String,
+  val title: String,
+  val allegation: String,
+  val severity: String, // CRITICAL, MAJOR, MINOR, INFO
+  val status: FindingStatus,
+  val supportingEvidence: List<EvidenceAnchor> = emptyList(),
+  val counterEvidence: List<EvidenceAnchor> = emptyList(),
+  val methodologicalJustification: String = "",
+  val recommendedCorrection: String = "",
+  val verificationNotes: String = ""
+)
+
+object ReviewFindingCodec {
+  fun encode(findings: List<ReviewFinding>): String {
+    if (findings.isEmpty()) return ""
+    val arr = JSONArray()
+    findings.forEach { f ->
+      val obj = JSONObject()
+      obj.put("id", f.id)
+      obj.put("title", f.title)
+      obj.put("allegation", f.allegation)
+      obj.put("severity", f.severity)
+      obj.put("status", f.status.name)
+      obj.put("supportingEvidence", encodeAnchors(f.supportingEvidence))
+      obj.put("counterEvidence", encodeAnchors(f.counterEvidence))
+      obj.put("methodologicalJustification", f.methodologicalJustification)
+      obj.put("recommendedCorrection", f.recommendedCorrection)
+      obj.put("verificationNotes", f.verificationNotes)
+      arr.put(obj)
+    }
+    return arr.toString()
+  }
+
+  fun decode(rawJson: String): List<ReviewFinding> {
+    if (rawJson.isBlank()) return emptyList()
+    return runCatching {
+      val arr = JSONArray(rawJson)
+      buildList {
+        for (i in 0 until arr.length()) {
+          val obj = arr.optJSONObject(i) ?: continue
+          add(
+            ReviewFinding(
+              id = obj.optString("id", "F-${i + 1}"),
+              title = obj.optString("title", "Untitled Finding"),
+              allegation = obj.optString("allegation", ""),
+              severity = obj.optString("severity", "MAJOR").uppercase(),
+              status = FindingStatus.fromNameOrDefault(obj.optString("status", "UNVERIFIED")),
+              supportingEvidence = decodeAnchors(obj.optJSONArray("supportingEvidence")),
+              counterEvidence = decodeAnchors(obj.optJSONArray("counterEvidence")),
+              methodologicalJustification = obj.optString("methodologicalJustification", ""),
+              recommendedCorrection = obj.optString("recommendedCorrection", ""),
+              verificationNotes = obj.optString("verificationNotes", "")
+            )
+          )
+        }
+      }
+    }.getOrDefault(emptyList())
+  }
+
+  private fun encodeAnchors(anchors: List<EvidenceAnchor>): JSONArray {
+    val arr = JSONArray()
+    anchors.forEach { a ->
+      val obj = JSONObject()
+      obj.put("documentId", a.documentId)
+      obj.put("pageNumber", a.pageNumber)
+      if (a.section != null) obj.put("section", a.section)
+      obj.put("exactQuote", a.exactQuote)
+      if (a.startOffset != null) obj.put("startOffset", a.startOffset)
+      if (a.endOffset != null) obj.put("endOffset", a.endOffset)
+      arr.put(obj)
+    }
+    return arr
+  }
+
+  private fun decodeAnchors(arr: JSONArray?): List<EvidenceAnchor> {
+    if (arr == null) return emptyList()
+    return buildList {
+      for (i in 0 until arr.length()) {
+        val obj = arr.optJSONObject(i) ?: continue
+        add(
+          EvidenceAnchor(
+            documentId = obj.optString("documentId", ""),
+            pageNumber = obj.optInt("pageNumber", 0),
+            section = obj.optString("section", "").takeIf { it.isNotBlank() },
+            exactQuote = obj.optString("exactQuote", ""),
+            startOffset = if (obj.has("startOffset") && !obj.isNull("startOffset")) obj.optInt("startOffset") else null,
+            endOffset = if (obj.has("endOffset") && !obj.isNull("endOffset")) obj.optInt("endOffset") else null
+          )
+        )
+      }
+    }
+  }
+}
 
 /**
  * Structured evaluation rubric for critical journal paper review.
  * Captures quantitative ratings (1–10) and qualitative referee justifications
- * across core peer-review dimensions: Methodology, Clarity, Significance,
+ * across core peer-review dimensions: Methodology, Significance, Clarity,
  * Originality, Mathematical Rigor, and Reproducibility.
+ *
+ * The composite [overallCredibilityScore] is computed strictly from the 6 weighted dimensions
+ * via [computeWeightedScore] so the headline score and rubric NEVER disagree.
  */
 data class PaperReviewRubric(
   val methodology: Int = 7,
@@ -23,17 +191,18 @@ data class PaperReviewRubric(
   val originality: Int = 7,
   val originalityJustification: String = "Assesses novelty of the research question, model formulation, or dataset.",
   val mathematicalRigor: Int = 7,
-  val mathematicalRigorJustification: String = "Assesses equation correctness, proof completeness, and subscript/notation consistency.",
+  val mathematicalRigorJustification: String = "Assesses equation correctness, statistical estimation, and numerical consistency.",
   val reproducibility: Int = 6,
-  val reproducibilityJustification: String = "Assesses train/validation/test split hygiene, absence of leakage, and replication readiness.",
-  val refereeConfidence: Int = 4, // 1–5 standard peer-review confidence scale
-  val overallCredibilityScore: Int = 75, // 0–100 weighted composite score
-  val recommendedVerdict: String = "MINOR_REVISION"
+  val reproducibilityJustification: String = "Assesses protocol transparency, data provenance, reporting completeness, and replication readiness.",
+  val refereeConfidence: Int = 4, // 1–5 scientific judgment confidence
+  val extractionConfidence: Int = 4, // 1–5 document extraction & source verification confidence
+  val overallCredibilityScore: Int = computeWeightedScore(7, 7, 8, 7, 7, 6),
+  val recommendedVerdict: String = "SOUND_WITH_CAVEATS"
 ) {
   fun criteriaList(): List<RubricCriterionEvaluation> = listOf(
     RubricCriterionEvaluation(
       criterion = "Methodology",
-      stageTag = "Stage 01b Butcher • 02c Blue Team",
+      stageTag = "Design, Bias Control & Synthesis",
       score = methodology.coerceIn(1, 10),
       maxScore = 10,
       weightPercent = 25,
@@ -41,7 +210,7 @@ data class PaperReviewRubric(
     ),
     RubricCriterionEvaluation(
       criterion = "Significance",
-      stageTag = "Stage 00c Contributions • 04a Reviewer",
+      stageTag = "Impact & Clinical/Policy Applicability",
       score = significance.coerceIn(1, 10),
       maxScore = 10,
       weightPercent = 20,
@@ -49,7 +218,7 @@ data class PaperReviewRubric(
     ),
     RubricCriterionEvaluation(
       criterion = "Clarity",
-      stageTag = "Stage 09a–09c Proofreader & Copyedit",
+      stageTag = "Exposition, Tables & Reporting Precision",
       score = clarity.coerceIn(1, 10),
       maxScore = 10,
       weightPercent = 15,
@@ -57,7 +226,7 @@ data class PaperReviewRubric(
     ),
     RubricCriterionEvaluation(
       criterion = "Originality",
-      stageTag = "Stage 01a Breaker • 00c Novelty",
+      stageTag = "Research Question & Contribution Delta",
       score = originality.coerceIn(1, 10),
       maxScore = 10,
       weightPercent = 15,
@@ -65,7 +234,7 @@ data class PaperReviewRubric(
     ),
     RubricCriterionEvaluation(
       criterion = "Mathematical Rigor",
-      stageTag = "Stage 01e–01fd Re-Deriver & Sober",
+      stageTag = "Quantitative & Statistical Verification",
       score = mathematicalRigor.coerceIn(1, 10),
       maxScore = 10,
       weightPercent = 15,
@@ -73,7 +242,7 @@ data class PaperReviewRubric(
     ),
     RubricCriterionEvaluation(
       criterion = "Reproducibility",
-      stageTag = "Stage 01c Shredder • 01i Hunter",
+      stageTag = "Protocol, Provenance & Data Availability",
       score = reproducibility.coerceIn(1, 10),
       maxScore = 10,
       weightPercent = 10,
@@ -82,7 +251,78 @@ data class PaperReviewRubric(
   )
 
   companion object {
+    /**
+     * Authoritative weighted composite formula (0–100):
+     * 25% Methodology + 20% Significance + 15% Clarity + 15% Originality + 15% Math Rigor + 10% Reproducibility.
+     */
+    fun computeWeightedScore(
+      methodology: Int,
+      significance: Int,
+      clarity: Int,
+      originality: Int,
+      mathematicalRigor: Int,
+      reproducibility: Int
+    ): Int {
+      val m = methodology.coerceIn(1, 10)
+      val s = significance.coerceIn(1, 10)
+      val c = clarity.coerceIn(1, 10)
+      val o = originality.coerceIn(1, 10)
+      val math = mathematicalRigor.coerceIn(1, 10)
+      val r = reproducibility.coerceIn(1, 10)
+      val weighted = (m * 25 + s * 20 + c * 15 + o * 15 + math * 15 + r * 10) / 10.0
+      return weighted.roundToInt().coerceIn(0, 100)
+    }
+
     fun fromPaperReview(review: PaperReview): PaperReviewRubric {
+      val hasStructuredScores = review.methodologyScore in 1..10 &&
+        review.significanceScore in 1..10 &&
+        review.clarityScore in 1..10 &&
+        review.originalityScore in 1..10 &&
+        review.mathRigorScore in 1..10 &&
+        review.reproducibilityScore in 1..10
+
+      if (hasStructuredScores) {
+        val exactComposite = computeWeightedScore(
+          methodology = review.methodologyScore,
+          significance = review.significanceScore,
+          clarity = review.clarityScore,
+          originality = review.originalityScore,
+          mathematicalRigor = review.mathRigorScore,
+          reproducibility = review.reproducibilityScore
+        )
+        return PaperReviewRubric(
+          methodology = review.methodologyScore,
+          methodologyJustification = review.methodologyJustification.ifBlank {
+            "Assessed via full-document methodological & risk-of-bias verification."
+          },
+          clarity = review.clarityScore,
+          clarityJustification = review.clarityJustification.ifBlank {
+            "Assessed via exposition, structural reporting, and figure/table consistency."
+          },
+          significance = review.significanceScore,
+          significanceJustification = review.significanceJustification.ifBlank {
+            "Assessed via scientific contribution, clinical relevance, and policy utility."
+          },
+          originality = review.originalityScore,
+          originalityJustification = review.originalityJustification.ifBlank {
+            "Assessed via novelty of research question, scope, and analytical contribution."
+          },
+          mathematicalRigor = review.mathRigorScore,
+          mathematicalRigorJustification = review.mathRigorJustification.ifBlank {
+            "Assessed via deterministic statcheck, CI geometry, and statistical audit."
+          },
+          reproducibility = review.reproducibilityScore,
+          reproducibilityJustification = review.reproducibilityJustification.ifBlank {
+            "Assessed via protocol transparency, search/code provenance, and reporting completeness."
+          },
+          refereeConfidence = review.refereeConfidence.coerceIn(1, 5),
+          extractionConfidence = review.extractionConfidence.coerceIn(1, 5),
+          overallCredibilityScore = exactComposite,
+          recommendedVerdict = review.verdict
+        )
+      }
+
+      // Backward-compatible path for legacy cached/Firestore dossiers created prior to structured rubric fields
       val base = (review.credibilityScore / 10L).toInt().coerceIn(3, 10)
       val note = review.editorNote
 
@@ -104,48 +344,57 @@ data class PaperReviewRubric(
       val reproScore = extractScore("Reproducibility", (base - 1).coerceAtLeast(3))
       val confidenceMatch = Regex("""\[CONFIDENCE:(\d)/5\]""", RegexOption.IGNORE_CASE).find(note)
       val confidence = confidenceMatch?.groupValues?.getOrNull(1)?.toIntOrNull()?.coerceIn(1, 5) ?: 4
+      val exactComposite = computeWeightedScore(
+        methodology = methodologyScore,
+        significance = significanceScore,
+        clarity = clarityScore,
+        originality = originalityScore,
+        mathematicalRigor = mathScore,
+        reproducibility = reproScore
+      )
 
       fun cleanSnippet(raw: String, fallback: String): String {
         val cleaned = com.example.util.DossierFormattingEngine.cleanAcademicProse(raw)
           .lineSequence()
           .map { it.trim() }
           .firstOrNull { it.isNotBlank() && !it.startsWith("[STAGE", ignoreCase = true) && !it.startsWith("[PRE-FLIGHT", ignoreCase = true) }
-        return cleaned?.take(220) ?: fallback
+        return cleaned?.take(260) ?: fallback
       }
 
       return PaperReviewRubric(
         methodology = methodologyScore,
         methodologyJustification = extractJustification(
           "Methodology",
-          cleanSnippet(review.keyMethodology, "Evaluated via Stage 01b Butcher & Stage 02c Blue Team verification cascade.")
+          cleanSnippet(review.keyMethodology, "Evaluated via methodological design & verification cascade.")
         ),
         clarity = clarityScore,
         clarityJustification = extractJustification(
           "Clarity",
-          cleanSnippet(review.copyeditSuggestions, "Evaluated via Stage 09a–09c Proofreader and academic copyediting pass.")
+          cleanSnippet(review.copyeditSuggestions, "Evaluated via reporting clarity and academic copyediting pass.")
         ),
         significance = significanceScore,
         significanceJustification = extractJustification(
           "Significance",
-          cleanSnippet(review.coreContributions, "Evaluated via Stage 00c Claimed Contributions and Stage 04a Reviewer synthesis.")
+          cleanSnippet(review.coreContributions, "Evaluated via claimed contributions and applicability synthesis.")
         ),
         originality = originalityScore,
         originalityJustification = extractJustification(
           "Originality",
-          cleanSnippet(review.researchQuestion, "Evaluated via Stage 01a The Breaker intellectual foundation interrogation.")
+          cleanSnippet(review.researchQuestion, "Evaluated via research question originality and novelty delta.")
         ),
         mathematicalRigor = mathScore,
         mathematicalRigorJustification = extractJustification(
           "Math",
-          cleanSnippet(review.mathAuditReport, "Evaluated via Stage 01e–01fd Re-Deriver and Sober Checker.")
+          cleanSnippet(review.mathAuditReport, "Evaluated via statistical and numerical consistency audit.")
         ),
         reproducibility = reproScore,
         reproducibilityJustification = extractJustification(
           "Reproducibility",
-          cleanSnippet(review.codeAuditReport, "Evaluated via Stage 01c Shredder and Stage 01i Divergence Hunter.")
+          cleanSnippet(review.codeAuditReport, "Evaluated via protocol transparency and reproducibility audit.")
         ),
         refereeConfidence = confidence,
-        overallCredibilityScore = review.credibilityScore.toInt().coerceIn(0, 100),
+        extractionConfidence = review.extractionConfidence.coerceIn(1, 5),
+        overallCredibilityScore = exactComposite,
         recommendedVerdict = review.verdict
       )
     }
@@ -171,7 +420,28 @@ data class PaperReview(
   val venueOrCitation: String = "",
   @get:PropertyName("isEmpirical") val isEmpirical: Boolean = true,
   val credibilityScore: Long = 75L,
-  val verdict: String = "MINOR_REVISION",
+  val verdict: String = "SOUND_WITH_CAVEATS",
+  // Structured 6-axis rubric scores & justifications (authoritative source of truth)
+  val methodologyScore: Int = 0,
+  val significanceScore: Int = 0,
+  val clarityScore: Int = 0,
+  val originalityScore: Int = 0,
+  val mathRigorScore: Int = 0,
+  val reproducibilityScore: Int = 0,
+  val methodologyJustification: String = "",
+  val significanceJustification: String = "",
+  val clarityJustification: String = "",
+  val originalityJustification: String = "",
+  val mathRigorJustification: String = "",
+  val reproducibilityJustification: String = "",
+  // Separated confidence & appraisal provenance metadata
+  val refereeConfidence: Int = 4,
+  val extractionConfidence: Int = 4,
+  val reviewMode: String = ReviewMode.POST_PUBLICATION_APPRAISAL.name,
+  val coverageDisclosure: String = "",
+  val validationStatus: String = "VERIFIED",
+  val structuredFindingsJson: String = "",
+  // Narrative dossier sections
   val abstractSummary: String = "",
   val researchQuestion: String = "",
   val keyMethodology: String = "",
@@ -191,6 +461,12 @@ data class PaperReview(
 ) {
   @Exclude
   fun toRubric(): PaperReviewRubric = PaperReviewRubric.fromPaperReview(this)
+
+  @Exclude
+  fun parsedFindings(): List<ReviewFinding> = ReviewFindingCodec.decode(structuredFindingsJson)
+
+  @Exclude
+  fun resolvedReviewMode(): ReviewMode = ReviewMode.fromNameOrDefault(reviewMode)
 }
 
 data class PipelineOptions(
@@ -199,6 +475,7 @@ data class PipelineOptions(
   val enableCodeAudit: Boolean = true,
   val enableCopyeditWriterMode: Boolean = true,
   val enableEditorNote: Boolean = true,
+  val reviewMode: ReviewMode = ReviewMode.POST_PUBLICATION_APPRAISAL,
   val targetVenue: String = "Top-Tier Peer-Reviewed Journal / Conference",
 )
 
@@ -226,6 +503,7 @@ object BenchmarkManuscriptCatalog {
       venue = "Working Paper / isitcredible.com Technical Report",
       isEmpirical = true,
       manuscriptText = """
+        [PAGE 1]
         ABSTRACT:
         Single-pass large language model (LLM) peer reviews suffer from sycophancy, superficial reading, and unverified hallucinations. We introduce reviewer2, a 30+ stage adversarial peer-review pipeline built around two principles: (1) aggressive red-team prompting ("Breaker", "Butcher", "Shredder") forces the model to interrogate identification assumptions, empirical tables, and proofs; and (2) a multi-stage Blue Team and Checker verification cascade filters out false positives and hallucinated critiques before assembling the final referee report.
         
@@ -249,6 +527,7 @@ object BenchmarkManuscriptCatalog {
       venue = "IEEE Journal of Biomedical and Health Informatics (Submission)",
       isEmpirical = true,
       manuscriptText = """
+        [PAGE 1]
         ABSTRACT:
         Digitizing handwritten regional clinical records and archival prescriptions remains challenging due to cursive ligatures, ink bleed-through, and domain-specific medical abbreviations. We propose DocuMorph, a two-stage pipeline combining a Convolutional Recurrent Neural Network (CRNN) with CTC loss and an LLM-assisted lexical-clinical post-processor.
         
@@ -271,6 +550,7 @@ object BenchmarkManuscriptCatalog {
       venue = "Journal of Empirical Finance",
       isEmpirical = true,
       manuscriptText = """
+        [PAGE 1]
         ABSTRACT:
         We investigate whether extreme Average True Range (ATR) compression combined with Central Pivot Range (CPR) narrowing predicts asymmetric positive skewness over 5- to 20-day holding horizons across NSE 500 equities from 2016 to 2025.
         

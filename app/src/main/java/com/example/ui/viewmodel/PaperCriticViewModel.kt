@@ -29,8 +29,10 @@ import com.example.data.model.BenchmarkManuscriptCatalog
 import com.example.data.model.DefaultAiProviderCatalog
 import com.example.data.model.PaperReview
 import com.example.data.model.PipelineOptions
+import com.example.data.model.ReviewMode
 import com.example.data.repository.LocalReviewRepository
 import com.example.data.repository.ReviewRepository
+import com.example.util.DocumentCoverageReport
 import com.example.util.ManuscriptExtractor
 import com.example.util.ManuscriptInputFormat
 import com.example.util.NetworkHealthChecker
@@ -74,13 +76,14 @@ data class AppSettingsState(
   val themeMode: ThemeModePreference = ThemeModePreference.IOS_LIGHT,
   val compactDossierMode: Boolean = false,
   val monospaceEquations: Boolean = true,
-  val reviewStrictness: String = "AGGRESSIVE_REVIEWER2",
+  val reviewStrictness: String = "BALANCED_AREA_CHAIR",
   val autoSaveToCloud: Boolean = true,
+  val confidentialLocalOnly: Boolean = false,
   val enablePdfVisionPages: Boolean = true,
   val enableLegalScreen: Boolean = true,
   val enableGrimStatsCheck: Boolean = true,
   val useCustomApiProvider: Boolean = false,
-  val autoFallbackToKeylessEngine: Boolean = true,
+  val autoFallbackToKeylessEngine: Boolean = false,
   val activeProviderId: String = DefaultAiProviderCatalog.BUILTIN_KEYLESS_ID,
   val defaultVenue: String = "Top-Tier Peer-Reviewed Journal / Conference",
   val defaultOptions: PipelineOptions = PipelineOptions(),
@@ -153,6 +156,7 @@ data class WorkbenchFormState(
   val importedWordCount: Int = 240,
   val importedPageCount: Int = 1,
   val pdfPageBitmaps: List<Bitmap> = emptyList(),
+  val coverageReport: DocumentCoverageReport? = null,
   val importedFileBanner: String? = "Ready: Benchmark #1 — Yell at It (reviewer2)",
   val replicationCodeFileName: String? = null,
   val replicationCodeText: String = "",
@@ -400,6 +404,10 @@ class PaperCriticViewModel(
   }
 
   fun syncPortfolioToCloud() {
+    if (_settingsState.value.confidentialLocalOnly) {
+      _statusBanner.value = "Confidential Local-Only Mode is active. Disable it in Settings → Cloud to sync to Firestore."
+      return
+    }
     val uid = _authenticatedUserId.value
     if (uid.isNullOrBlank()) {
       _statusBanner.value = "Sign in with Google to sync your paper review portfolio across devices."
@@ -529,6 +537,7 @@ class PaperCriticViewModel(
         importedWordCount = words,
         importedPageCount = 1,
         pdfPageBitmaps = emptyList(),
+        coverageReport = null,
         importedFileBanner = "Loaded ${sample.badge}",
         options = it.options.copy(isEmpirical = sample.isEmpirical)
       )
@@ -549,6 +558,7 @@ class PaperCriticViewModel(
         importedWordCount = 0,
         importedPageCount = 0,
         pdfPageBitmaps = emptyList(),
+        coverageReport = null,
         importedFileBanner = null,
         options = _settingsState.value.defaultOptions
       )
@@ -558,7 +568,7 @@ class PaperCriticViewModel(
 
   fun importManuscriptFromUri(context: Context, uri: Uri) {
     viewModelScope.launch {
-      _statusBanner.value = "Parsing document (PDF / Word / Text)..."
+      _statusBanner.value = "Extracting full document text & page coordinates..."
       val renderVision = _settingsState.value.enablePdfVisionPages
       val result = ManuscriptExtractor.extractFromUri(context, uri, renderPdfBitmaps = renderVision)
       result.onSuccess { extracted ->
@@ -579,6 +589,7 @@ class PaperCriticViewModel(
             importedWordCount = extracted.wordCount,
             importedPageCount = extracted.pageCount,
             pdfPageBitmaps = extracted.pdfPageBitmaps,
+            coverageReport = extracted.coverageReport,
             importedFileBanner = extracted.summaryNotice
           )
         }
@@ -610,6 +621,7 @@ class PaperCriticViewModel(
         importedWordCount = words,
         importedPageCount = (words / 350).coerceAtLeast(1),
         pdfPageBitmaps = emptyList(),
+        coverageReport = null,
         importedFileBanner = "Imported shared text ($words words)"
       )
     }
@@ -680,6 +692,7 @@ class PaperCriticViewModel(
           manuscriptText = form.manuscriptText,
           replicationCodeText = form.replicationCodeText,
           pdfPageBitmaps = if (settings.enablePdfVisionPages) form.pdfPageBitmaps else emptyList(),
+          coverageReport = form.coverageReport,
           reviewStrictness = settings.reviewStrictness,
           options = form.options,
           externalProvider = activeExternal,
@@ -694,11 +707,12 @@ class PaperCriticViewModel(
         )
 
         val activeUid = _authenticatedUserId.value
-        val finalReview = if (settings.autoSaveToCloud && !activeUid.isNullOrBlank()) {
+        val shouldSyncCloud = !settings.confidentialLocalOnly && settings.autoSaveToCloud && !activeUid.isNullOrBlank()
+        val finalReview = if (shouldSyncCloud) {
           val saveResult = repository.createReview(generatedReview)
           if (saveResult.isSuccess) {
             val newId = saveResult.getOrThrow()
-            val refreshed = repository.getReviewById(newId, activeUid).getOrNull()
+            val refreshed = repository.getReviewById(newId, activeUid!!).getOrNull()
             _statusBanner.value = "Analysis complete & saved to Room Offline DB + Cloud Library."
             refreshed ?: generatedReview.copy(id = newId, userId = activeUid)
           } else {
@@ -712,7 +726,11 @@ class PaperCriticViewModel(
           val localId = "local_${UUID.randomUUID()}"
           val localReview = generatedReview.copy(id = localId)
           _localReviews.update { listOf(localReview) + it }
-          _statusBanner.value = "Analysis complete & cached in Room Offline Database!"
+          _statusBanner.value = if (settings.confidentialLocalOnly) {
+            "Confidential local-only mode: saved strictly to on-device Room DB (not synced to cloud)."
+          } else {
+            "Analysis complete & cached in Room Offline Database!"
+          }
           localReview
         }
 
@@ -1183,18 +1201,22 @@ class PaperCriticViewModel(
       val themeName = prefs.getString("themeMode", ThemeModePreference.IOS_LIGHT.name)
       val themeMode = ThemeModePreference.entries.find { it.name == themeName }
         ?: ThemeModePreference.IOS_LIGHT
+      val reviewMode = ReviewMode.fromNameOrDefault(
+        prefs.getString("opt_reviewMode", ReviewMode.POST_PUBLICATION_APPRAISAL.name)
+      )
       return AppSettingsState(
         themeMode = themeMode,
         compactDossierMode = prefs.getBoolean("compactDossierMode", false),
         monospaceEquations = prefs.getBoolean("monospaceEquations", true),
-        reviewStrictness = prefs.getString("reviewStrictness", "AGGRESSIVE_REVIEWER2")
-          ?: "AGGRESSIVE_REVIEWER2",
+        reviewStrictness = prefs.getString("reviewStrictness", "BALANCED_AREA_CHAIR")
+          ?: "BALANCED_AREA_CHAIR",
         autoSaveToCloud = prefs.getBoolean("autoSaveToCloud", true),
+        confidentialLocalOnly = prefs.getBoolean("confidentialLocalOnly", false),
         enablePdfVisionPages = prefs.getBoolean("enablePdfVisionPages", true),
         enableLegalScreen = prefs.getBoolean("enableLegalScreen", true),
         enableGrimStatsCheck = prefs.getBoolean("enableGrimStatsCheck", true),
         useCustomApiProvider = prefs.getBoolean("useCustomApiProvider", false),
-        autoFallbackToKeylessEngine = prefs.getBoolean("autoFallbackToKeylessEngine", true),
+        autoFallbackToKeylessEngine = prefs.getBoolean("autoFallbackToKeylessEngine", false),
         activeProviderId = prefs.getString("activeProviderId", DefaultAiProviderCatalog.BUILTIN_KEYLESS_ID)
           ?: DefaultAiProviderCatalog.BUILTIN_KEYLESS_ID,
         defaultVenue = prefs.getString("defaultVenue", "Top-Tier Peer-Reviewed Journal / Conference")
@@ -1204,7 +1226,8 @@ class PaperCriticViewModel(
           enableMathAudit = prefs.getBoolean("opt_enableMathAudit", true),
           enableCodeAudit = prefs.getBoolean("opt_enableCodeAudit", true),
           enableEditorNote = prefs.getBoolean("opt_enableEditorNote", true),
-          enableCopyeditWriterMode = prefs.getBoolean("opt_enableCopyeditWriterMode", true)
+          enableCopyeditWriterMode = prefs.getBoolean("opt_enableCopyeditWriterMode", true),
+          reviewMode = reviewMode
         ),
         reportTextScale = prefs.getFloat("reportTextScale", 1.0f)
       )
@@ -1217,6 +1240,7 @@ class PaperCriticViewModel(
         putBoolean("monospaceEquations", state.monospaceEquations)
         putString("reviewStrictness", state.reviewStrictness)
         putBoolean("autoSaveToCloud", state.autoSaveToCloud)
+        putBoolean("confidentialLocalOnly", state.confidentialLocalOnly)
         putBoolean("enablePdfVisionPages", state.enablePdfVisionPages)
         putBoolean("enableLegalScreen", state.enableLegalScreen)
         putBoolean("enableGrimStatsCheck", state.enableGrimStatsCheck)
@@ -1229,6 +1253,7 @@ class PaperCriticViewModel(
         putBoolean("opt_enableCodeAudit", state.defaultOptions.enableCodeAudit)
         putBoolean("opt_enableEditorNote", state.defaultOptions.enableEditorNote)
         putBoolean("opt_enableCopyeditWriterMode", state.defaultOptions.enableCopyeditWriterMode)
+        putString("opt_reviewMode", state.defaultOptions.reviewMode.name)
         putFloat("reportTextScale", state.reportTextScale)
         apply()
       }

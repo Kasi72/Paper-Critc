@@ -13,7 +13,9 @@ import android.text.Layout
 import android.text.StaticLayout
 import android.text.TextPaint
 import androidx.core.content.FileProvider
+import com.example.data.model.FindingStatus
 import com.example.data.model.PaperReview
+import com.example.data.model.ReviewFinding
 import java.io.File
 import java.io.FileOutputStream
 import java.io.OutputStream
@@ -24,19 +26,43 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
 /**
- * Generates publication-grade multi-page A4 PDF referee dossiers using native Android PdfDocument
- * and exports/shares them via FileProvider or Storage Access Framework without storage permissions.
- *
- * Uses [DossierFormattingEngine] to parse raw stage text into semantic blocks (SubHeaders,
- * color-coded SeverityCards, Callouts, hanging-indented Bullets, and shaded Equation strips)
- * so both new and previously saved dossiers render with clean academic typography.
+ * Controls PDF export depth:
+ * - [SCIENTIFIC_APPRAISAL_REPORT]: Default, concise, evidence-first publication-grade report
+ *   organized around source-anchored findings, quantitative forensics, applicability, and rubric.
+ * - [FULL_TECHNICAL_APPENDIX]: Appends raw multi-agent transcripts (Stage 01 Red Team,
+ *   Anticipated Reviewer 2 Q&A, Copyedit notes) for deep technical inspection.
+ */
+enum class PdfExportScope(
+  val shortLabel: String,
+  val displayName: String,
+  val fileSuffix: String
+) {
+  SCIENTIFIC_APPRAISAL_REPORT(
+    shortLabel = "Appraisal Report",
+    displayName = "Scientific Appraisal Report",
+    fileSuffix = "appraisal_report"
+  ),
+  FULL_TECHNICAL_APPENDIX(
+    shortLabel = "Full Appendix",
+    displayName = "Full Technical Appendix",
+    fileSuffix = "full_technical_dossier"
+  )
+}
+
+/**
+ * Generates publication-grade multi-page A4 PDF critical appraisal dossiers using native Android
+ * [PdfDocument] with:
+ * - Zero truncation of 6-axis rubric justifications (dynamically measured multi-line rows)
+ * - Paragraph & widow/orphan protection + keep-with-next section/sub-header pagination
+ * - Evidence-first layout featuring source-anchored [ReviewFinding] ledger cards, document
+ *   coverage disclosure, and separated Scientific vs. Extraction confidence metrics.
  */
 object PdfReportExporter {
 
   private const val PAGE_WIDTH = 595 // A4 width in PostScript points (72 dpi)
   private const val PAGE_HEIGHT = 842 // A4 height in PostScript points
   private const val MARGIN_H = 40f
-  private const val MARGIN_TOP_FIRST = 38f
+  private const val MARGIN_TOP_FIRST = 36f
   private const val MARGIN_TOP_SUBSEQUENT = 48f
   private const val MARGIN_BOTTOM = 46f
   private val CONTENT_WIDTH = PAGE_WIDTH - (MARGIN_H * 2)
@@ -48,64 +74,84 @@ object PdfReportExporter {
     val textColor: Int
   )
 
-  suspend fun createShareablePdfUri(context: Context, review: PaperReview): Uri =
-    withContext(Dispatchers.IO) {
-      val exportsDir = File(context.cacheDir, "exports").apply { mkdirs() }
-      val normalizedTitle = DossierFormattingEngine.normalizeTitle(review.title)
-      val safeSlug = normalizedTitle
-        .lowercase(Locale.US)
-        .replace(Regex("""[^a-z0-9]+"""), "_")
-        .trim('_')
-        .take(40)
-        .ifBlank { "paper_critic_review" }
-      val outFile = File(exportsDir, "${safeSlug}_referee_report.pdf")
-      FileOutputStream(outFile).use { stream ->
-        renderReviewToPdfStream(review, stream)
-      }
-      FileProvider.getUriForFile(
-        context,
-        "${context.packageName}.fileprovider",
-        outFile
-      )
-    }
-
-  suspend fun exportAndSharePdf(context: Context, review: PaperReview): Result<Uri> = runCatching {
-    val uri = createShareablePdfUri(context, review)
+  suspend fun createShareablePdfUri(
+    context: Context,
+    review: PaperReview,
+    scope: PdfExportScope = PdfExportScope.SCIENTIFIC_APPRAISAL_REPORT
+  ): Uri = withContext(Dispatchers.IO) {
+    val exportsDir = File(context.cacheDir, "exports").apply { mkdirs() }
     val normalizedTitle = DossierFormattingEngine.normalizeTitle(review.title)
+    val safeSlug = normalizedTitle
+      .lowercase(Locale.US)
+      .replace(Regex("""[^a-z0-9]+"""), "_")
+      .trim('_')
+      .take(38)
+      .ifBlank { "paper_critic_review" }
+    val outFile = File(exportsDir, "${safeSlug}_${scope.fileSuffix}.pdf")
+    FileOutputStream(outFile).use { stream ->
+      renderReviewToPdfStream(review, stream, scope)
+    }
+    FileProvider.getUriForFile(
+      context,
+      "${context.packageName}.fileprovider",
+      outFile
+    )
+  }
+
+  suspend fun exportAndSharePdf(
+    context: Context,
+    review: PaperReview,
+    scope: PdfExportScope = PdfExportScope.SCIENTIFIC_APPRAISAL_REPORT
+  ): Result<Uri> = runCatching {
+    val uri = createShareablePdfUri(context, review, scope)
+    val normalizedTitle = DossierFormattingEngine.normalizeTitle(review.title)
+    val rubric = review.toRubric()
     val shareIntent = Intent(Intent.ACTION_SEND).apply {
       type = "application/pdf"
-      putExtra(Intent.EXTRA_SUBJECT, "Paper Critic Referee Report: $normalizedTitle")
+      putExtra(Intent.EXTRA_SUBJECT, "Paper Critic ${scope.displayName}: $normalizedTitle")
       putExtra(
         Intent.EXTRA_TEXT,
-        "Attached is the 30-stage adversarial referee dossier for \"$normalizedTitle\" " +
-          "(Credibility: ${review.credibilityScore}/100 • Verdict: ${review.verdict.replace('_', ' ')})."
+        "Attached is the Paper Critic ${scope.displayName} for \"$normalizedTitle\" " +
+          "(Weighted Score: ${rubric.overallCredibilityScore}/100 • Assessment: ${review.verdict.replace('_', ' ')})."
       )
       putExtra(Intent.EXTRA_STREAM, uri)
       addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
     }
-    val chooser = Intent.createChooser(shareIntent, "Share Referee Report (PDF)")
+    val chooser = Intent.createChooser(shareIntent, "Share ${scope.displayName} (PDF)")
       .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
     context.startActivity(chooser)
     uri
   }
 
-  suspend fun writePdfToUri(context: Context, review: PaperReview, targetUri: Uri): Result<Unit> =
-    withContext(Dispatchers.IO) {
-      runCatching {
-        context.contentResolver.openOutputStream(targetUri)?.use { out ->
-          renderReviewToPdfStream(review, out)
-        } ?: throw IllegalStateException("Could not open destination output stream for PDF.")
-        Unit
-      }
+  suspend fun writePdfToUri(
+    context: Context,
+    review: PaperReview,
+    targetUri: Uri,
+    scope: PdfExportScope = PdfExportScope.SCIENTIFIC_APPRAISAL_REPORT
+  ): Result<Unit> = withContext(Dispatchers.IO) {
+    runCatching {
+      context.contentResolver.openOutputStream(targetUri)?.use { out ->
+        renderReviewToPdfStream(review, out, scope)
+      } ?: throw IllegalStateException("Could not open destination output stream for PDF.")
+      Unit
     }
+  }
 
-  fun renderReviewToPdfStream(review: PaperReview, outputStream: OutputStream) {
+  fun renderReviewToPdfStream(
+    review: PaperReview,
+    outputStream: OutputStream,
+    scope: PdfExportScope = PdfExportScope.SCIENTIFIC_APPRAISAL_REPORT
+  ) {
     val document = PdfDocument()
-    val rubric = review.toRubric()
+    try {
+      val rubric = review.toRubric()
+    val authoritativeScore = rubric.overallCredibilityScore
+    val reviewMode = review.resolvedReviewMode()
+    val findings = review.parsedFindings()
     val dateStr = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(Date())
     val normalizedTitle = DossierFormattingEngine.normalizeTitle(review.title)
-    val runningTitle = if (normalizedTitle.length > 64) {
-      normalizedTitle.take(61).trimEnd() + "…"
+    val runningTitle = if (normalizedTitle.length > 58) {
+      normalizedTitle.take(55).trimEnd() + "…"
     } else {
       normalizedTitle
     }
@@ -125,6 +171,7 @@ object PdfReportExporter {
     }
     val trackBarBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(226, 232, 240) }
     val eqBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(241, 245, 249) }
+    val quoteBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(241, 245, 249) }
     val dividerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
       color = Color.rgb(214, 222, 234)
       strokeWidth = 0.75f
@@ -134,23 +181,23 @@ object PdfReportExporter {
 
     val bannerEyebrowPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
       color = Color.rgb(148, 163, 184)
-      textSize = 8.2f
+      textSize = 7.9f
       letterSpacing = 0.08f
       typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
     }
     val bannerTitlePaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
       color = Color.WHITE
-      textSize = 14f
+      textSize = 13.5f
       typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
     }
     val bannerSubPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
       color = Color.rgb(203, 213, 225)
-      textSize = 8.5f
+      textSize = 8.0f
       typeface = Typeface.create(Typeface.MONOSPACE, Typeface.NORMAL)
     }
     val verdictPillTextPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
       color = Color.WHITE
-      textSize = 8.8f
+      textSize = 8.4f
       typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
     }
     val scoreBigPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -160,72 +207,77 @@ object PdfReportExporter {
     }
     val scoreSubPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
       color = Color.rgb(148, 163, 184)
-      textSize = 7.5f
+      textSize = 7.3f
       typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
     }
     val paperTitlePaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
       color = Color.rgb(15, 23, 42)
-      textSize = 14.5f
+      textSize = 14.2f
       typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
     }
     val metaPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
       color = Color.rgb(71, 85, 105)
-      textSize = 9.2f
+      textSize = 9.0f
       typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.NORMAL)
     }
     val sectionNumPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
       color = Color.WHITE
-      textSize = 8.5f
+      textSize = 8.4f
       typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
     }
     val sectionHeaderPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
       color = Color.rgb(15, 23, 42)
-      textSize = 10.5f
+      textSize = 10.2f
       typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
     }
     val sectionStagePaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
       color = Color.rgb(0, 98, 227)
-      textSize = 7.8f
+      textSize = 7.6f
       typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
     }
     val subHeaderTagPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
       color = Color.rgb(0, 82, 204)
-      textSize = 7.8f
+      textSize = 7.6f
       typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
     }
     val subHeaderTitlePaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
       color = Color.rgb(15, 23, 42)
-      textSize = 9.6f
+      textSize = 9.5f
       typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
     }
     val bodyPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
       color = Color.rgb(30, 41, 59)
-      textSize = 9.2f
+      textSize = 9.1f
       typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.NORMAL)
     }
     val bodyBoldPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
       color = Color.rgb(15, 23, 42)
-      textSize = 9.2f
+      textSize = 9.1f
       typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
     }
     val smallMutedPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
-      color = Color.rgb(100, 116, 139)
-      textSize = 8.0f
+      color = Color.rgb(71, 85, 105)
+      textSize = 8.1f
       typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.NORMAL)
+    }
+    val quoteItalicPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+      color = Color.rgb(51, 65, 85)
+      textSize = 8.3f
+      typeface = Typeface.create(Typeface.SERIF, Typeface.ITALIC)
     }
     val bulletMarkerPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
       color = Color.rgb(0, 98, 227)
-      textSize = 8.6f
+      textSize = 8.5f
       typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
     }
     val monoPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
       color = Color.rgb(30, 41, 59)
-      textSize = 8.4f
+      textSize = 8.3f
       typeface = Typeface.create(Typeface.MONOSPACE, Typeface.NORMAL)
     }
     val headerFooterPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
       color = Color.rgb(100, 116, 139)
-      textSize = 7.8f
+      textSize = 7.7f
       typeface = Typeface.create(Typeface.MONOSPACE, Typeface.NORMAL)
     }
 
@@ -233,11 +285,12 @@ object PdfReportExporter {
     var page = document.startPage(PdfDocument.PageInfo.Builder(PAGE_WIDTH, PAGE_HEIGHT, pageNumber).create())
     var canvas: Canvas = page.canvas
     var cursorY = MARGIN_TOP_FIRST
+    val maxPageBodyHeight = PAGE_HEIGHT - MARGIN_TOP_SUBSEQUENT - MARGIN_BOTTOM
 
     fun drawRunningHeader(targetCanvas: Canvas) {
       val headerY = 26f
-      targetCanvas.drawText("REFEREE DOSSIER  •  $runningTitle", MARGIN_H, headerY, headerFooterPaint)
-      val verdictTag = "$verdictUpper (${review.credibilityScore}/100)"
+      targetCanvas.drawText("${scope.shortLabel.uppercase(Locale.US)}  •  $runningTitle", MARGIN_H, headerY, headerFooterPaint)
+      val verdictTag = "$verdictUpper ($authoritativeScore/100)"
       val vw = headerFooterPaint.measureText(verdictTag)
       targetCanvas.drawText(verdictTag, PAGE_WIDTH - MARGIN_H - vw, headerY, headerFooterPaint)
       targetCanvas.drawLine(MARGIN_H, headerY + 7f, PAGE_WIDTH - MARGIN_H, headerY + 7f, dividerPaint)
@@ -247,7 +300,7 @@ object PdfReportExporter {
       val footerY = PAGE_HEIGHT - 22f
       targetCanvas.drawLine(MARGIN_H, footerY - 12f, PAGE_WIDTH - MARGIN_H, footerY - 12f, dividerPaint)
       targetCanvas.drawText(
-        "Paper Critic 30-Stage Peer-Review Engine  •  $dateStr",
+        "Paper Critic Critical Appraisal Engine  •  ${reviewMode.shortLabel}  •  $dateStr",
         MARGIN_H,
         footerY,
         headerFooterPaint
@@ -282,6 +335,11 @@ object PdfReportExporter {
         .build()
     }
 
+    /**
+     * Paragraph-aware pagination with widow & orphan protection:
+     * - Short paragraphs (≤ 4 lines) are kept intact on one page.
+     * - Longer paragraphs never leave a single orphan line at page bottom or single widow line at top.
+     */
     fun drawLayoutPaginated(
       text: String,
       paint: TextPaint,
@@ -294,16 +352,43 @@ object PdfReportExporter {
       val clean = text.trim()
       if (clean.isEmpty()) return
       val layout = buildLayout(clean, paint, width, lineAdd)
+      val lineCount = layout.lineCount
+      if (lineCount == 0) return
+
       val accentPaint = leftAccentColor?.let { c ->
         Paint(Paint.ANTI_ALIAS_FLAG).apply { color = c }
       }
-      for (lineIdx in 0 until layout.lineCount) {
+
+      // Keep short paragraphs intact on one page
+      if (lineCount <= 4 && layout.height <= maxPageBodyHeight) {
+        ensureSpace(layout.height.toFloat() + 2f)
+      } else if (lineCount >= 2) {
+        // Orphan protection: ensure at least the first 2 lines fit before starting on current page
+        val firstTwoHeight = (layout.getLineBottom(1) - layout.getLineTop(0)).toFloat()
+        if (cursorY + firstTwoHeight > PAGE_HEIGHT - MARGIN_BOTTOM) {
+          startNewPage()
+        }
+      }
+
+      var lineIdx = 0
+      while (lineIdx < lineCount) {
         val lineTop = layout.getLineTop(lineIdx)
         val lineBottom = layout.getLineBottom(lineIdx)
         val lineHeight = (lineBottom - lineTop).toFloat()
-        if (cursorY + lineHeight > PAGE_HEIGHT - MARGIN_BOTTOM) {
+
+        // Widow protection: if 2 lines remain and only 1 fits on current page, push both to next page
+        val remainingLines = lineCount - lineIdx
+        if (remainingLines == 2 && lineIdx > 0) {
+          val twoLinesH = (layout.getLineBottom(lineIdx + 1) - lineTop).toFloat()
+          if (cursorY + lineHeight <= PAGE_HEIGHT - MARGIN_BOTTOM &&
+            cursorY + twoLinesH > PAGE_HEIGHT - MARGIN_BOTTOM
+          ) {
+            startNewPage()
+          }
+        } else if (cursorY + lineHeight > PAGE_HEIGHT - MARGIN_BOTTOM) {
           startNewPage()
         }
+
         val lineStart = layout.getLineStart(lineIdx)
         val lineEnd = layout.getLineEnd(lineIdx)
         val lineStr = clean.substring(lineStart, lineEnd).trimEnd('\n')
@@ -313,6 +398,7 @@ object PdfReportExporter {
         }
         canvas.drawText(lineStr, leftX, cursorY + baselineOffset, paint)
         cursorY += lineHeight
+        lineIdx++
       }
     }
 
@@ -329,7 +415,7 @@ object PdfReportExporter {
       val bodyLayout = buildLayout(bodyText.trim(), bodyPaint, innerWidth, 2.5f)
       val headerHeight = if (isCalloutTitle) 14f else 17f
       val totalHeight = padV + headerHeight + bodyLayout.height + padV
-      val maxSinglePageHeight = PAGE_HEIGHT - MARGIN_TOP_SUBSEQUENT - MARGIN_BOTTOM - 24f
+      val maxSinglePageHeight = maxPageBodyHeight - 24f
 
       if (totalHeight <= maxSinglePageHeight) {
         ensureSpace(totalHeight + 4f)
@@ -380,8 +466,7 @@ object PdfReportExporter {
 
         cursorY = boxTop + totalHeight + 6f
       } else {
-        // Fallback for extraordinarily long items (>1 page): paginated with left accent bar
-        ensureSpace(34f)
+        ensureSpace(48f)
         val headerPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
           color = palette.textColor
           textSize = 8.8f
@@ -401,13 +486,163 @@ object PdfReportExporter {
       }
     }
 
+    fun drawFindingLedgerCard(finding: ReviewFinding) {
+      val palette = findingPalette(finding)
+      val padH = 11f
+      val padV = 8.5f
+      val innerLeft = MARGIN_H + 4f + padH
+      val innerWidth = CONTENT_WIDTH - 4f - (padH * 2)
+
+      val titleLayout = buildLayout("${finding.id}  •  ${finding.title}", bodyBoldPaint, innerWidth, 2.0f)
+      val allegationLayout = buildLayout(finding.allegation, bodyPaint, innerWidth, 2.3f)
+
+      val primaryAnchor = finding.supportingEvidence.firstOrNull()
+      val quoteText = primaryAnchor?.exactQuote?.trim().orEmpty()
+      val quotePrefix = buildString {
+        append("Source")
+        if (primaryAnchor != null && primaryAnchor.pageNumber > 0) append(" [Page ${primaryAnchor.pageNumber}]")
+        if (!primaryAnchor?.section.isNullOrBlank()) append(" (${primaryAnchor?.section})")
+        append(": ")
+      }
+      val quoteLayout = if (quoteText.isNotBlank()) {
+        buildLayout("$quotePrefix\"$quoteText\"", quoteItalicPaint, innerWidth - 12f, 2.0f)
+      } else null
+
+      val counterAnchor = finding.counterEvidence.firstOrNull()
+      val counterText = counterAnchor?.exactQuote?.trim().orEmpty()
+      val counterLayout = if (counterText.isNotBlank()) {
+        val cPage = if (counterAnchor != null && counterAnchor.pageNumber > 0) " [Page ${counterAnchor.pageNumber}]" else ""
+        buildLayout("Counterevidence$cPage: \"$counterText\"", smallMutedPaint, innerWidth - 12f, 2.0f)
+      } else null
+
+      val remedyText = buildString {
+        if (finding.recommendedCorrection.isNotBlank() && finding.status != FindingStatus.CONTRADICTED) {
+          append("Recommended Action: ${finding.recommendedCorrection}")
+        }
+        if (finding.verificationNotes.isNotBlank()) {
+          if (isNotEmpty()) append("\n")
+          append("Verification Note: ${finding.verificationNotes}")
+        }
+      }
+      val remedyLayout = if (remedyText.isNotBlank()) {
+        buildLayout(remedyText, smallMutedPaint, innerWidth, 2.0f)
+      } else null
+
+      val pillsRowH = 16f
+      val quoteBlockH = quoteLayout?.let { it.height + 10f } ?: 0f
+      val counterBlockH = counterLayout?.let { it.height + 10f } ?: 0f
+      val remedyBlockH = remedyLayout?.let { it.height + 6f } ?: 0f
+      val totalH = padV + pillsRowH + 4f + titleLayout.height + 4f + allegationLayout.height +
+        (if (quoteBlockH > 0) 6f + quoteBlockH else 0f) +
+        (if (counterBlockH > 0) 5f + counterBlockH else 0f) +
+        (if (remedyBlockH > 0) 5f + remedyBlockH else 0f) + padV
+
+      if (totalH <= maxPageBodyHeight - 20f) {
+        ensureSpace(totalH + 5f)
+        val top = cursorY
+        val boxRect = RectF(MARGIN_H, top, PAGE_WIDTH - MARGIN_H, top + totalH)
+        val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = palette.bgColor }
+        val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+          color = palette.borderColor
+          style = Paint.Style.STROKE
+          strokeWidth = 0.8f
+        }
+        val accentPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = palette.accentColor }
+
+        canvas.drawRoundRect(boxRect, 6f, 6f, bgPaint)
+        canvas.drawRoundRect(boxRect, 6f, 6f, borderPaint)
+        canvas.drawRoundRect(RectF(MARGIN_H, top, MARGIN_H + 4f, top + totalH), 2f, 2f, accentPaint)
+
+        // Severity + Status pills
+        val pillTextPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+          color = Color.WHITE
+          textSize = 7.2f
+          typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+        }
+        var px = innerLeft
+        val py = top + padV
+        val sevLabel = finding.severity.uppercase(Locale.US)
+        val sevW = pillTextPaint.measureText(sevLabel) + 11f
+        canvas.drawRoundRect(RectF(px, py, px + sevW, py + 12.5f), 3.5f, 3.5f, accentPaint)
+        canvas.drawText(sevLabel, px + 5.5f, py + 8.8f, pillTextPaint)
+        px += sevW + 6f
+
+        val statusLabel = finding.status.displayBadge
+        val statusPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = statusPillColor(finding.status) }
+        val stW = pillTextPaint.measureText(statusLabel) + 11f
+        canvas.drawRoundRect(RectF(px, py, px + stW, py + 12.5f), 3.5f, 3.5f, statusPaint)
+        canvas.drawText(statusLabel, px + 5.5f, py + 8.8f, pillTextPaint)
+
+        if (primaryAnchor != null && primaryAnchor.pageNumber > 0) {
+          val pgLabel = "PAGE ${primaryAnchor.pageNumber}"
+          val pgW = sectionStagePaint.measureText(pgLabel)
+          canvas.drawText(pgLabel, PAGE_WIDTH - MARGIN_H - padH - pgW, py + 9f, sectionStagePaint)
+        }
+
+        var y = py + pillsRowH + 4f
+        canvas.save()
+        canvas.translate(innerLeft, y)
+        titleLayout.draw(canvas)
+        canvas.restore()
+        y += titleLayout.height + 4f
+
+        canvas.save()
+        canvas.translate(innerLeft, y)
+        allegationLayout.draw(canvas)
+        canvas.restore()
+        y += allegationLayout.height
+
+        if (quoteLayout != null) {
+          y += 6f
+          val qRect = RectF(innerLeft, y, innerLeft + innerWidth, y + quoteLayout.height + 10f)
+          canvas.drawRoundRect(qRect, 4f, 4f, quoteBgPaint)
+          canvas.drawRoundRect(qRect, 4f, 4f, cardBorderPaint)
+          canvas.save()
+          canvas.translate(innerLeft + 6f, y + 5f)
+          quoteLayout.draw(canvas)
+          canvas.restore()
+          y += quoteLayout.height + 10f
+        }
+
+        if (counterLayout != null) {
+          y += 5f
+          val cRect = RectF(innerLeft, y, innerLeft + innerWidth, y + counterLayout.height + 10f)
+          val cBg = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(240, 253, 244) }
+          canvas.drawRoundRect(cRect, 4f, 4f, cBg)
+          canvas.drawRoundRect(cRect, 4f, 4f, cardBorderPaint)
+          canvas.save()
+          canvas.translate(innerLeft + 6f, y + 5f)
+          counterLayout.draw(canvas)
+          canvas.restore()
+          y += counterLayout.height + 10f
+        }
+
+        if (remedyLayout != null) {
+          y += 5f
+          canvas.save()
+          canvas.translate(innerLeft, y)
+          remedyLayout.draw(canvas)
+          canvas.restore()
+        }
+
+        cursorY = top + totalH + 6.5f
+      } else {
+        drawBoxedCard(
+          badgeText = "${finding.id} • ${finding.severity} • ${finding.status.displayBadge}",
+          bodyText = "${finding.title}\n${finding.allegation}\n$remedyText",
+          palette = palette,
+          isCalloutTitle = false
+        )
+      }
+    }
+
     fun drawStructuredBlocks(rawContent: String, stripInternalTags: Boolean = true) {
       val blocks = DossierFormattingEngine.parseStructuredBlocks(
         raw = rawContent,
         stripInternalTags = stripInternalTags
       )
       if (blocks.isEmpty()) {
-        drawLayoutPaginated("No additional findings recorded for this stage.", smallMutedPaint)
+        drawLayoutPaginated("No additional findings recorded for this section.", smallMutedPaint)
         cursorY += 4f
         return
       }
@@ -415,7 +650,8 @@ object PdfReportExporter {
       for (block in blocks) {
         when (block) {
           is ReportBlock.SubHeader -> {
-            ensureSpace(34f)
+            // Keep-with-next: subheader + at least 40pt of following text stay together
+            ensureSpace(58f)
             cursorY += 4f
             var xOffset = MARGIN_H
             if (block.tag.isNotBlank()) {
@@ -454,7 +690,8 @@ object PdfReportExporter {
           }
 
           is ReportBlock.Bullet -> {
-            ensureSpace(18f)
+            // Ensure bullet marker + first 2 lines stay together
+            ensureSpace(26f)
             val gutterW = if (block.marker.length > 3) 34f else 20f
             val firstLineBaselineOffset = 9.5f
             canvas.drawText(block.marker, MARGIN_H + 2f, cursorY + firstLineBaselineOffset, bulletMarkerPaint)
@@ -499,12 +736,12 @@ object PdfReportExporter {
             }
             val tableCellPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
               color = Color.rgb(30, 41, 59)
-              textSize = 8.1f
+              textSize = 8.0f
               typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.NORMAL)
             }
             val tableCellBoldPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
               color = Color.rgb(15, 23, 42)
-              textSize = 8.1f
+              textSize = 8.0f
               typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
             }
             val zebraLightPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE }
@@ -521,7 +758,7 @@ object PdfReportExporter {
                 buildLayout(h.uppercase(Locale.US), tableHeaderPaint, (colWidths[c] - 8f).coerceAtLeast(24f), 1.2f)
               }
               val headerH = (headerLayouts.maxOfOrNull { it.height } ?: 10).toFloat() + headerPadV * 2
-              ensureSpace(headerH + 22f)
+              ensureSpace(headerH + 26f)
               val top = cursorY
               canvas.drawRoundRect(
                 RectF(MARGIN_H, top, PAGE_WIDTH - MARGIN_H, top + headerH),
@@ -603,23 +840,21 @@ object PdfReportExporter {
     }
 
     fun drawSectionHeader(sectionNum: String, title: String, stageTag: String) {
-      ensureSpace(48f)
+      // Keep-with-next: section header + at least 60pt of body stay on the same page
+      ensureSpace(92f)
       cursorY += 6f
       val barTop = cursorY
       val barH = 24f
       val barRect = RectF(MARGIN_H, barTop, PAGE_WIDTH - MARGIN_H, barTop + barH)
       canvas.drawRoundRect(barRect, 5f, 5f, sectionTintPaint)
 
-      // Number badge on left
       val badgeRect = RectF(MARGIN_H, barTop, MARGIN_H + 26f, barTop + barH)
       canvas.drawRoundRect(badgeRect, 5f, 5f, bluePaint)
       val numW = sectionNumPaint.measureText(sectionNum)
       canvas.drawText(sectionNum, MARGIN_H + (26f - numW) / 2f, barTop + 15.5f, sectionNumPaint)
 
-      // Section title
       canvas.drawText(title, MARGIN_H + 34f, barTop + 15.5f, sectionHeaderPaint)
 
-      // Right-aligned stage code
       if (stageTag.isNotBlank()) {
         val stW = sectionStagePaint.measureText(stageTag)
         canvas.drawText(stageTag, PAGE_WIDTH - MARGIN_H - stW - 8f, barTop + 15f, sectionStagePaint)
@@ -631,39 +866,47 @@ object PdfReportExporter {
     // =========================================================================
     // 1. EXECUTIVE MASTHEAD BANNER (Page 1)
     // =========================================================================
-    val bannerH = 78f
+    val bannerH = 84f
     val bannerRect = RectF(MARGIN_H, cursorY, PAGE_WIDTH - MARGIN_H, cursorY + bannerH)
     canvas.drawRoundRect(bannerRect, 9f, 9f, navyBgPaint)
 
-    // Left masthead typography + color-coded verdict pill
-    canvas.drawText("PAPER CRITIC  •  30-STAGE PEER-REVIEW DOSSIER", MARGIN_H + 15f, cursorY + 19f, bannerEyebrowPaint)
-    canvas.drawText("IS IT CREDIBLE?  REFEREE REPORT", MARGIN_H + 15f, cursorY + 37f, bannerTitlePaint)
+    canvas.drawText(
+      "PAPER CRITIC  •  ${scope.displayName.uppercase(Locale.US)}",
+      MARGIN_H + 15f,
+      cursorY + 18f,
+      bannerEyebrowPaint
+    )
+    canvas.drawText(
+      reviewMode.displayTitle.uppercase(Locale.US),
+      MARGIN_H + 15f,
+      cursorY + 35f,
+      bannerTitlePaint
+    )
 
     val pillW = verdictPillTextPaint.measureText(verdictUpper) + 18f
-    val pillTop = cursorY + 46f
+    val pillTop = cursorY + 44f
     canvas.drawRoundRect(
-      RectF(MARGIN_H + 15f, pillTop, MARGIN_H + 15f + pillW, pillTop + 19f),
+      RectF(MARGIN_H + 15f, pillTop, MARGIN_H + 15f + pillW, pillTop + 18.5f),
       4.5f,
       4.5f,
       verdictPillPaint
     )
-    canvas.drawText(verdictUpper, MARGIN_H + 24f, pillTop + 12.8f, verdictPillTextPaint)
+    canvas.drawText(verdictUpper, MARGIN_H + 24f, pillTop + 12.4f, verdictPillTextPaint)
 
-    val trackText = if (review.isEmpirical) "EMPIRICAL TRACK" else "THEORETICAL TRACK"
     canvas.drawText(
-      "$trackText  •  CONFIDENCE ${rubric.refereeConfidence}/5  •  $dateStr",
-      MARGIN_H + 15f + pillW + 10f,
-      pillTop + 12.5f,
+      "SCIENTIFIC CONF: ${rubric.refereeConfidence}/5  •  EXTRACTION CONF: ${rubric.extractionConfidence}/5",
+      MARGIN_H + 15f,
+      cursorY + 75f,
       bannerSubPaint
     )
 
-    // Right-aligned Credibility Score Badge Box
-    val scoreBoxW = 84f
+    // Right-aligned Weighted Score Box (100% synchronized with 6-axis weighted rubric)
+    val scoreBoxW = 86f
     val scoreBoxLeft = PAGE_WIDTH - MARGIN_H - scoreBoxW - 12f
     val scoreBoxTop = cursorY + 11f
     val scoreBoxRect = RectF(scoreBoxLeft, scoreBoxTop, scoreBoxLeft + scoreBoxW, cursorY + bannerH - 11f)
     canvas.drawRoundRect(scoreBoxRect, 7f, 7f, scoreBoxPaint)
-    val scoreAccentPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = scoreColor(review.credibilityScore.toInt()) }
+    val scoreAccentPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = scoreColor(authoritativeScore) }
     canvas.drawRoundRect(
       RectF(scoreBoxLeft, scoreBoxTop, scoreBoxLeft + scoreBoxW, scoreBoxTop + 3.5f),
       2f,
@@ -671,17 +914,17 @@ object PdfReportExporter {
       scoreAccentPaint
     )
 
-    val scoreText = "${review.credibilityScore}"
+    val scoreText = "$authoritativeScore"
     val scoreW = scoreBigPaint.measureText(scoreText)
-    canvas.drawText(scoreText, scoreBoxLeft + (scoreBoxW - scoreW) / 2f, scoreBoxTop + 31f, scoreBigPaint)
-    val subScoreText = "/ 100 CREDIBILITY"
+    canvas.drawText(scoreText, scoreBoxLeft + (scoreBoxW - scoreW) / 2f, scoreBoxTop + 33f, scoreBigPaint)
+    val subScoreText = "/ 100 WEIGHTED"
     val subW = scoreSubPaint.measureText(subScoreText)
-    canvas.drawText(subScoreText, scoreBoxLeft + (scoreBoxW - subW) / 2f, scoreBoxTop + 46f, scoreSubPaint)
+    canvas.drawText(subScoreText, scoreBoxLeft + (scoreBoxW - subW) / 2f, scoreBoxTop + 49f, scoreSubPaint)
 
-    cursorY += bannerH + 14f
+    cursorY += bannerH + 12f
 
     // =========================================================================
-    // 2. MANUSCRIPT TITLE & CLEAN CITATION METADATA
+    // 2. MANUSCRIPT TITLE, CITATION METADATA & COVERAGE DISCLOSURE
     // =========================================================================
     drawLayoutPaginated(normalizedTitle, paperTitlePaint, CONTENT_WIDTH, MARGIN_H, 2.2f)
     cursorY += 3f
@@ -699,43 +942,84 @@ object PdfReportExporter {
     val metaLine = if (metaParts.isNotEmpty()) {
       metaParts.joinToString("  •  ")
     } else {
-      "Uploaded Academic Manuscript  •  Independent Referee Evaluation"
+      "Uploaded Academic Manuscript  •  Independent Critical Appraisal"
     }
     drawLayoutPaginated(metaLine, metaPaint, CONTENT_WIDTH, MARGIN_H, 1.8f)
-    cursorY += 8f
+    cursorY += 6f
+
+    // Document Coverage & Validation Provenance Banner
+    val coverageText = buildString {
+      append("Validation Status: ${review.validationStatus.replace('_', ' ')}")
+      if (review.coverageDisclosure.isNotBlank()) {
+        append("  |  ${review.coverageDisclosure}")
+      }
+      append("  |  Generated: $dateStr")
+    }
+    val covLayout = buildLayout(coverageText, smallMutedPaint, CONTENT_WIDTH - 16f, 1.8f)
+    val covH = covLayout.height + 11f
+    ensureSpace(covH + 6f)
+    val covRect = RectF(MARGIN_H, cursorY, PAGE_WIDTH - MARGIN_H, cursorY + covH)
+    canvas.drawRoundRect(covRect, 5f, 5f, eqBgPaint)
+    canvas.drawRoundRect(covRect, 5f, 5f, cardBorderPaint)
+    canvas.save()
+    canvas.translate(MARGIN_H + 8f, cursorY + 5.5f)
+    covLayout.draw(canvas)
+    canvas.restore()
+    cursorY += covH + 9f
 
     // =========================================================================
-    // 3. STRUCTURED 6-AXIS WEIGHTED REVIEW RUBRIC CARD
+    // 3. STRUCTURED 6-AXIS WEIGHTED RUBRIC (DYNAMIC MULTI-LINE — ZERO TRUNCATION!)
     // =========================================================================
     val criteria = rubric.criteriaList()
-    val rowHeight = 29f
-    val rubricBoxH = 34f + criteria.size * rowHeight + 6f
-    ensureSpace(rubricBoxH + 8f)
+    val rubricInnerW = CONTENT_WIDTH - 24f
+    val preparedRows = criteria.map { item ->
+      val cleanJust = DossierFormattingEngine.cleanAcademicProse(item.justification)
+        .replace("\n", " ")
+        .replace(Regex("""\s+"""), " ")
+        .trim()
+      val justLayout = buildLayout(cleanJust, smallMutedPaint, rubricInnerW, 1.8f)
+      val rowH = 16f + justLayout.height.toFloat() + 7f
+      Triple(item, justLayout, rowH)
+    }
+
+    val totalRubricH = 34f + preparedRows.sumOf { it.third.toDouble() }.toFloat() + 6f
+    if (totalRubricH <= maxPageBodyHeight) {
+      ensureSpace(totalRubricH + 8f)
+    } else {
+      ensureSpace(90f)
+    }
 
     val rubricTop = cursorY
-    val rubricRect = RectF(MARGIN_H, rubricTop, PAGE_WIDTH - MARGIN_H, rubricTop + rubricBoxH)
-    canvas.drawRoundRect(rubricRect, 7f, 7f, cardBgPaint)
-    canvas.drawRoundRect(rubricRect, 7f, 7f, cardBorderPaint)
+    val fitsSingleCard = cursorY + totalRubricH <= PAGE_HEIGHT - MARGIN_BOTTOM
+    if (fitsSingleCard) {
+      val rubricRect = RectF(MARGIN_H, rubricTop, PAGE_WIDTH - MARGIN_H, rubricTop + totalRubricH)
+      canvas.drawRoundRect(rubricRect, 7f, 7f, cardBgPaint)
+      canvas.drawRoundRect(rubricRect, 7f, 7f, cardBorderPaint)
+    }
 
     canvas.drawText(
-      "6-AXIS WEIGHTED PEER-REVIEW RUBRIC",
+      "6-AXIS WEIGHTED APPRAISAL RUBRIC (EXACT COMPOSITE)",
       MARGIN_H + 12f,
-      rubricTop + 18f,
+      rubricTop + 17.5f,
       subHeaderTitlePaint
     )
-    val confRight = "WEIGHTED SCORE: ${review.credibilityScore}/100  •  CONFIDENCE: ${rubric.refereeConfidence}/5"
+    val confRight = "WEIGHTED: $authoritativeScore/100  •  SCI ${rubric.refereeConfidence}/5  •  EXT ${rubric.extractionConfidence}/5"
     val confRightW = sectionStagePaint.measureText(confRight)
-    canvas.drawText(confRight, PAGE_WIDTH - MARGIN_H - confRightW - 12f, rubricTop + 17.5f, sectionStagePaint)
-    canvas.drawLine(MARGIN_H + 12f, rubricTop + 25f, PAGE_WIDTH - MARGIN_H - 12f, rubricTop + 25f, dividerPaint)
+    canvas.drawText(confRight, PAGE_WIDTH - MARGIN_H - confRightW - 12f, rubricTop + 17f, sectionStagePaint)
+    canvas.drawLine(MARGIN_H + 12f, rubricTop + 24f, PAGE_WIDTH - MARGIN_H - 12f, rubricTop + 24f, dividerPaint)
 
-    var rowY = rubricTop + 38f
-    criteria.forEach { item ->
-      canvas.drawText("${item.criterion} (${item.weightPercent}%)", MARGIN_H + 12f, rowY, bodyBoldPaint)
+    cursorY = rubricTop + 34f
+    preparedRows.forEach { (item, justLayout, rowH) ->
+      if (!fitsSingleCard && cursorY + rowH > PAGE_HEIGHT - MARGIN_BOTTOM) {
+        startNewPage()
+      }
+      val rowBaseline = cursorY + 8f
+      canvas.drawText("${item.criterion} (${item.weightPercent}%)", MARGIN_H + 12f, rowBaseline, bodyBoldPaint)
 
       val barStartX = MARGIN_H + 168f
-      val barW = 286f
+      val barW = 282f
       canvas.drawRoundRect(
-        RectF(barStartX, rowY - 7.5f, barStartX + barW, rowY - 1.5f),
+        RectF(barStartX, rowBaseline - 7.5f, barStartX + barW, rowBaseline - 1.5f),
         3f,
         3f,
         trackBarBgPaint
@@ -743,7 +1027,7 @@ object PdfReportExporter {
       val fraction = (item.score.toFloat() / item.maxScore.toFloat()).coerceIn(0f, 1f)
       val barFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = axisScoreColor(item.score) }
       canvas.drawRoundRect(
-        RectF(barStartX, rowY - 7.5f, barStartX + (barW * fraction).coerceAtLeast(4f), rowY - 1.5f),
+        RectF(barStartX, rowBaseline - 7.5f, barStartX + (barW * fraction).coerceAtLeast(4f), rowBaseline - 1.5f),
         3f,
         3f,
         barFillPaint
@@ -754,38 +1038,36 @@ object PdfReportExporter {
         color = axisScoreColor(item.score)
         typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
       }
-      canvas.drawText(scoreLabel, barStartX + barW + 12f, rowY, scoreLabelPaint)
+      canvas.drawText(scoreLabel, barStartX + barW + 12f, rowBaseline, scoreLabelPaint)
 
-      // Clean 1-line rationale snippet beneath each rubric row
-      val cleanJust = DossierFormattingEngine.cleanAcademicProse(item.justification)
-        .replace("\n", " ")
-        .replace(Regex("""\s+"""), " ")
-        .trim()
-      val truncatedJust = if (cleanJust.length > 106) cleanJust.take(103).trimEnd() + "…" else cleanJust
-      canvas.drawText(truncatedJust, MARGIN_H + 12f, rowY + 11.5f, smallMutedPaint)
+      // Full multi-line rationale — NEVER clipped or truncated!
+      canvas.save()
+      canvas.translate(MARGIN_H + 12f, rowBaseline + 4.5f)
+      justLayout.draw(canvas)
+      canvas.restore()
 
-      rowY += rowHeight
+      cursorY += rowH
     }
-    cursorY = rubricTop + rubricBoxH + 10f
+    cursorY = if (fitsSingleCard) rubricTop + totalRubricH + 10f else cursorY + 8f
 
     // =========================================================================
-    // 4. LOGICAL, COHERENT 9-SECTION DOSSIER FLOW
+    // 4. EVIDENCE-FIRST SCIENTIFIC APPRAISAL SECTIONS
     // =========================================================================
 
-    // Section 01: Manuscript Profile & Claimed Contributions
-    drawSectionHeader("01", "MANUSCRIPT PROFILE & CLAIMED CONTRIBUTIONS", "STAGE 00a–00c")
+    // Section 01: Executive Summary & Article Profile
+    drawSectionHeader("01", "EXECUTIVE SUMMARY & ARTICLE PROFILE", "SCOPE & DESIGN")
     val profileContent = buildString {
       if (review.abstractSummary.isNotBlank()) {
         appendLine("Executive Assessment: ${review.abstractSummary.trim()}")
         appendLine()
       }
       if (review.researchQuestion.isNotBlank()) {
-        appendLine("[STAGE 00b — RESEARCH QUESTION]")
+        appendLine("[STAGE 00b — PRIMARY RESEARCH QUESTION]")
         appendLine(review.researchQuestion.trim())
         appendLine()
       }
       if (review.keyMethodology.isNotBlank()) {
-        appendLine("[STAGE 00b — CORE METHODOLOGY & DESIGN]")
+        appendLine("[STAGE 00b — METHODOLOGY & STUDY DESIGN]")
         appendLine(review.keyMethodology.trim())
         appendLine()
       }
@@ -796,64 +1078,113 @@ object PdfReportExporter {
     }
     drawStructuredBlocks(profileContent, stripInternalTags = true)
 
-    // Section 02: Editorial Decision, Credibility Assessment & Revision Roadmap
-    drawSectionHeader("02", "EDITORIAL DECISION, CREDIBILITY & REVISION ROADMAP", "STAGE 04a / 06 / 08a–08b")
-    drawStructuredBlocks(review.editorNote, stripInternalTags = true)
+    // Section 02: Prioritized Source-Anchored Findings Ledger
+    drawSectionHeader("02", "PRIORITIZED SOURCE-ANCHORED FINDINGS LEDGER", "EVIDENCE AUDIT")
+    if (findings.isNotEmpty()) {
+      val verifiedCount = findings.count { it.status == FindingStatus.VERIFIED }
+      val partialCount = findings.count { it.status == FindingStatus.PARTIALLY_SUPPORTED }
+      val contradictedCount = findings.count { it.status == FindingStatus.CONTRADICTED }
+      val unverifiedCount = findings.count { it.status == FindingStatus.UNVERIFIED }
+      drawLayoutPaginated(
+        "Ledger Summary: ${findings.size} structured finding(s) — $verifiedCount Verified, " +
+          "$partialCount Partially Supported, $unverifiedCount Unverified, $contradictedCount Contradicted/Dismissed.",
+        smallMutedPaint
+      )
+      cursorY += 5f
+      findings.forEach { finding ->
+        drawFindingLedgerCard(finding)
+      }
+    } else {
+      drawStructuredBlocks(review.blueTeamVerification, stripInternalTags = true)
+    }
 
-    // Section 03: Adjudicated Findings Matrix & Blue Team Verification
-    drawSectionHeader("03", "ADJUDICATED FINDINGS MATRIX & BLUE TEAM VERIFICATION", "STAGE 02a–03c")
-    drawStructuredBlocks(review.blueTeamVerification, stripInternalTags = true)
-
-    // Section 04: Quantitative, Statistical & Mathematical Audit (Proportional text + shaded Equation strips!)
+    // Section 03: Quantitative & Statistical Audit
     if (review.mathAuditReport.isNotBlank()) {
-      drawSectionHeader("04", "QUANTITATIVE, STATISTICAL & MATHEMATICAL AUDIT", "STAGE 01e–01fd")
+      drawSectionHeader("03", "QUANTITATIVE, STATISTICAL & MATHEMATICAL AUDIT", "FORENSICS & STATS")
       drawStructuredBlocks(review.mathAuditReport, stripInternalTags = true)
     }
 
-    // Section 05: Reproducibility, Provenance & Methodology X-Ray
+    // Section 04: Methodological Verification, Counterarguments & Numerical Check
+    if (findings.isNotEmpty() && review.blueTeamVerification.isNotBlank()) {
+      drawSectionHeader("04", "VERIFICATION SYNTHESIS & BLUE TEAM COUNTERARGUMENTS", "CROSS-CHECK")
+      drawStructuredBlocks(review.blueTeamVerification, stripInternalTags = true)
+    }
+
+    // Section 05: Reproducibility, Provenance & Clinical/Policy Applicability
     if (review.codeAuditReport.isNotBlank()) {
-      drawSectionHeader("05", "REPRODUCIBILITY, PROVENANCE & METHODOLOGY X-RAY", "STAGE 01i–01n & 07b")
+      drawSectionHeader("05", "REPRODUCIBILITY, PROVENANCE & CLINICAL APPLICABILITY", "TRANSFERABILITY")
       drawStructuredBlocks(review.codeAuditReport, stripInternalTags = true)
     }
 
-    // Section 06: Red Team Adversarial Transcript
-    if (review.redTeamCritique.isNotBlank()) {
-      drawSectionHeader("06", "RED TEAM ADVERSARIAL TRANSCRIPT", "STAGE 01a–01g")
-      drawStructuredBlocks(review.redTeamCritique, stripInternalTags = true)
-    }
+    // Section 06: Balanced Final Assessment, Decision & Action Roadmap
+    drawSectionHeader("06", "FINAL ASSESSMENT, VERDICT & PRIORITIZED ACTIONS", reviewMode.shortLabel.uppercase(Locale.US))
+    drawStructuredBlocks(review.editorNote, stripInternalTags = true)
 
-    // Section 07: Anticipated Reviewer 2 Interrogation & Robustness Checks
-    if (review.reviewerQuestions.isNotBlank()) {
-      drawSectionHeader("07", "ANTICIPATED REVIEWER 2 INTERROGATION & ABLATIONS", "PHD-SKILLS FORTIFY")
-      drawStructuredBlocks(review.reviewerQuestions, stripInternalTags = true)
-    }
-
-    // Section 08: Proofreading & Academic Copyedit Report
-    if (review.copyeditSuggestions.isNotBlank()) {
-      drawSectionHeader("08", "PROOFREADING & ACADEMIC COPYEDIT REPORT", "STAGE 09a–09c")
-      drawStructuredBlocks(review.copyeditSuggestions, stripInternalTags = true)
-    }
-
-    // Section 09: Author Revision & Rebuttal Notes (if added by user)
+    // Author personal notes (always included when present)
     if (review.personalNotes.isNotBlank()) {
-      drawSectionHeader("09", "AUTHOR REVISION & REBUTTAL NOTES", "PERSONAL SCRATCHPAD")
+      drawSectionHeader("07", "RESEARCHER NOTES & REVISION SCRATCHPAD", "USER NOTES")
       drawStructuredBlocks(review.personalNotes, stripInternalTags = false)
+    }
+
+    // =========================================================================
+    // 5. OPTIONAL FULL TECHNICAL APPENDIX (Multi-Agent Raw Transcripts)
+    // =========================================================================
+    if (scope == PdfExportScope.FULL_TECHNICAL_APPENDIX) {
+      if (review.redTeamCritique.isNotBlank()) {
+        drawSectionHeader("A1", "APPENDIX: CANDIDATE ADVERSARIAL CRITIQUE TRANSCRIPT", "STAGE 01a–01g")
+        drawStructuredBlocks(review.redTeamCritique, stripInternalTags = true)
+      }
+      if (review.reviewerQuestions.isNotBlank()) {
+        drawSectionHeader("A2", "APPENDIX: ANTICIPATED PEER-REVIEW QUESTIONS & CHECKS", "FORTIFY Q&A")
+        drawStructuredBlocks(review.reviewerQuestions, stripInternalTags = true)
+      }
+      if (review.copyeditSuggestions.isNotBlank()) {
+        drawSectionHeader("A3", "APPENDIX: PROOFREADING & ACADEMIC COPYEDIT NOTES", "STAGE 09a–09c")
+        drawStructuredBlocks(review.copyeditSuggestions, stripInternalTags = true)
+      }
     }
 
     drawFooter(canvas, pageNumber)
     document.finishPage(page)
 
-    document.writeTo(outputStream)
-    document.close()
+      document.writeTo(outputStream)
+    } finally {
+      document.close()
+    }
   }
 
   private fun verdictAccentColor(verdict: String): Int {
     val upper = verdict.uppercase(Locale.US)
     return when {
-      upper.contains("ACCEPT") && !upper.contains("REJECT") -> Color.rgb(22, 163, 74)
-      upper.contains("MINOR") -> Color.rgb(0, 98, 227)
-      upper.contains("MAJOR") -> Color.rgb(217, 119, 6)
+      upper in setOf("ACCEPT", "HIGH_CREDIBILITY", "HIGH_CERTAINTY") -> Color.rgb(22, 163, 74)
+      upper in setOf("MINOR_REVISION", "SOUND_WITH_CAVEATS", "MODERATE_CERTAINTY") -> Color.rgb(0, 98, 227)
+      upper in setOf("MAJOR_REVISION", "REQUIRES_CORRECTION", "LOW_CERTAINTY") -> Color.rgb(217, 119, 6)
       else -> Color.rgb(220, 38, 38)
+    }
+  }
+
+  private fun statusPillColor(status: FindingStatus): Int = when (status) {
+    FindingStatus.VERIFIED -> Color.rgb(22, 163, 74)
+    FindingStatus.PARTIALLY_SUPPORTED -> Color.rgb(0, 98, 227)
+    FindingStatus.UNVERIFIED -> Color.rgb(217, 119, 6)
+    FindingStatus.CONTRADICTED -> Color.rgb(100, 116, 139)
+    FindingStatus.NOT_APPLICABLE -> Color.rgb(100, 116, 139)
+  }
+
+  private fun findingPalette(finding: ReviewFinding): BadgePalette {
+    if (finding.status == FindingStatus.CONTRADICTED || finding.status == FindingStatus.NOT_APPLICABLE) {
+      return BadgePalette(
+        bgColor = Color.rgb(248, 250, 252),
+        borderColor = Color.rgb(203, 213, 225),
+        accentColor = Color.rgb(100, 116, 139),
+        textColor = Color.rgb(71, 85, 105)
+      )
+    }
+    return when (finding.severity.uppercase(Locale.US)) {
+      "CRITICAL" -> severityPalette(SeverityLevel.CRITICAL)
+      "MAJOR" -> severityPalette(SeverityLevel.MAJOR)
+      "MINOR" -> severityPalette(SeverityLevel.MINOR)
+      else -> severityPalette(SeverityLevel.RECOMMENDED)
     }
   }
 

@@ -944,7 +944,26 @@ fun IosSettingsScreen(
       1 -> {
         item {
           IosGroupedCard(
-            header = "AI Referee Harshness Persona"
+            header = "Default Appraisal Mode",
+            footer = settingsState.defaultOptions.reviewMode.description
+          ) {
+            val modes = com.example.data.model.ReviewMode.entries
+            IosSegmentedControl(
+              items = modes.map { it.shortLabel },
+              selectedIndex = modes.indexOf(settingsState.defaultOptions.reviewMode).coerceAtLeast(0),
+              onSelect = { idx ->
+                onUpdateSettings {
+                  it.copy(defaultOptions = it.defaultOptions.copy(reviewMode = modes[idx]))
+                }
+              },
+              modifier = Modifier.testTag("settings_review_mode_selector")
+            )
+          }
+        }
+
+        item {
+          IosGroupedCard(
+            header = "AI Referee Rigor & Calibration"
           ) {
             Row(
               verticalAlignment = Alignment.CenterVertically,
@@ -1191,10 +1210,34 @@ fun IosSettingsScreen(
               iconTint = CupertinoGreen,
               title = "Auto-Save Reports to Cloud Library",
               subtitle = "Automatically persist every analysed paper to Firebase Firestore",
-              checked = settingsState.autoSaveToCloud,
+              checked = settingsState.autoSaveToCloud && !settingsState.confidentialLocalOnly,
               onCheckedChange = { enabled ->
-                onUpdateSettings { it.copy(autoSaveToCloud = enabled) }
+                onUpdateSettings {
+                  it.copy(
+                    autoSaveToCloud = enabled,
+                    confidentialLocalOnly = if (enabled) false else it.confidentialLocalOnly
+                  )
+                }
               }
+            )
+
+            IosInsetDivider()
+
+            IosSettingToggleRow(
+              icon = Icons.Default.Policy,
+              iconTint = CupertinoAmber,
+              title = "Confidential Local-Only Mode",
+              subtitle = "Keep unpublished manuscripts strictly in on-device Room storage (no Firestore upload, excluded from Android cloud backups)",
+              checked = settingsState.confidentialLocalOnly,
+              onCheckedChange = { enabled ->
+                onUpdateSettings {
+                  it.copy(
+                    confidentialLocalOnly = enabled,
+                    autoSaveToCloud = if (enabled) false else it.autoSaveToCloud
+                  )
+                }
+              },
+              modifier = Modifier.testTag("toggle_confidential_local_only")
             )
 
             Spacer(modifier = Modifier.height(10.dp))

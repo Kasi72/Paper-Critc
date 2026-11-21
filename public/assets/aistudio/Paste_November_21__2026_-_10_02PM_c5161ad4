@@ -1,0 +1,485 @@
+Paper Critic — Source-Code Audit and Professionalisation Plan
+GitHub repository review · Original 14-page manuscript · Generated 8-page referee report · 21 November 2026
+
+The repository is now accessible. I've verified that Kasi72/Paper-Critc is public and inspected the actual Kotlin implementation.
+
+The original article you uploaded is also extremely useful: it allows us to identify not merely what is wrong with the generated report, but which parts of the application are responsible for those errors.
+1. The three most consequential discoveries
+1. The PDF extraction system is inadequate for rigorous journal appraisal.
+
+The application attempts to extract text by manually scanning PDF byte streams and matching parenthesized text. It is not using a full PDF text-and-layout extraction engine. This can lose scientific text, symbols, equations, reading order and tables.
+
+
+
+2. The AI frequently reviews an abbreviated version of the paper.
+
+The application reduces the extracted manuscript to approximately 14,000 characters, retaining the beginning and end while discarding the middle. The middle of a scientific article often contains exactly the Methods and Results needed to validate its criticisms.
+
+
+
+3. Verification and credibility scoring are not sufficiently independent.
+
+The report's important judgments still depend heavily on model-generated prose. The code also permits the displayed credibility score and six-axis rubric to disagree.
+
+
+
+These are implementation problems, not merely prompt-writing problems.
+2. What the repository actually contains
+The project is a native Android application built with Kotlin and Jetpack Compose, using Firebase AI Logic for its primary AI pipeline, with configurable external AI-provider support. It also includes local persistence, Firestore integration, a native PDF exporter and a multi-persona reviewer chat interface.
+
+I found meaningful engineering work already present: structured response schemas, fallback model handling, a deterministic statistics module, manuscript-type classification, a red-team/blue-team pipeline and dedicated dossier formatting.
+
+The architecture is not something I would discard. It needs substantial correction and separation of responsibilities.
+Current architecture, reconstructed from source
+PDF / DOCX / text upload
+
+ManuscriptExtractor.kt
+
+
+Regex-based forensic preflight
+
+ManuscriptForensicEngine.kt + QuantitativeForensicAnalyzer.kt
+
+
+Pass 1 — AI adversarial criticism
+
+Red-team findings and article profile
+
+
+Pass 2A
+
+AI verification and editorial synthesis
+
+
+Pass 2B
+
+Specialist quantitative critique, run in parallel
+
+
+
+
+Rubric, verdict and dossier assembly
+
+PaperReview.kt + Reviewer2PipelineService.kt
+
+
+Native Android PDF rendering
+
+DossierFormattingEngine.kt + PdfReportExporter.kt
+
+
+There is an important distinction between the product's 30 named review stages and its actual execution. The source coordinates a deterministic preflight and a small number of substantial model passes. Many of the named stages are requested as sections within those model responses, rather than executed as independently verified stages.
+
+That is not inherently wrong for an MVP, but it matters when the report presents the output as a thoroughly verified, 30-stage expert review.
+3. A direct reconstruction of the PDF extraction failure
+I reproduced the repository's PDF text-extraction heuristic against your newly uploaded original manuscript. This was a static reconstruction of the extraction algorithm, not an execution of the Android application.
+Original article14
+pages
+
+
+Actual PDF text56,474
+characters
+
+
+Heuristic output22,000
+characters, heavily damaged
+
+
+
+The reconstructed extraction began like this:
+Ps ychological Medicine ... evie Article ... ozas-Serri ... Need est tes ychia tric beds: emati re view and meta-an ly sis ...
+
+This is decisive evidence that the application's current PDF-reading approach can damage exactly the information needed for reliable scientific appraisal.
+
+In that reconstructed output, direct phrase searches failed to find:
+- random-effects meta-analyses
+- Data were independently extracted
+- I2-statistic
+- September 13
+- prevalence ratios
+All these concepts appear in the actual article. For example, the paper describes random-effects meta-analysis and I² in its Methods section on page 2, and independent data extraction by three authors on that same page. 
+S0033291724002307a.pdf
+ S0033291724002307a.pdf
+
+This explains why the generated review could confidently criticize analyses that the authors actually performed.
+
+The problem becomes worse because of the successive truncation limits:
+Code location	Actual implementation
+ManuscriptExtractor.kt	PDF byte reading limited to 6 MB; extracted text limited to 22,000 characters; imported manuscript content limited to 24,000
+condenseTextForPrompt()	Manuscript shortened by retaining 62% from the beginning and the remainder from the end
+Pipeline input construction	Primary prompt receives a 14,000-character condensation; fallback receives 8,500 characters
+Model fallback	Fallback switches to the shorter manuscript and removes visual inputs
+
+The application may therefore have access to neither the complete text nor the relevant figure when it makes a criticism.
+
+This is the first component I would replace, before rewriting the prompts or redesigning the PDF.
+4. What the original article proves the reviewer got wrong — and what it missed
+The following comparison is grounded in the two PDFs, not just the code.
+Verification test	Original article	Generated review	Assessment
+Search cutoff	13 September 2022, page 1	September 2023	Wrong
+Meta-analysis performed?	Yes; random-effects models, page 2	Described as entirely unweighted median/IQR synthesis	Wrong
+Heterogeneity quantified?	I² described on page 2; Figure 2 reports I² above 99%	Says heterogeneity was not quantified	Wrong
+Meta-regression performed?	Yes; β=0.53, p=0.004, page 8	Says inferential analysis was lacking	Wrong
+Quality assessment	A limited quality-scoring approach, page 3	Says appraisal was completely absent	Overstated
+Geographic generalizability	62 of 65 publications from HICs	Identifies high-income skew	Valid concern
+
+The original article documents these methods and results explicitly. 
+S0033291724002307a.pdf
+ S0033291724002307a.pdf
+ S0033291724002307a.pdf
+ S0033291724002307a.pdf
+
+A genuine numerical inconsistency the app should have found
+There is a much more interesting potential reporting error in the published article itself.
+
+On page 8, the Results text gives a pooled long-stay bed estimate of 9, accompanied by a stated 95% CI of 1.26 to 2.35. That interval does not contain the point estimate of 9.
+
+Yet Figure 2 on page 9 displays the long-stay pooled estimate as approximately 9 (95% CI 3–15).
+
+That is a concrete cross-reference discrepancy worth flagging for verification. It may be a transcription or editorial error, but the application should not invent an explanation without checking the source and any correction notices. 
+S0033291724002307a.pdf
+
+What the improved reviewer should say:
+Numerical consistency concern — Results versus Figure 2. The reported long-stay pooled point estimate of 9 is incompatible with the confidence interval of 1.26–2.35 given in the narrative. Figure 2 appears to give 3–15 instead. Verify the intended confidence limits and correct the discrepancy if confirmed.
+
+This is a much stronger example of scientific reviewing than automatically recommending REML, Egger regression or publication-bias tests.
+
+It is also a test of the whole architecture: the system needs reliable extraction of the Results text, visual or structured interpretation of Figure 2, numerical validation, and a linked finding.
+
+5. The credibility score has a demonstrable code defect
+Your report displays the following six-axis rubric:
+
+02.557.510MethodologySignificanceClarityOriginalityMath rigorReproducibility
+
+
+
+
+
+
+
+
+
+The six scores shown in the generated report
+
+      
+
+
+
+The weighted total is 63/100, but the headline says 72/100. 
+need_estimates_of_psychiatric_beds_a_sys_referee_report.pdf
+
+I traced the reason through two files:
+- Reviewer2PipelineService.kt, lines 976–1017 calculates a weighted total but still permits the model's separate credibility score when it differs by up to 10 points. For larger discrepancies, it averages the two values rather than enforcing the weighted calculation.
+- PaperReview.kt, lines 85–151 reconstructs individual rubric values by parsing text in editorNote, with fallback scores derived from the headline score.
+This creates two loosely connected representations of the same assessment.
+
+Exact correction: Store all six criterion scores as structured fields, calculate the composite exclusively from those fields, and render both the rubric and headline from the same immutable assessment object.
+
+Do not reconstruct numerical values from an editorial paragraph.
+
+The application should also distinguish a confidence score in the AI's extraction and verification from confidence in the scientific conclusions. Those are two different concepts.
+6. File-by-file engineering audit
+I would prioritize changes to the existing code as follows.
+Priority	File	Problem and specific correction
+P0	ManuscriptExtractor.kt	Replace heuristic byte-stream text extraction; preserve every page, table, figure, equation and source location
+P0	Reviewer2PipelineService.kt	Remove destructive input condensation; add source-grounded claim verification and final cross-pass adjudication
+P0	QuantitativeForensicAnalyzer.kt	Distinguish genuine numerical errors from missing-keyword warnings; cross-check tables and figures
+P0	PaperReview.kt	Store structured findings, rubric scores, evidence references and verification statuses
+P1	ManuscriptForensicEngine.kt	Improve study-design routing and replace rigid generic appraisal assumptions
+P1	PdfReportExporter.kt	Redesign document hierarchy, pagination, scientific tables, metadata and citations
+P1	DossierFormattingEngine.kt	Replace regex reconstruction of model-generated paragraphs with typed report blocks
+P1	PaperCriticViewModel.kt	Add document coverage checks, explicit review modes and user-controlled confidentiality
+P2	DossierDetailView.kt	Build an interactive evidence-to-source review interface
+P2	PaperCriticSqlDatabase.kt	Secure API credentials, introduce schema migrations and preserve structured findings
+
+Additional code-level concerns
+The quantitative heuristics are too aggressive. In QuantitativeForensicAnalyzer.kt, the heterogeneity check relies on detecting text patterns such as I² = .... When a statistic is inside a figure, expressed using a different inequality, or lost during PDF parsing, the system may incorrectly conclude that the analysis is missing. The same module can issue an Egger/publication-bias warning based primarily on overall study count, without first establishing whether the relevant synthesis supports such a test.
+
+The prompts actively encourage over-criticism. In Reviewer2PipelineService.kt, the default review mode is AGGRESSIVE_REVIEWER2, and the prompt directs the model to assume zero benefit of the doubt. That may be useful for generating hypotheses, but it is poorly suited to deciding which hypotheses are established facts.
+
+The two analytical passes are not properly reconciled. The statistical and editorial analyses run concurrently. Their results are assembled into the final review, but there is no subsequent, evidence-grounded adjudicator that must resolve contradictions between the statistical report and editorial conclusion.
+
+External literature verification is separate from the main review. The Google Search grounding feature is implemented, but it is triggered separately from the dossier workflow in PaperCriticViewModel.kt. Consequently, the existence of that feature does not mean that every exported criticism has been independently checked against external information.
+
+The JSON recovery mechanism is permissive. The pipeline tries to repair truncated model JSON by closing braces or cutting back to earlier properties. Combined with default values for missing fields, this can turn an incomplete response into a seemingly complete review. A professional system should distinguish successfully generated from successfully validated.
+
+The present tests partly reinforce the wrong assumptions. The existing unit tests use a simplified psychiatric-bed manuscript and explicitly expect an unweighted-synthesis warning. They do not establish whether a warning remains appropriate after inspecting the complete published article. This is a strong reason to add full-document regression tests, not merely more isolated parser tests.
+7. The redesigned scientific review engine
+I recommend replacing the present orchestration with a verifiable evidence workflow, while preserving your red-team, blue-team, statistical and editorial capabilities.
+01
+
+Full-document ingestion
+
+Capture all pages and preserve source coordinates; identify missing or unreadable content.
+
+
+
+
+02
+
+Research classification
+
+Identify study type, primary question, research design and applicable appraisal instruments.
+
+
+
+
+03
+
+Factual evidence inventory
+
+Extract study counts, methods, analyses, outcomes, tables, statistics and limitations.
+
+
+
+
+04
+
+Independent appraisal modules
+
+Run design, statistics, reporting, reproducibility and applicability analyses.
+
+
+
+
+05
+
+Adversarial challenge
+
+Generate candidate concerns, each anchored to the evidence inventory.
+
+
+
+
+06
+
+Counterevidence verification
+
+Search the complete manuscript for evidence that disproves or qualifies every concern.
+
+
+
+
+07
+
+Final adjudication
+
+Accept, qualify, dismiss or leave findings unverified; resolve contradictions.
+
+
+
+
+08
+
+Editorial synthesis
+
+Write one coherent assessment from adjudicated findings only.
+
+
+
+
+09
+
+Report verification
+
+Check calculations, citations, completeness, typography and PDF integrity.
+
+
+
+The essential evidence data model
+Instead of passing unstructured criticism between large prompts, create a structured finding object.
+
+data class EvidenceAnchor(
+    val documentId: String,
+    val pageNumber: Int,
+    val section: String?,
+    val exactQuote: String,
+    val startOffset: Int?,
+    val endOffset: Int?,
+    val boundingBox: List<Float>?
+)
+
+enum class FindingStatus {
+    VERIFIED,
+    PARTIALLY_SUPPORTED,
+    CONTRADICTED,
+    UNVERIFIED,
+    NOT_APPLICABLE
+}
+
+data class ReviewFinding(
+    val id: String,
+    val title: String,
+    val allegation: String,
+    val severity: String,
+    val status: FindingStatus,
+    val supportingEvidence: List<EvidenceAnchor>,
+    val counterEvidence: List<EvidenceAnchor>,
+    val methodologicalJustification: String,
+    val recommendedCorrection: String,
+    val verificationNotes: String
+)
+
+
+
+The system should not permit a finding to be represented as verified unless the supporting evidence exists and the source coordinates have passed validation.
+
+For claims about the absence of an analysis, the rule needs to be even stricter: verify that the relevant Methods, Results, tables, figures and available supplements were actually inspected. Failure to detect a term in extracted text is not evidence that the method was omitted.
+8. Redesign the report around evidence, not agents
+The current PDF has nine sections determined largely by the internal pipeline. This causes repetition and gives equal visual prominence to important findings and secondary AI-generated discussion.
+
+I would replace it with two distinct documents:
+
+
+
+
+
+
+
+
+
+
+
+A. Scientific Appraisal Report
+
+The primary report for researchers, journal editors, clinicians and academic departments.
+
+Target approximately 6–10 pages when justified by the manuscript. Emphasize the verdict, methodological quality, critical findings, uncertainty, applicability and required corrections.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+B. Technical Verification Appendix
+
+An optional detailed companion containing the complete evidence ledger, statistical checks, source passages, counterarguments, reproducibility observations and model limitations.
+
+This is where your extensive 30-stage work belongs.
+
+
+
+The distinction is important. A professional reviewer can be extremely thorough without forcing the reader through every intermediate analytical step.
+Proposed primary report layout
+Page or section	Content
+Cover and executive summary	Verified article citation, review mode, core conclusion, strongest findings
+Article profile	Research question, design, population, inclusion criteria, outcomes, study flow
+Evidence map	Principal claims, supporting results and strength of evidence
+Methodological appraisal	Design-specific strengths, limitations and reporting quality
+Statistical audit	Verified errors, methods appropriateness, uncertainty and heterogeneity
+Critical findings	Prioritized, source-linked findings with precise corrections
+Clinical/policy relevance	Applicability, transferability, practical consequences and limitations
+Final assessment	Balanced synthesis, confidence and outstanding verification tasks
+
+For an already published article, the default should be Post-publication Critical Appraisal, not Minor Revision. A journal-referee mode can remain available when that is the user's purpose.
+World-class PDF formatting standards
+The code currently uses Android PdfDocument and manual Canvas positioning. This is a workable starting point, but it needs a document-layout system rather than a sequence of drawing commands.
+
+I would establish the following standards:
+- A4 with consistent margins and a proper typographic grid; approximately 10–11 pt body text and comfortable leading.
+- A real serif/sans-serif type hierarchy, with tabular numerals for statistical values.
+- Numbered findings with stable references, such as M-01 for methodology and Q-03 for quantitative issues.
+- Source citations beside findings, with page references and clickable links where supported.
+- Table row integrity, repeated column headers and controlled table continuation.
+- Rules preventing section headings, severity cards and bullets from being orphaned at page boundaries.
+- A proper final conclusion and evidence appendix rather than ending with proofreading notes.
+- Embedded metadata, meaningful bookmarks, selectable text, accessibility tagging where supported, and hyperlink annotations.
+Two exact layout defects are visible in the code.
+
+First, PdfReportExporter.kt deliberately truncates rubric explanations to 106 characters. That is why several explanations on page 1 end with ellipses. Scientific content should never be silently cut to fit a decorative card.
+
+Second, drawLayoutPaginated() splits text at the line level when space runs out. That explains why individual findings or paragraphs can break awkwardly across pages. A professional pagination engine should operate on paragraphs and semantic blocks, with widow/orphan rules and continuation logic.
+
+I would retain the existing native PDF exporter as a fallback if offline export matters, but investigate a structured HTML/CSS print engine or a proper PDF-layout library for the high-quality report path. The choice should be based on Android compatibility, licensing, accessibility, and whether server-side rendering is acceptable.
+9. Clinical and research-specific upgrades
+Because this application will be used to scrutinize biomedical literature, it should offer an additional Clinical Evidence Appraisal mode.
+
+That mode should evaluate more than statistical significance. It should ask whether patient selection is clinically representative, whether outcome measures matter, whether benefits and harms are balanced, whether the results transfer to resource-constrained settings, and what certainty is justified by the available evidence.
+
+For example, the psychiatric-bed article presents internationally synthesized estimates but does not directly establish the correct capacity for any particular hospital or district. A useful clinical/policy appraisal would distinguish bed need estimates from observed utilization, accessibility, community alternatives, case mix, length of stay and actual capacity constraints.
+
+I would also introduce design-specific appraisal pathways. PRISMA is relevant to this paper's reporting; an appropriate review-quality instrument is a separate matter. Do not treat reporting guidelines, risk-of-bias tools and certainty-of-evidence frameworks as interchangeable.
+10. Privacy, persistence and deployment findings
+These are secondary to scientific validity but important before positioning the app for professional use.
+Finding	Source-based concern	Recommended change
+API credentials	SqlApiProviderEntity stores apiKey in the ordinary Room database	Encrypt secrets using Android Keystore-backed storage, or avoid retaining them
+Database migration	Room uses fallbackToDestructiveMigration(true)	Introduce explicit migrations so updates do not erase local reviews
+Cloud retention	Generated reviews are automatically saved to Firestore by default for signed-in users	Require transparent retention and confidentiality controls for unpublished manuscripts
+Provider fallback	An external-provider failure can automatically fall back to Firebase AI	Obtain explicit consent before sending manuscript content to a different AI provider
+Android backup	Backup is enabled in the manifest	Audit backup exclusions for locally cached reports and credentials
+Release process	The repository contains tests but no visible automated CI workflow	Add reproducible builds, regression tests, PDF checks and release validation
+
+One positive point: the Firestore rules use an owner-based access model and a default-deny policy. That is a sound foundation. It still needs to be evaluated together with local storage, provider routing and retention behavior.
+11. Implementation order
+I would avoid a wholesale rewrite. The following sequence retains the existing work and corrects its most consequential weaknesses.
+
+Phase 1 — Scientific integrity
+Highest priority
+
+Replace PDF extraction, preserve page coordinates, remove lossy context truncation, fix scoring, distinguish unverified findings and add source-evidence checks.
+
+Exit condition: The psychiatric-bed paper no longer produces the false claims about meta-analysis or heterogeneity.
+
+
+
+
+Phase 2 — Professional appraisal engine
+
+Introduce study-design routing, independent counterevidence verification, a structured finding ledger, editorial reconciliation and clinical applicability assessment.
+
+Exit condition: Every consequential finding can be independently traced and challenged.
+
+
+
+
+Phase 3 — Report and UI redesign
+
+Build the principal appraisal report and technical appendix; implement professional pagination, references, bookmarks and an evidence-inspection interface.
+
+Exit condition: PDF exports pass automated layout checks and independent editorial review.
+
+
+
+
+Phase 4 — Validation and release hardening
+
+Develop benchmark papers across different research designs, protect credentials, migrate persisted data safely, introduce CI and document limitations.
+
+Exit condition: Known error cases remain fixed across repeated releases, and the app's confidentiality controls are verified.
+
+
+
+Minimum acceptance criteria for the psychiatric-bed benchmark
+The complete original manuscript should be used as a regression fixture. The application should correctly extract its 2022 search cutoff, the 65 publications and 98 estimates, the random-effects analyses, the reported I², the quality-scoring approach and the independent extraction procedure.
+
+It should also identify the potentially inconsistent long-stay confidence interval on page 8, relate it to Figure 2, and avoid inventing missing methods.
+
+On the reporting side, the six-axis scores must reconcile with the displayed composite, severity must be consistent with the overall appraisal, and no text may be truncated or misplaced. The exported report should contain verifiable references and clearly disclose any materials that were not successfully inspected.
+
+12. Final engineering judgment
+The source-code review has changed my assessment in an important way.
+
+Paper Critic's central problem is not that the AI needs to be made more intelligent or more aggressive. The app is currently denying the AI reliable access to parts of the paper, then allowing the resulting guesses to become authoritative findings.
+
+The existing Kotlin implementation provides a useful foundation, including real deterministic checks, structured AI responses, native UI components, persistent reviews and PDF export. Those are worth preserving.
+
+But the next version should enforce a clear hierarchy:
+Complete source evidence
+Correct methodological analysis
+Independently verified findings
+Coherent editorial judgment
+Publication-grade presentation
+
+If these five layers are implemented properly, the resulting report could be both exceptionally detailed and scientifically restrained.
+
+My single highest-priority recommendation is to rebuild ManuscriptExtractor.kt and the evidence-verification path in Reviewer2PipelineService.kt before spending more effort on visual styling. That is where the largest improvement in professional credibility will come from.
+
+Scope: This audit inspected the accessible repository source and both provided PDFs, including a reconstruction of the PDF extraction heuristic. It did not compile the Android application, execute live AI requests or modify the GitHub repository.

@@ -1,0 +1,150 @@
+{
+  "entities": {
+    "PaperReview": {
+      "title": "PaperReview",
+      "description": "A structured adversarial peer review dossier for an academic journal manuscript generated via the multi-stage Reviewer2 & PhD-Skills pipeline.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Authenticated owner UID matching request.auth.uid"
+        },
+        "title": {
+          "type": "string",
+          "description": "Title of the reviewed academic manuscript"
+        },
+        "authors": {
+          "type": "string",
+          "description": "Authors of the manuscript"
+        },
+        "publicationYear": {
+          "type": "string",
+          "description": "Publication or preprint year"
+        },
+        "venueOrCitation": {
+          "type": "string",
+          "description": "Journal, conference venue, DOI, or full citation string"
+        },
+        "isEmpirical": {
+          "type": "boolean",
+          "description": "Whether the paper contains empirical data/experiments"
+        },
+        "credibilityScore": {
+          "type": "integer",
+          "description": "Overall methodological credibility score from 0 to 100"
+        },
+        "verdict": {
+          "type": "string",
+          "enum": [
+            "ACCEPT",
+            "MINOR_REVISION",
+            "MAJOR_REVISION",
+            "REJECT_AND_RESUBMIT",
+            "REJECT"
+          ],
+          "description": "Editorial peer-review decision verdict"
+        },
+        "abstractSummary": {
+          "type": "string",
+          "description": "Stage 00b clean summary of the manuscript abstract and central thesis"
+        },
+        "researchQuestion": {
+          "type": "string",
+          "description": "Primary research question and identification strategy"
+        },
+        "keyMethodology": {
+          "type": "string",
+          "description": "Summary of core empirical or theoretical methodology"
+        },
+        "coreContributions": {
+          "type": "string",
+          "description": "Stage 00c extracted claims and contributions"
+        },
+        "redTeamCritique": {
+          "type": "string",
+          "description": "Stage 01 Red Team (Breaker/Butcher/Shredder) adversarial critique"
+        },
+        "blueTeamVerification": {
+          "type": "string",
+          "description": "Stage 02-03 Blue Team defense, numerical verification, and surviving issues"
+        },
+        "mathAuditReport": {
+          "type": "string",
+          "description": "Stage 01e-01fd equation proofread, LaTeX notation check, and derivation audit"
+        },
+        "codeAuditReport": {
+          "type": "string",
+          "description": "Stage 01i-01n & X-Ray code reproducibility and data leakage audit"
+        },
+        "editorNote": {
+          "type": "string",
+          "description": "Stage 08b Editor's synthesis note and decision rationale"
+        },
+        "copyeditSuggestions": {
+          "type": "string",
+          "description": "Stage 09c author-facing copyediting, clarity, and structural improvements"
+        },
+        "reviewerQuestions": {
+          "type": "string",
+          "description": "Anticipated Reviewer 2 questions and suggested ablation defenses"
+        },
+        "formattedDossier": {
+          "type": "string",
+          "description": "Stage 10 plain-text assembled report in IS IT CREDIBLE? / reviewer2 format"
+        },
+        "bookmarked": {
+          "type": "boolean",
+          "description": "Whether the user has starred/bookmarked this review"
+        },
+        "personalNotes": {
+          "type": "string",
+          "description": "User's private referee or reading notes on the manuscript"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the review was created (FieldValue.serverTimestamp())"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the review was last updated (FieldValue.serverTimestamp())"
+        }
+      },
+      "required": [
+        "userId",
+        "title",
+        "authors",
+        "publicationYear",
+        "venueOrCitation",
+        "isEmpirical",
+        "credibilityScore",
+        "verdict",
+        "abstractSummary",
+        "researchQuestion",
+        "keyMethodology",
+        "coreContributions",
+        "redTeamCritique",
+        "blueTeamVerification",
+        "mathAuditReport",
+        "codeAuditReport",
+        "editorNote",
+        "copyeditSuggestions",
+        "reviewerQuestions",
+        "formattedDossier",
+        "bookmarked",
+        "personalNotes",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}/reviews/{reviewId}": {
+      "schema": {
+        "$ref": "#/entities/PaperReview"
+      },
+      "description": "Per-user subcollection of critical journal paper reviews and adversarial audit dossiers."
+    }
+  }
+}

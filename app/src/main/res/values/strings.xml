@@ -1,0 +1,22 @@
+<resources>
+    <string name="app_name">Paper Critic</string>
+    <string name="app_tagline">Adversarial Peer Review &amp; Research Integrity Workbench</string>
+    <string name="sign_in_with_google">Sign in with Google</string>
+    <string name="sign_out">Sign Out</string>
+    <string name="auth_subtitle">Authenticate with Google to access the Gemini Adversarial Peer-Review Pipeline and sync your journal critique dossiers across devices.</string>
+    <string name="nav_workbench">Review Lab</string>
+    <string name="nav_archive">Dossiers</string>
+    <string name="nav_pipeline_guide">Pipeline Specs</string>
+    <string name="btn_import_pdf_or_txt">Import PDF / LaTeX / TXT Manuscript</string>
+    <string name="btn_run_adversarial_review">Run Reviewer2 Pipeline</string>
+    <string name="btn_save_dossier">Save Review Dossier to Cloud</string>
+    <string name="btn_copy_dossier">Copy Plain-Text Report</string>
+    <string name="btn_share_dossier">Share Dossier</string>
+    <string name="label_manuscript_title">Manuscript Title</string>
+    <string name="label_manuscript_authors">Authors &amp; Affiliations</string>
+    <string name="label_manuscript_year">Year</string>
+    <string name="label_manuscript_venue">Target Venue / Citation / DOI</string>
+    <string name="label_manuscript_body">Manuscript Content (Abstract, Methodology, Equations, Results &amp; Code Notes)</string>
+    <string name="empty_archive_title">No Saved Review Dossiers Yet</string>
+    <string name="empty_archive_subtitle">Run an adversarial review in the Review Lab or load a benchmark paper to build your cloud-synced peer review portfolio.</string>
+</resources>

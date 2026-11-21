@@ -330,24 +330,24 @@ fun DossierDetailView(
   }
 
   val sectionTabs = listOf(
-    IosSubTabEntry("1. Rubric & Verdict", Icons.Default.Gavel, "${review.credibilityScore}%"),
-    IosSubTabEntry("2. Red/Blue & Search", Icons.Default.Security, "01a–03c"),
-    IosSubTabEntry("3. Quant & Code", Icons.Default.Functions, "01e/02a"),
-    IosSubTabEntry("4. Editor & Copy", Icons.Default.EditNote, "08b/09c"),
+    IosSubTabEntry("Rubric", Icons.Default.Gavel, "${review.credibilityScore}%"),
+    IosSubTabEntry("Red/Blue", Icons.Default.Security, "01a–03c"),
+    IosSubTabEntry("Quant", Icons.Default.Functions, "01e/02a"),
+    IosSubTabEntry("Editor", Icons.Default.EditNote, "08b/09c"),
     IosSubTabEntry(
-      "5. Gemini Chat",
+      "Chat",
       Icons.Default.Forum,
       if (refereeChatState.messages.isNotEmpty()) "${refereeChatState.messages.size}" else "AI"
     ),
-    IosSubTabEntry("6. Export / PDF", Icons.Default.PictureAsPdf, "PDF")
+    IosSubTabEntry("PDF", Icons.Default.PictureAsPdf, "A4")
   )
 
   LazyColumn(
     modifier = Modifier
       .fillMaxSize()
       .testTag("dossier_detail_list"),
-    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 12.dp),
-    verticalArrangement = Arrangement.spacedBy(12.dp)
+    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
+    verticalArrangement = Arrangement.spacedBy(15.dp)
   ) {
     // Quick switcher if user has multiple analysed papers
     if (recentReviews.size > 1) {
@@ -655,35 +655,51 @@ fun DossierDetailView(
           header = "Find Across All 30 Referee Stages"
         ) {
           Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedTextField(
-              value = dossierSearchQuery,
-              onValueChange = { dossierSearchQuery = it },
-              placeholder = { Text("Search e.g. IQR, PRISMA, FAIL, leakage, bias...") },
-              leadingIcon = {
-                Icon(
-                  imageVector = Icons.Default.Search,
-                  contentDescription = "Find in dossier",
-                  tint = CupertinoBlue
-                )
-              },
-              trailingIcon = {
-                if (dossierSearchQuery.isNotEmpty()) {
-                  IconButton(onClick = { dossierSearchQuery = "" }) {
-                    Icon(
-                      imageVector = Icons.Default.Close,
-                      contentDescription = "Clear search",
-                      tint = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                  }
-                }
-              },
-              singleLine = true,
-              shape = SquircleShape(cornerRadius = 9.dp, smoothing = 0.86f),
-              colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = CupertinoBlue),
+            val searchPalette = LocalNeumorphicPalette.current
+            Box(
               modifier = Modifier
                 .fillMaxWidth()
-                .testTag("dossier_search_input")
-            )
+                .neuRecessed(
+                  cornerRadius = 24.dp,
+                  depth = 4.5.dp,
+                  cavityColor = searchPalette.surfaceRecessed
+                )
+            ) {
+              OutlinedTextField(
+                value = dossierSearchQuery,
+                onValueChange = { dossierSearchQuery = it },
+                placeholder = { Text("Search e.g. IQR, PRISMA, FAIL, bias…") },
+                leadingIcon = {
+                  Icon(
+                    imageVector = Icons.Default.Search,
+                    contentDescription = "Find in dossier",
+                    tint = MaterialTheme.colorScheme.primary
+                  )
+                },
+                trailingIcon = {
+                  if (dossierSearchQuery.isNotEmpty()) {
+                    IconButton(onClick = { dossierSearchQuery = "" }) {
+                      Icon(
+                        imageVector = Icons.Default.Close,
+                        contentDescription = "Clear search",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant
+                      )
+                    }
+                  }
+                },
+                singleLine = true,
+                shape = SquircleShape(cornerRadius = 24.dp, smoothing = 0.86f),
+                colors = OutlinedTextFieldDefaults.colors(
+                  focusedBorderColor = Color.Transparent,
+                  unfocusedBorderColor = Color.Transparent,
+                  focusedContainerColor = Color.Transparent,
+                  unfocusedContainerColor = Color.Transparent
+                ),
+                modifier = Modifier
+                  .fillMaxWidth()
+                  .testTag("dossier_search_input")
+              )
+            }
 
             if (dossierSearchQuery.trim().length >= 2) {
               if (dossierSearchMatches.isEmpty()) {

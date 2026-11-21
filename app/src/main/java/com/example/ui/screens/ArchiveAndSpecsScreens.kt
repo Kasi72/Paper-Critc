@@ -193,19 +193,19 @@ fun ArchiveScreen(
 
   val historySubTabs = listOf(
     IosSubTabEntry(
-      title = "1. Dossiers",
+      title = "Dossiers",
       icon = Icons.Default.History,
       badge = "${allReviews.size}"
     ),
     IosSubTabEntry(
-      title = "2. Rubric Stats",
+      title = "Stats",
       icon = Icons.Default.Analytics,
       badge = if (allReviews.isNotEmpty()) "${allReviews.map { it.credibilityScore }.average().toInt()}%" else null
     ),
     IosSubTabEntry(
-      title = "3. SQL & Cloud",
+      title = "Sync",
       icon = if (isSignedIn) Icons.Default.CloudDone else Icons.Default.CloudSync,
-      badge = if (isSignedIn) "SYNC" else "SQL"
+      badge = if (isSignedIn) "CLOUD" else "SQL"
     )
   )
 
@@ -213,8 +213,8 @@ fun ArchiveScreen(
     modifier = Modifier
       .fillMaxSize()
       .testTag("archive_screen_list"),
-    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 12.dp),
-    verticalArrangement = Arrangement.spacedBy(12.dp)
+    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
+    verticalArrangement = Arrangement.spacedBy(15.dp)
   ) {
     item {
       IosSubTabBar(
@@ -231,29 +231,40 @@ fun ArchiveScreen(
           IosGroupedCard(
             header = "Referee Dossier Library (${filteredReviews.size} of ${allReviews.size})"
           ) {
-            OutlinedTextField(
-              value = searchQuery,
-              onValueChange = { searchQuery = it },
-              placeholder = { Text("Search paper title, venue, or summary...") },
-              leadingIcon = {
-                Icon(
-                  imageVector = Icons.Default.Search,
-                  contentDescription = "Search library",
-                  tint = CupertinoBlue
-                )
-              },
+            val palette = LocalNeumorphicPalette.current
+            Box(
               modifier = Modifier
                 .fillMaxWidth()
-                .testTag("archive_search_input"),
-              singleLine = true,
-              shape = SquircleShape(cornerRadius = 16.dp, smoothing = 0.86f),
-              colors = OutlinedTextFieldDefaults.colors(
-                focusedBorderColor = CupertinoBlue,
-                unfocusedBorderColor = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.55f),
-                focusedContainerColor = LocalNeumorphicPalette.current.surfaceRecessed.copy(alpha = 0.72f),
-                unfocusedContainerColor = LocalNeumorphicPalette.current.surfaceRecessed.copy(alpha = 0.65f)
+                .neuRecessed(
+                  cornerRadius = 24.dp,
+                  depth = 4.5.dp,
+                  cavityColor = palette.surfaceRecessed
+                )
+            ) {
+              OutlinedTextField(
+                value = searchQuery,
+                onValueChange = { searchQuery = it },
+                placeholder = { Text("Search title, venue, or summary…") },
+                leadingIcon = {
+                  Icon(
+                    imageVector = Icons.Default.Search,
+                    contentDescription = "Search library",
+                    tint = MaterialTheme.colorScheme.primary
+                  )
+                },
+                modifier = Modifier
+                  .fillMaxWidth()
+                  .testTag("archive_search_input"),
+                singleLine = true,
+                shape = SquircleShape(cornerRadius = 24.dp, smoothing = 0.86f),
+                colors = OutlinedTextFieldDefaults.colors(
+                  focusedBorderColor = androidx.compose.ui.graphics.Color.Transparent,
+                  unfocusedBorderColor = androidx.compose.ui.graphics.Color.Transparent,
+                  focusedContainerColor = androidx.compose.ui.graphics.Color.Transparent,
+                  unfocusedContainerColor = androidx.compose.ui.graphics.Color.Transparent
+                )
               )
-            )
+            }
 
             Spacer(modifier = Modifier.height(10.dp))
 
@@ -770,23 +781,23 @@ fun IosSettingsScreen(
   }
 
   val settingsSubTabs = listOf(
-    IosSubTabEntry("1. Display", Icons.Default.DarkMode, settingsState.themeMode.label),
-    IosSubTabEntry("2. Toggles", Icons.Default.Tune, "$activePipelineToggleCount/8"),
+    IosSubTabEntry("Display", Icons.Default.DarkMode, settingsState.themeMode.label),
+    IosSubTabEntry("Toggles", Icons.Default.Tune, "$activePipelineToggleCount/8"),
     IosSubTabEntry(
-      "3. API Keys",
+      "API Keys",
       Icons.Default.Key,
       if (settingsState.useCustomApiProvider) "CUSTOM" else if (configuredKeysCount > 0) "$configuredKeysCount" else "FREE"
     ),
-    IosSubTabEntry("4. Cloud Sync", Icons.Default.CloudDone, if (isSignedIn) "ON" else "OFF"),
-    IosSubTabEntry("5. 30-Stage Engine", Icons.Default.Info, "v2")
+    IosSubTabEntry("Cloud", Icons.Default.CloudDone, if (isSignedIn) "ON" else "OFF"),
+    IosSubTabEntry("Engine", Icons.Default.Info, "30-Stg")
   )
 
   LazyColumn(
     modifier = Modifier
       .fillMaxSize()
       .testTag("ios_settings_screen"),
-    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 12.dp),
-    verticalArrangement = Arrangement.spacedBy(12.dp)
+    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
+    verticalArrangement = Arrangement.spacedBy(15.dp)
   ) {
     // Sharp-Edged iOS Squircle Sub-Tab Bar for Settings
     item {

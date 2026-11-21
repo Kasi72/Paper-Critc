@@ -508,10 +508,10 @@ private fun IosTopHeaderBar(
 ) {
   val palette = LocalNeumorphicPalette.current
   val subtitle = when (activeTab) {
-    0 -> "UPLOAD • PDF / WORD / TEXT"
-    1 -> "30-STAGE REFEREE DOSSIER"
-    2 -> "REVIEW LIBRARY ($reviewCount)"
-    else -> "PREFERENCES & AI ENGINES"
+    0 -> "30-STAGE PEER REVIEW"
+    1 -> "REFEREE DOSSIER"
+    2 -> "HISTORY ($reviewCount)"
+    else -> "PREFERENCES"
   }
 
   Column(
@@ -523,20 +523,20 @@ private fun IosTopHeaderBar(
       modifier = Modifier
         .fillMaxWidth()
         .statusBarsPadding()
-        .padding(horizontal = 16.dp, vertical = 11.dp),
+        .padding(horizontal = 16.dp, vertical = 12.dp),
       verticalAlignment = Alignment.CenterVertically,
       horizontalArrangement = Arrangement.SpaceBetween
     ) {
       Row(
         modifier = Modifier.weight(1f),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(11.dp)
+        horizontalArrangement = Arrangement.spacedBy(12.dp)
       ) {
         IosSquircleIconBadge(
           icon = Icons.Default.Gavel,
-          tint = CupertinoBlue,
-          size = 40.dp,
-          cornerRadius = 13.dp
+          tint = MaterialTheme.colorScheme.primary,
+          size = 42.dp,
+          cornerRadius = 21.dp
         )
         Column {
           Text(
@@ -551,8 +551,8 @@ private fun IosTopHeaderBar(
             style = MaterialTheme.typography.labelSmall,
             fontFamily = JetBrainsMonoFamily,
             fontSize = 9.5.sp,
-            letterSpacing = 0.75.sp,
-            color = CupertinoBlue,
+            letterSpacing = 0.85.sp,
+            color = MaterialTheme.colorScheme.primary,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis
           )
@@ -561,21 +561,21 @@ private fun IosTopHeaderBar(
 
       Row(
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp)
+        horizontalArrangement = Arrangement.spacedBy(9.dp)
       ) {
-        // Active AI Engine Raised Neumorphic Pill
+        // Active AI Engine Raised Clay Pill
         val engineColor = if (usesCustomProvider) CupertinoIndigo else CupertinoTeal
-        val engineShape = SquircleShape(cornerRadius = 10.dp, smoothing = 0.86f)
+        val engineShape = SquircleShape(cornerRadius = 12.dp, smoothing = 0.86f)
         Row(
           modifier = Modifier
             .neuRaised(
-              cornerRadius = 10.dp,
-              elevation = 3.5.dp,
-              surfaceColor = palette.surfaceElevated
+              cornerRadius = 12.dp,
+              elevation = 4.5.dp,
+              surfaceColor = palette.surfaceRaised
             )
             .clip(engineShape)
             .clickable { onOpenApiSettings() }
-            .padding(horizontal = 8.dp, vertical = 6.dp)
+            .padding(horizontal = 9.dp, vertical = 7.dp)
             .testTag("top_bar_api_engine_badge"),
           verticalAlignment = Alignment.CenterVertically,
           horizontalArrangement = Arrangement.spacedBy(4.dp)
@@ -590,25 +590,25 @@ private fun IosTopHeaderBar(
             text = if (usesCustomProvider) "CUSTOM" else "KEYLESS",
             style = MaterialTheme.typography.labelSmall,
             fontFamily = JetBrainsMonoFamily,
-            fontSize = 9.5.sp,
+            fontSize = 9.sp,
             fontWeight = FontWeight.Bold,
             color = engineColor
           )
         }
 
-        // Cloud Sync Raised Neumorphic Pill
-        val badgeColor = if (isSignedIn) CupertinoGreen else CupertinoBlue
-        val badgeShape = SquircleShape(cornerRadius = 10.dp, smoothing = 0.86f)
+        // Cloud Sync Raised Clay Pill
+        val badgeColor = if (isSignedIn) CupertinoGreen else MaterialTheme.colorScheme.primary
+        val badgeShape = SquircleShape(cornerRadius = 12.dp, smoothing = 0.86f)
         Row(
           modifier = Modifier
             .neuRaised(
-              cornerRadius = 10.dp,
-              elevation = 3.5.dp,
-              surfaceColor = palette.surfaceElevated
+              cornerRadius = 12.dp,
+              elevation = 4.5.dp,
+              surfaceColor = palette.surfaceRaised
             )
             .clip(badgeShape)
             .clickable { onOpenAccountSettings() }
-            .padding(horizontal = 8.dp, vertical = 6.dp)
+            .padding(horizontal = 9.dp, vertical = 7.dp)
             .testTag("top_bar_cloud_sync_badge"),
           verticalAlignment = Alignment.CenterVertically,
           horizontalArrangement = Arrangement.spacedBy(4.dp)
@@ -623,22 +623,22 @@ private fun IosTopHeaderBar(
             text = if (isSignedIn) "SYNCED" else "SIGN IN",
             style = MaterialTheme.typography.labelSmall,
             fontFamily = JetBrainsMonoFamily,
-            fontSize = 9.5.sp,
+            fontSize = 9.sp,
             fontWeight = FontWeight.Bold,
             color = badgeColor
           )
         }
 
         // Tactile Circular Light / Dark Theme Medallion
-        val themeBtnShape = SquircleShape(cornerRadius = 18.dp, smoothing = 0.86f)
+        val themeBtnShape = SquircleShape(cornerRadius = 19.dp, smoothing = 0.86f)
         IconButton(
           onClick = onToggleTheme,
           modifier = Modifier
-            .size(36.dp)
+            .size(38.dp)
             .neuRaised(
-              cornerRadius = 18.dp,
-              elevation = 3.8.dp,
-              surfaceColor = palette.surfaceElevated
+              cornerRadius = 19.dp,
+              elevation = 4.5.dp,
+              surfaceColor = palette.surfaceRaised
             )
             .clip(themeBtnShape)
             .testTag("top_bar_theme_toggle")
@@ -646,26 +646,12 @@ private fun IosTopHeaderBar(
           Icon(
             imageVector = if (isDarkActive) Icons.Default.LightMode else Icons.Default.DarkMode,
             contentDescription = if (isDarkActive) "Switch to Light Mode" else "Switch to Dark Mode",
-            tint = if (isDarkActive) AmberGold400 else CupertinoIndigo,
+            tint = if (isDarkActive) AmberGold400 else MaterialTheme.colorScheme.primary,
             modifier = Modifier.size(17.dp)
           )
         }
       }
     }
-
-    // Embossed two-tone Neumorphic seam divider
-    Box(
-      modifier = Modifier
-        .fillMaxWidth()
-        .height(0.85.dp)
-        .background(palette.hairlineShadow)
-    )
-    Box(
-      modifier = Modifier
-        .fillMaxWidth()
-        .height(0.85.dp)
-        .background(palette.hairlineHighlight)
-    )
   }
 }
 
@@ -677,28 +663,20 @@ private fun IosSquircleBottomTabBar(
   onSelectTab: (Int) -> Unit
 ) {
   val palette = LocalNeumorphicPalette.current
-  val dockRadius = 22.dp
-  val dockShape = SquircleShape(cornerRadius = dockRadius, smoothing = 0.86f)
 
+  // Directly modeled on the reference Neumorphic bottom bar:
+  // 4 independent sculpted clay tiles on #E0E5EC where inactive = raised & active = deeply carved inset.
   Box(
     modifier = Modifier
       .fillMaxWidth()
       .background(palette.canvas)
       .navigationBarsPadding()
-      .padding(horizontal = 14.dp, vertical = 9.dp)
+      .padding(horizontal = 16.dp, vertical = 12.dp)
       .testTag("bottom_navigation_bar")
   ) {
     Row(
-      modifier = Modifier
-        .fillMaxWidth()
-        .neuRaised(
-          cornerRadius = dockRadius,
-          elevation = 7.dp,
-          surfaceColor = palette.surfaceElevated
-        )
-        .clip(dockShape)
-        .padding(horizontal = 7.dp, vertical = 6.dp),
-      horizontalArrangement = Arrangement.spacedBy(5.dp),
+      modifier = Modifier.fillMaxWidth(),
+      horizontalArrangement = Arrangement.spacedBy(12.dp),
       verticalAlignment = Alignment.CenterVertically
     ) {
       IosSquircleTabItem(
@@ -718,7 +696,7 @@ private fun IosSquircleBottomTabBar(
       )
       IosSquircleTabItem(
         selected = activeTab == 2,
-        label = "Review History",
+        label = "History",
         icon = Icons.Default.History,
         badgeText = if (libraryCount > 0) libraryCount.toString() else null,
         onClick = { onSelectTab(2) },
@@ -743,18 +721,26 @@ private fun GlobalLivePipelineBanner(
   onReturnToWorkbench: () -> Unit,
   onCancel: () -> Unit
 ) {
-  Surface(
-    color = SlateNavy900,
+  val palette = LocalNeumorphicPalette.current
+  Box(
     modifier = Modifier
       .fillMaxWidth()
-      .clickable { onReturnToWorkbench() }
-      .testTag("global_live_pipeline_banner")
+      .background(palette.canvas)
+      .padding(horizontal = 16.dp, vertical = 4.dp)
   ) {
     Column(
       modifier = Modifier
         .fillMaxWidth()
-        .padding(horizontal = 14.dp, vertical = 7.dp),
-      verticalArrangement = Arrangement.spacedBy(5.dp)
+        .neuRecessed(
+          cornerRadius = 16.dp,
+          depth = 4.dp,
+          cavityColor = palette.surfaceRecessed
+        )
+        .clip(SquircleShape(cornerRadius = 16.dp, smoothing = 0.86f))
+        .clickable { onReturnToWorkbench() }
+        .padding(horizontal = 14.dp, vertical = 9.dp)
+        .testTag("global_live_pipeline_banner"),
+      verticalArrangement = Arrangement.spacedBy(6.dp)
     ) {
       Row(
         modifier = Modifier.fillMaxWidth(),
@@ -769,14 +755,14 @@ private fun GlobalLivePipelineBanner(
           Text(
             text = "STAGE [$stageCode]",
             fontFamily = JetBrainsMonoFamily,
-            fontWeight = FontWeight.Bold,
+            fontWeight = FontWeight.ExtraBold,
             fontSize = 10.sp,
-            color = AmberGold400
+            color = MaterialTheme.colorScheme.primary
           )
           Text(
             text = stageLabel,
             style = MaterialTheme.typography.labelSmall,
-            color = Color.White.copy(alpha = 0.92f),
+            color = MaterialTheme.colorScheme.onSurface,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.weight(1f)
@@ -789,9 +775,9 @@ private fun GlobalLivePipelineBanner(
           Text(
             text = "${(progress * 100).toInt()}%",
             fontFamily = JetBrainsMonoFamily,
-            fontWeight = FontWeight.Bold,
+            fontWeight = FontWeight.ExtraBold,
             fontSize = 11.sp,
-            color = Color.White
+            color = MaterialTheme.colorScheme.primary
           )
           IconButton(
             onClick = onCancel,
@@ -802,20 +788,16 @@ private fun GlobalLivePipelineBanner(
             Icon(
               imageVector = Icons.Default.Close,
               contentDescription = "Cancel running review",
-              tint = Color.White.copy(alpha = 0.78f),
+              tint = MaterialTheme.colorScheme.onSurfaceVariant,
               modifier = Modifier.size(15.dp)
             )
           }
         }
       }
-      LinearProgressIndicator(
-        progress = { progress.coerceIn(0.02f, 1f) },
-        modifier = Modifier
-          .fillMaxWidth()
-          .height(3.dp)
-          .clip(SquircleShape(cornerRadius = 2.dp, smoothing = 0.88f)),
-        color = CupertinoBlue,
-        trackColor = Color.White.copy(alpha = 0.16f)
+      com.example.ui.components.NeuProgressBar(
+        progress = progress,
+        height = 9.dp,
+        fillColor = MaterialTheme.colorScheme.primary
       )
     }
   }

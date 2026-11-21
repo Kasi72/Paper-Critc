@@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
@@ -27,6 +28,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -48,6 +50,7 @@ import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -68,10 +71,10 @@ import kotlin.math.min
 import kotlin.math.sin
 
 /**
- * Continuous Superellipse Squircle used across sculpted Neo-Tactile cards, pills, and medallions.
+ * Continuous Superellipse Squircle used across sculpted ui-neumorphism cards, pills, and medallions.
  */
 class SquircleShape(
-  private val cornerRadius: Dp = 14.dp,
+  private val cornerRadius: Dp = 16.dp,
   private val smoothing: Float = 0.86f
 ) : Shape {
   override fun createOutline(
@@ -102,8 +105,50 @@ class SquircleShape(
 }
 
 /**
- * Neo-Tactile Primary Action Button with soft extruded lift, luminous ambient aura,
- * and physical depression into an inner-shadow pressed state on touch.
+ * Sculpted ui-neumorphism Progress Bar modeled on deep carved tracks with muted steel-slate fill.
+ */
+@Composable
+fun NeuProgressBar(
+  progress: Float,
+  modifier: Modifier = Modifier,
+  height: Dp = 12.dp,
+  fillColor: Color = CupertinoBlue
+) {
+  val palette = LocalNeumorphicPalette.current
+  val clamped = progress.coerceIn(0.02f, 1f)
+  val pillRadius = height / 2f
+
+  Box(
+    modifier = modifier
+      .fillMaxWidth()
+      .height(height)
+      .neuRecessed(
+        cornerRadius = pillRadius,
+        depth = 3.dp,
+        cavityColor = palette.surfaceRecessed
+      )
+      .padding(2.dp)
+  ) {
+    Box(
+      modifier = Modifier
+        .fillMaxWidth(clamped)
+        .fillMaxHeight()
+        .clip(RoundedCornerShape(pillRadius))
+        .background(
+          brush = Brush.horizontalGradient(
+            colors = listOf(
+              fillColor.copy(alpha = 0.88f),
+              fillColor
+            )
+          )
+        )
+    )
+  }
+}
+
+/**
+ * ui-neumorphism Primary Action Button: sculpted steel-slate extruded capsule with opposing
+ * soft light & cool shadow that physically depresses into a carved inner-shadow cavity on touch.
  */
 @Composable
 fun IosSquircleButton(
@@ -114,17 +159,17 @@ fun IosSquircleButton(
   enabled: Boolean = true,
   containerColor: Color = MaterialTheme.colorScheme.primary,
   contentColor: Color = MaterialTheme.colorScheme.onPrimary,
-  cornerRadius: Dp = 14.dp
+  cornerRadius: Dp = 16.dp
 ) {
   val palette = LocalNeumorphicPalette.current
   val interactionSource = remember { MutableInteractionSource() }
   val isPressed by interactionSource.collectIsPressedAsState()
   val scale by animateFloatAsState(
-    targetValue = if (isPressed && enabled) 0.982f else 1f,
+    targetValue = if (isPressed && enabled) 0.985f else 1f,
     animationSpec = spring(stiffness = Spring.StiffnessMedium),
     label = "neuPrimaryBtnScale"
   )
-  val effectiveRadius = cornerRadius.coerceAtLeast(12.dp)
+  val effectiveRadius = cornerRadius.coerceAtLeast(14.dp)
   val shape = SquircleShape(cornerRadius = effectiveRadius, smoothing = 0.86f)
   val effectiveFill = if (enabled) containerColor else palette.surfaceRecessed
   val effectiveContent = if (enabled) contentColor else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.55f)
@@ -132,21 +177,26 @@ fun IosSquircleButton(
   Box(
     contentAlignment = Alignment.Center,
     modifier = modifier
+      .padding(vertical = 3.dp, horizontal = 2.dp)
       .scale(scale)
-      .heightIn(min = 50.dp)
+      .heightIn(min = 52.dp)
       .then(
         when {
-          !enabled -> Modifier.neuRecessed(cornerRadius = effectiveRadius, depth = 2.dp, cavityColor = palette.surfaceRecessed)
-          isPressed -> Modifier.neuRecessed(
+          !enabled -> Modifier.neuRecessed(
             cornerRadius = effectiveRadius,
             depth = 3.dp,
+            cavityColor = palette.surfaceRecessed
+          )
+          isPressed -> Modifier.neuRecessed(
+            cornerRadius = effectiveRadius,
+            depth = 4.5.dp,
             cavityColor = containerColor.copy(alpha = 0.90f)
           )
           else -> Modifier.neuRaised(
             cornerRadius = effectiveRadius,
-            elevation = 5.5.dp,
+            elevation = 6.dp,
             surfaceColor = effectiveFill,
-            accentGlowColor = containerColor.copy(alpha = if (palette.isDark) 0.42f else 0.30f),
+            accentGlowColor = containerColor.copy(alpha = if (palette.isDark) 0.34f else 0.22f),
             drawBorderRim = true
           )
         }
@@ -188,8 +238,8 @@ fun IosSquircleButton(
 }
 
 /**
- * Neo-Tactile Soft Raised Secondary Button on monochromatic porcelain/obsidian surface.
- * Physically presses down into a carved inner-shadow cavity when touched.
+ * ui-neumorphism Monochromatic Raised Clay Button (#E0E5EC / #262A30) that depresses
+ * cleanly into a carved inset cavity when pressed.
  */
 @Composable
 fun IosSecondarySquircleButton(
@@ -199,36 +249,37 @@ fun IosSecondarySquircleButton(
   icon: ImageVector? = null,
   enabled: Boolean = true,
   tintColor: Color = MaterialTheme.colorScheme.primary,
-  cornerRadius: Dp = 13.dp
+  cornerRadius: Dp = 15.dp
 ) {
   val palette = LocalNeumorphicPalette.current
   val interactionSource = remember { MutableInteractionSource() }
   val isPressed by interactionSource.collectIsPressedAsState()
   val scale by animateFloatAsState(
-    targetValue = if (isPressed && enabled) 0.982f else 1f,
+    targetValue = if (isPressed && enabled) 0.985f else 1f,
     animationSpec = spring(stiffness = Spring.StiffnessMedium),
     label = "neuSecondaryBtnScale"
   )
-  val effectiveRadius = cornerRadius.coerceAtLeast(11.dp)
+  val effectiveRadius = cornerRadius.coerceAtLeast(13.dp)
   val shape = SquircleShape(cornerRadius = effectiveRadius, smoothing = 0.86f)
   val fg = if (enabled) tintColor else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.45f)
 
   Box(
     contentAlignment = Alignment.Center,
     modifier = modifier
+      .padding(vertical = 3.dp, horizontal = 2.dp)
       .scale(scale)
       .heightIn(min = 48.dp)
       .then(
         when {
-          !enabled -> Modifier.neuRecessed(cornerRadius = effectiveRadius, depth = 1.8.dp)
+          !enabled -> Modifier.neuRecessed(cornerRadius = effectiveRadius, depth = 2.5.dp)
           isPressed -> Modifier.neuRecessed(
             cornerRadius = effectiveRadius,
-            depth = 3.dp,
-            focusGlowColor = tintColor.copy(alpha = 0.45f)
+            depth = 4.5.dp,
+            cavityColor = palette.surfaceRecessed
           )
           else -> Modifier.neuRaised(
             cornerRadius = effectiveRadius,
-            elevation = 4.5.dp,
+            elevation = 5.5.dp,
             surfaceColor = palette.surfaceRaised
           )
         }
@@ -259,7 +310,7 @@ fun IosSecondarySquircleButton(
       Text(
         text = text,
         style = MaterialTheme.typography.labelLarge,
-        fontWeight = FontWeight.SemiBold,
+        fontWeight = FontWeight.Bold,
         color = fg,
         letterSpacing = (-0.1).sp,
         maxLines = 1,
@@ -270,19 +321,18 @@ fun IosSecondarySquircleButton(
 }
 
 /**
- * Sculpted Neumorphic Raised Icon Medallion — directly inspired by tactile circular/squircle
- * floating icon tokens with dual directional shadows and crisp accent iconography.
+ * Sculpted ui-neumorphism Extruded Clay Medallion with opposing soft light and cool shadow.
  */
 @Composable
 fun IosSquircleIconBadge(
   icon: ImageVector,
   tint: Color,
   modifier: Modifier = Modifier,
-  size: Dp = 38.dp,
-  cornerRadius: Dp = 12.dp
+  size: Dp = 40.dp,
+  cornerRadius: Dp = 14.dp
 ) {
   val palette = LocalNeumorphicPalette.current
-  val effectiveRadius = if (cornerRadius >= size / 2f) size / 2f else cornerRadius.coerceAtLeast(10.dp)
+  val effectiveRadius = if (cornerRadius >= size / 2f) size / 2f else cornerRadius.coerceAtLeast(11.dp)
   val shape = SquircleShape(cornerRadius = effectiveRadius, smoothing = 0.86f)
 
   Box(
@@ -291,18 +341,10 @@ fun IosSquircleIconBadge(
       .size(size)
       .neuRaised(
         cornerRadius = effectiveRadius,
-        elevation = 3.8.dp,
-        surfaceColor = palette.surfaceElevated
+        elevation = 4.5.dp,
+        surfaceColor = palette.surfaceRaised
       )
       .clip(shape)
-      .background(
-        brush = Brush.radialGradient(
-          colors = listOf(
-            tint.copy(alpha = if (palette.isDark) 0.22f else 0.14f),
-            Color.Transparent
-          )
-        )
-      )
   ) {
     Icon(
       imageVector = icon,
@@ -314,8 +356,8 @@ fun IosSquircleIconBadge(
 }
 
 /**
- * Neo-Tactile Carved Segmented Control: deeply recessed inner-shadow groove housing a
- * physically extruded floating active pill (inspired by the Product UI & Neumorphism styleguides).
+ * ui-neumorphism Carved Segmented Control: deeply recessed stone groove housing an
+ * extruded monochromatic clay active pill with steel-slate accent label.
  */
 @Composable
 fun IosSegmentedControl(
@@ -325,22 +367,22 @@ fun IosSegmentedControl(
   modifier: Modifier = Modifier
 ) {
   val palette = LocalNeumorphicPalette.current
-  val outerRadius = 14.dp
-  val innerRadius = 10.5.dp
+  val outerRadius = 18.dp
+  val innerRadius = 13.dp
 
   Box(
     modifier = modifier
       .fillMaxWidth()
       .neuRecessed(
         cornerRadius = outerRadius,
-        depth = 3.2.dp,
+        depth = 4.5.dp,
         cavityColor = palette.surfaceRecessed
       )
-      .padding(4.dp)
+      .padding(5.dp)
   ) {
     Row(
       modifier = Modifier.fillMaxWidth(),
-      horizontalArrangement = Arrangement.spacedBy(4.dp),
+      horizontalArrangement = Arrangement.spacedBy(5.dp),
       verticalAlignment = Alignment.CenterVertically
     ) {
       items.forEachIndexed { index, label ->
@@ -364,8 +406,8 @@ fun IosSegmentedControl(
               if (isSelected) {
                 Modifier.neuRaised(
                   cornerRadius = innerRadius,
-                  elevation = 3.5.dp,
-                  surfaceColor = palette.surfaceElevated
+                  elevation = 4.dp,
+                  surfaceColor = palette.surfaceRaised
                 )
               } else {
                 Modifier
@@ -378,7 +420,7 @@ fun IosSegmentedControl(
           Text(
             text = label,
             style = MaterialTheme.typography.labelMedium,
-            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+            fontWeight = if (isSelected) FontWeight.ExtraBold else FontWeight.SemiBold,
             color = textColor,
             letterSpacing = (-0.1).sp,
             maxLines = 1,
@@ -397,7 +439,9 @@ data class IosSubTabEntry(
 )
 
 /**
- * Tactile Recessed Rail with Floating Extruded Sub-Tab Pills.
+ * Pure ui-neumorphism Tactile Sub-Tab Strip (ZERO harsh neon fills):
+ * - Inactive tab = Extruded raised clay pill (#E0E5EC / #262A30)
+ * - Selected tab = Deeply carved INSET clay cavity with steel-slate blue icon & bold label
  */
 @Composable
 fun IosSubTabBar(
@@ -408,107 +452,85 @@ fun IosSubTabBar(
   tagPrefix: String = "sub_tab"
 ) {
   val palette = LocalNeumorphicPalette.current
-  val railRadius = 16.dp
 
-  Box(
+  Row(
     modifier = modifier
       .fillMaxWidth()
-      .neuRecessed(
-        cornerRadius = railRadius,
-        depth = 3.2.dp,
-        cavityColor = palette.surfaceRecessed
-      )
-      .padding(vertical = 5.dp, horizontal = 5.dp)
+      .horizontalScroll(rememberScrollState())
+      .padding(horizontal = 4.dp, vertical = 7.dp),
+    horizontalArrangement = Arrangement.spacedBy(10.dp),
+    verticalAlignment = Alignment.CenterVertically
   ) {
-    Row(
-      modifier = Modifier
-        .fillMaxWidth()
-        .horizontalScroll(rememberScrollState()),
-      horizontalArrangement = Arrangement.spacedBy(6.dp),
-      verticalAlignment = Alignment.CenterVertically
-    ) {
-      tabs.forEachIndexed { idx, tab ->
-        val isSelected = idx == selectedIndex
-        val tabRadius = 11.dp
-        val tabShape = SquircleShape(cornerRadius = tabRadius, smoothing = 0.86f)
-        val fgColor by animateColorAsState(
-          targetValue = if (isSelected) {
-            Color.White
-          } else {
-            MaterialTheme.colorScheme.onSurface
-          },
-          label = "neuSubTabFg"
-        )
+    tabs.forEachIndexed { idx, tab ->
+      val isSelected = idx == selectedIndex
+      val tabRadius = 15.dp
+      val tabShape = SquircleShape(cornerRadius = tabRadius, smoothing = 0.86f)
+      val fgColor by animateColorAsState(
+        targetValue = if (isSelected) {
+          MaterialTheme.colorScheme.primary
+        } else {
+          MaterialTheme.colorScheme.onSurfaceVariant
+        },
+        label = "neuSubTabFg"
+      )
 
-        Row(
-          modifier = Modifier
-            .heightIn(min = 40.dp)
-            .then(
-              if (isSelected) {
-                Modifier.neuRaised(
-                  cornerRadius = tabRadius,
-                  elevation = 4.dp,
-                  surfaceColor = CupertinoBlue,
-                  accentGlowColor = CupertinoBlue.copy(alpha = 0.35f)
-                )
-              } else {
-                Modifier.neuRaised(
-                  cornerRadius = tabRadius,
-                  elevation = 2.dp,
-                  surfaceColor = palette.surfaceRaised
-                )
-              }
-            )
-            .clip(tabShape)
-            .then(
-              if (isSelected) {
-                Modifier.background(
-                  brush = Brush.horizontalGradient(
-                    colors = listOf(CupertinoBlue, CupertinoIndigo)
-                  )
-                )
-              } else {
-                Modifier
-              }
-            )
-            .clickable { onSelect(idx) }
-            .padding(horizontal = 12.dp, vertical = 8.dp),
-          verticalAlignment = Alignment.CenterVertically,
-          horizontalArrangement = Arrangement.spacedBy(6.dp)
-        ) {
-          Icon(
-            imageVector = tab.icon,
-            contentDescription = null,
-            tint = if (isSelected) Color.White else MaterialTheme.colorScheme.primary,
-            modifier = Modifier.size(15.dp)
-          )
-          Text(
-            text = tab.title,
-            style = MaterialTheme.typography.labelMedium,
-            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.SemiBold,
-            color = fgColor,
-            letterSpacing = (-0.1).sp,
-            maxLines = 1
-          )
-          if (!tab.badge.isNullOrBlank()) {
-            val badgeShape = SquircleShape(cornerRadius = 6.dp, smoothing = 0.88f)
-            Box(
-              modifier = Modifier
-                .clip(badgeShape)
-                .background(
-                  if (isSelected) Color.White.copy(alpha = 0.24f)
-                  else MaterialTheme.colorScheme.primary.copy(alpha = 0.13f)
-                )
-                .padding(horizontal = 6.dp, vertical = 1.5.dp)
-            ) {
-              Text(
-                text = tab.badge,
-                style = MaterialTheme.typography.labelSmall,
-                fontSize = 10.sp,
-                fontWeight = FontWeight.Bold,
-                color = if (isSelected) Color.White else MaterialTheme.colorScheme.primary
+      Row(
+        modifier = Modifier
+          .heightIn(min = 42.dp)
+          .then(
+            if (isSelected) {
+              Modifier.neuRecessed(
+                cornerRadius = tabRadius,
+                depth = 4.5.dp,
+                cavityColor = palette.surfaceRecessed
+              )
+            } else {
+              Modifier.neuRaised(
+                cornerRadius = tabRadius,
+                elevation = 5.dp,
+                surfaceColor = palette.surfaceRaised
               )
             }
+          )
+          .clip(tabShape)
+          .clickable { onSelect(idx) }
+          .padding(horizontal = 13.dp, vertical = 9.dp)
+          .testTag("${tagPrefix}_$idx"),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp)
+      ) {
+        Icon(
+          imageVector = tab.icon,
+          contentDescription = null,
+          tint = fgColor,
+          modifier = Modifier.size(15.dp)
+        )
+        Text(
+          text = tab.title,
+          style = MaterialTheme.typography.labelMedium,
+          fontWeight = if (isSelected) FontWeight.ExtraBold else FontWeight.SemiBold,
+          color = fgColor,
+          letterSpacing = (-0.1).sp,
+          maxLines = 1
+        )
+        if (!tab.badge.isNullOrBlank()) {
+          Box(
+            modifier = Modifier
+              .clip(RoundedCornerShape(6.dp))
+              .background(
+                if (isSelected) MaterialTheme.colorScheme.primary.copy(alpha = 0.14f)
+                else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.10f)
+              )
+              .padding(horizontal = 6.dp, vertical = 1.5.dp)
+          ) {
+            Text(
+              text = tab.badge,
+              style = MaterialTheme.typography.labelSmall,
+              fontFamily = JetBrainsMonoFamily,
+              fontSize = 9.5.sp,
+              fontWeight = FontWeight.Bold,
+              color = fgColor
+            )
           }
         }
       }
@@ -517,8 +539,8 @@ fun IosSubTabBar(
 }
 
 /**
- * Museum-Grade Neo-Tactile Elevated Card with dual directional soft shadows,
- * subtle convex sheen, and wide-tracked architectural micro-typography header.
+ * Authentic ui-neumorphism Sculpted Clay Card (#E0E5EC Light / #262A30 Dark)
+ * with generous shadow breathing room so opposing bright & cool shadows never clip.
  */
 @Composable
 fun IosGroupedCard(
@@ -529,18 +551,18 @@ fun IosGroupedCard(
   content: @Composable ColumnScope.() -> Unit
 ) {
   val palette = LocalNeumorphicPalette.current
-  val cardRadius = 18.dp
+  val cardRadius = 22.dp
   val cardShape = SquircleShape(cornerRadius = cardRadius, smoothing = 0.86f)
 
   Column(
     modifier = modifier.fillMaxWidth(),
-    verticalArrangement = Arrangement.spacedBy(8.dp)
+    verticalArrangement = Arrangement.spacedBy(9.dp)
   ) {
     if (!header.isNullOrBlank()) {
       Row(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp),
-        modifier = Modifier.padding(horizontal = 8.dp)
+        modifier = Modifier.padding(horizontal = 10.dp)
       ) {
         Box(
           modifier = Modifier
@@ -549,7 +571,6 @@ fun IosGroupedCard(
               cornerRadius = 4.dp,
               elevation = 2.dp,
               surfaceColor = accentColor,
-              accentGlowColor = accentColor.copy(alpha = 0.45f),
               drawBorderRim = false
             )
             .clip(CircleShape)
@@ -559,7 +580,7 @@ fun IosGroupedCard(
           text = header.uppercase(),
           style = MaterialTheme.typography.labelSmall,
           fontSize = 10.5.sp,
-          letterSpacing = 1.05.sp,
+          letterSpacing = 1.1.sp,
           color = MaterialTheme.colorScheme.onSurfaceVariant,
           fontWeight = FontWeight.Bold
         )
@@ -568,10 +589,10 @@ fun IosGroupedCard(
     Box(
       modifier = Modifier
         .fillMaxWidth()
-        .padding(horizontal = 2.dp, vertical = 2.dp)
+        .padding(horizontal = 5.dp, vertical = 5.dp)
         .neuRaised(
           cornerRadius = cardRadius,
-          elevation = 6.dp,
+          elevation = 7.dp,
           surfaceColor = palette.surfaceRaised
         )
         .clip(cardShape)
@@ -589,15 +610,15 @@ fun IosGroupedCard(
         style = MaterialTheme.typography.bodySmall,
         fontSize = 11.5.sp,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
-        modifier = Modifier.padding(horizontal = 10.dp)
+        modifier = Modifier.padding(horizontal = 12.dp)
       )
     }
   }
 }
 
 /**
- * Authentic Neo-Tactile Toggle Switch (directly inspired by the uploaded Neumorphism & Neo-Tactile guides):
- * Carved recessed pill groove with soft mint/emerald active glow and an extruded spherical thumb.
+ * Authentic ui-neumorphism Carved Toggle Switch: deeply recessed pill groove
+ * with subtle active fill and an extruded spherical clay thumb.
  */
 @Composable
 fun IosCupertinoSwitch(
@@ -605,14 +626,14 @@ fun IosCupertinoSwitch(
   onCheckedChange: (Boolean) -> Unit,
   modifier: Modifier = Modifier,
   enabled: Boolean = true,
-  activeTrackColor: Color = CupertinoGreen
+  activeTrackColor: Color = CupertinoBlue
 ) {
   val palette = LocalNeumorphicPalette.current
   val trackColor by animateColorAsState(
     targetValue = when {
-      !enabled && checked -> activeTrackColor.copy(alpha = 0.42f)
+      !enabled && checked -> activeTrackColor.copy(alpha = 0.40f)
       !enabled && !checked -> palette.surfaceRecessed.copy(alpha = 0.65f)
-      checked -> activeTrackColor.copy(alpha = if (palette.isDark) 0.78f else 0.88f)
+      checked -> activeTrackColor.copy(alpha = if (palette.isDark) 0.72f else 0.82f)
       else -> palette.surfaceRecessed
     },
     animationSpec = spring(stiffness = Spring.StiffnessMedium),
@@ -629,12 +650,11 @@ fun IosCupertinoSwitch(
 
   Box(
     modifier = modifier
-      .size(width = 54.dp, height = 32.dp)
+      .size(width = 56.dp, height = 32.dp)
       .neuRecessed(
         cornerRadius = 16.dp,
-        depth = 3.dp,
-        cavityColor = trackColor,
-        focusGlowColor = if (checked && enabled) activeTrackColor else null
+        depth = 4.dp,
+        cavityColor = trackColor
       )
       .clip(CircleShape)
       .clickable(
@@ -655,19 +675,18 @@ fun IosCupertinoSwitch(
         .size(26.dp)
         .neuRaised(
           cornerRadius = 13.dp,
-          elevation = 3.dp,
-          surfaceColor = if (palette.isDark) Color(0xFFE6ECF5) else Color(0xFFFAFBFD)
+          elevation = 3.5.dp,
+          surfaceColor = palette.surfaceRaised
         )
         .clip(CircleShape)
     ) {
-      // Tactile center dimple dot inspired by sculpted physical switches
       Box(
         modifier = Modifier
           .size(6.dp)
           .clip(CircleShape)
           .background(
-            if (checked) activeTrackColor.copy(alpha = 0.45f)
-            else palette.innerDarkShadow.copy(alpha = 0.35f)
+            if (checked) activeTrackColor
+            else palette.innerDarkShadow.copy(alpha = 0.45f)
           )
       )
     }
@@ -700,7 +719,7 @@ fun IosSettingToggleRow(
       horizontalArrangement = Arrangement.spacedBy(12.dp),
       modifier = Modifier.weight(1f)
     ) {
-      IosSquircleIconBadge(icon = icon, tint = iconTint, size = 38.dp, cornerRadius = 11.dp)
+      IosSquircleIconBadge(icon = icon, tint = iconTint, size = 38.dp, cornerRadius = 12.dp)
       Column(modifier = Modifier.padding(end = 10.dp)) {
         Text(
           text = title,
@@ -728,7 +747,7 @@ fun IosSettingToggleRow(
 }
 
 /**
- * Embossed two-tone Neumorphic groove divider (1dp soft shadow over 1dp soft specular catch-light).
+ * Embossed two-tone Neumorphic groove divider (1dp cool shadow over 1dp bright catch-light).
  */
 @Composable
 fun IosInsetDivider() {
@@ -736,25 +755,27 @@ fun IosInsetDivider() {
   Column(
     modifier = Modifier
       .fillMaxWidth()
-      .padding(start = 50.dp, top = 2.dp, bottom = 2.dp)
+      .padding(start = 50.dp, top = 3.dp, bottom = 3.dp)
   ) {
     Box(
       modifier = Modifier
         .fillMaxWidth()
-        .height(0.85.dp)
+        .height(0.9.dp)
         .background(palette.hairlineShadow)
     )
     Box(
       modifier = Modifier
         .fillMaxWidth()
-        .height(0.85.dp)
+        .height(0.9.dp)
         .background(palette.hairlineHighlight)
     )
   }
 }
 
 /**
- * Tactile Bottom Dock Tab Item — selected tab depresses cleanly into a sculpted soft-glow cavity.
+ * Independent Sculpted Bottom Dock Tile — directly modeled on the reference Neumorphic dock:
+ * - Unselected tab = Extruded raised clay square tile (#E0E5EC / #262A30)
+ * - Selected tab = Deeply carved INSET clay cavity with steel-slate blue icon & bold label
  */
 @Composable
 fun RowScope.IosSquircleTabItem(
@@ -774,42 +795,43 @@ fun RowScope.IosSquircleTabItem(
     },
     label = "neuTabTint"
   )
-  val itemShape = SquircleShape(cornerRadius = 14.dp, smoothing = 0.86f)
+  val tileRadius = 16.dp
+  val itemShape = SquircleShape(cornerRadius = tileRadius, smoothing = 0.86f)
 
   Column(
     horizontalAlignment = Alignment.CenterHorizontally,
     verticalArrangement = Arrangement.Center,
     modifier = modifier
       .weight(1f)
-      .heightIn(min = 56.dp)
+      .heightIn(min = 58.dp)
       .then(
         if (selected) {
           Modifier.neuRecessed(
-            cornerRadius = 14.dp,
-            depth = 2.6.dp,
-            cavityColor = if (palette.isDark) {
-              Color(0xFF172033)
-            } else {
-              Color(0xFFDCE6F7)
-            }
+            cornerRadius = tileRadius,
+            depth = 5.dp,
+            cavityColor = palette.surfaceRecessed
           )
         } else {
-          Modifier
+          Modifier.neuRaised(
+            cornerRadius = tileRadius,
+            elevation = 6.dp,
+            surfaceColor = palette.surfaceRaised
+          )
         }
       )
       .clip(itemShape)
       .clickable(onClick = onClick)
-      .padding(vertical = 6.dp, horizontal = 3.dp)
+      .padding(vertical = 8.dp, horizontal = 4.dp)
   ) {
     Row(
       verticalAlignment = Alignment.CenterVertically,
-      horizontalArrangement = Arrangement.spacedBy(4.dp)
+      horizontalArrangement = Arrangement.spacedBy(3.dp)
     ) {
       Icon(
         imageVector = icon,
         contentDescription = label,
         tint = tint,
-        modifier = Modifier.size(20.dp)
+        modifier = Modifier.size(21.dp)
       )
       if (!badgeText.isNullOrBlank()) {
         val badgeShape = SquircleShape(cornerRadius = 6.dp, smoothing = 0.88f)
@@ -820,10 +842,10 @@ fun RowScope.IosSquircleTabItem(
           Text(
             text = badgeText,
             style = MaterialTheme.typography.labelSmall,
-            fontSize = 9.5.sp,
+            fontSize = 9.sp,
             color = MaterialTheme.colorScheme.onPrimary,
             fontWeight = FontWeight.Bold,
-            modifier = Modifier.padding(horizontal = 4.5.dp, vertical = 1.dp)
+            modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
           )
         }
       }
@@ -832,9 +854,9 @@ fun RowScope.IosSquircleTabItem(
     Text(
       text = label,
       style = MaterialTheme.typography.labelSmall,
-      fontSize = if (label.length > 10) 9.5.sp else 10.5.sp,
-      letterSpacing = if (label.length > 10) (-0.3).sp else 0.sp,
-      fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+      fontSize = 10.sp,
+      letterSpacing = (-0.1).sp,
+      fontWeight = if (selected) FontWeight.ExtraBold else FontWeight.SemiBold,
       color = tint,
       softWrap = false,
       maxLines = 1,
@@ -844,8 +866,8 @@ fun RowScope.IosSquircleTabItem(
 }
 
 /**
- * Sculpted Tactile Rotary Credibility Dial Gauge — inspired by the iconic Neumorphic
- * radial dial centerpiece (extruded circular bezel + tick dots + luminous radial sweep arc).
+ * Sculpted Tactile Rotary Credibility Dial Gauge — extruded circular clay bezel
+ * surrounding a carved recessed dial basin with precision tick marks and muted score arc.
  */
 @Composable
 fun IosCredibilityArcGauge(
@@ -867,7 +889,7 @@ fun IosCredibilityArcGauge(
     clampedScore >= 40 -> CupertinoAmber
     else -> CupertinoRed
   }
-  val tickColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.30f)
+  val tickColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.34f)
 
   Box(
     contentAlignment = Alignment.Center,
@@ -875,13 +897,13 @@ fun IosCredibilityArcGauge(
       .size(size)
       .neuRaised(
         cornerRadius = size / 2f,
-        elevation = 5.5.dp,
-        surfaceColor = palette.surfaceElevated
+        elevation = 6.dp,
+        surfaceColor = palette.surfaceRaised
       )
       .padding(6.dp)
       .neuRecessed(
         cornerRadius = (size - 12.dp) / 2f,
-        depth = 2.5.dp,
+        depth = 3.5.dp,
         cavityColor = palette.surfaceRecessed
       )
   ) {
@@ -894,7 +916,6 @@ fun IosCredibilityArcGauge(
       )
       val arcSize = Size(diameter, diameter)
 
-      // Subtle perimeter micro-dots echoing Image 1's tactile rotary dial
       val centerX = this.size.width / 2f
       val centerY = this.size.height / 2f
       val tickRadius = min(this.size.width, this.size.height) / 2f - 2.dp.toPx()
@@ -904,15 +925,14 @@ fun IosCredibilityArcGauge(
         val dotX = centerX + (tickRadius * cos(rad)).toFloat()
         val dotY = centerY + (tickRadius * sin(rad)).toFloat()
         drawCircle(
-          color = if (i * 100 / 16 <= clampedScore) arcColor.copy(alpha = 0.72f) else tickColor,
+          color = if (i * 100 / 16 <= clampedScore) arcColor.copy(alpha = 0.80f) else tickColor,
           radius = if (i % 4 == 0) 1.5.dp.toPx() else 0.9.dp.toPx(),
           center = Offset(dotX, dotY)
         )
       }
 
-      // Recessed arc groove
       drawArc(
-        color = palette.innerDarkShadow.copy(alpha = 0.25f),
+        color = palette.innerDarkShadow.copy(alpha = 0.28f),
         startAngle = 150f,
         sweepAngle = 240f,
         useCenter = false,
@@ -921,10 +941,9 @@ fun IosCredibilityArcGauge(
         style = Stroke(width = strokePx, cap = StrokeCap.Round)
       )
 
-      // Luminous active score sweep
       drawArc(
         brush = Brush.sweepGradient(
-          colors = listOf(arcColor.copy(alpha = 0.75f), arcColor, CupertinoIndigo)
+          colors = listOf(arcColor.copy(alpha = 0.82f), arcColor, CupertinoIndigo)
         ),
         startAngle = 150f,
         sweepAngle = animatedSweep,
@@ -935,7 +954,6 @@ fun IosCredibilityArcGauge(
       )
     }
 
-    // Center raised dial cap
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
       Text(
         text = "$clampedScore",

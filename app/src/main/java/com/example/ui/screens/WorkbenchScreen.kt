@@ -183,22 +183,22 @@ fun WorkbenchScreen(
 
   val subTabs = listOf(
     IosSubTabEntry(
-      title = "1. Import File",
+      title = "Files",
       icon = Icons.Default.UploadFile,
-      badge = formState.importedFormat.displayBadge
+      badge = formState.importedFormat.displayBadge.replace(" Document", "")
     ),
     IosSubTabEntry(
-      title = "2. Paper Editor",
+      title = "Editor",
       icon = Icons.Default.EditNote,
       badge = "${formState.importedWordCount}w"
     ),
     IosSubTabEntry(
-      title = "3. Forensic Scan",
+      title = "Scan",
       icon = Icons.Default.Radar,
       badge = if (forensicAlertCount > 0) "$forensicAlertCount!" else "OK"
     ),
     IosSubTabEntry(
-      title = "4. Audit & Run",
+      title = "Stages",
       icon = Icons.Default.Tune,
       badge = "$activeModuleCount/5"
     )
@@ -209,198 +209,161 @@ fun WorkbenchScreen(
       .fillMaxSize()
       .background(MaterialTheme.colorScheme.background)
       .verticalScroll(rememberScrollState())
-      .padding(horizontal = 14.dp, vertical = 12.dp),
-    verticalArrangement = Arrangement.spacedBy(12.dp)
+      .padding(horizontal = 16.dp, vertical = 14.dp),
+    verticalArrangement = Arrangement.spacedBy(15.dp)
   ) {
-    // Museum-Grade Neo-Tactile Sculpted Executive Hero Card
-    // Inspired directly by the Neumorphism styleguide: soft monochromatic depth,
-    // high-contrast editorial ink, sculpted corner counter medallion ("30 STAGES"),
-    // and a carved recessed 4-column telemetry bar.
+    // Authentic ui-neumorphism Hero Section modeled directly on the reference layout:
+    // 1) Deeply carved INSET top hero capsule with extruded circular "30" medallion on the left
+    // 2) Twin side-by-side raised Bento capsules right underneath (Live Telemetry + Tactile Run Audit)
     val palette = LocalNeumorphicPalette.current
-    val heroRadius = 22.dp
-    val heroShape = SquircleShape(cornerRadius = heroRadius, smoothing = 0.86f)
     val isRunningNow = pipelineState is PipelineExecutionState.Running
 
-    Box(
-      modifier = Modifier
-        .fillMaxWidth()
-        .padding(horizontal = 2.dp, vertical = 2.dp)
-        .neuRaised(
-          cornerRadius = heroRadius,
-          elevation = 8.dp,
-          surfaceColor = palette.surfaceElevated
-        )
-        .clip(heroShape)
+    Column(
+      modifier = Modifier.fillMaxWidth(),
+      verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
-      Column(
+      // 1. Carved Inset Top Hero Capsule
+      Row(
         modifier = Modifier
           .fillMaxWidth()
-          .padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(13.dp)
+          .padding(horizontal = 4.dp)
+          .neuRecessed(
+            cornerRadius = 28.dp,
+            depth = 6.dp,
+            cavityColor = palette.surfaceRecessed
+          )
+          .padding(horizontal = 16.dp, vertical = 15.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(15.dp)
       ) {
-        Row(
-          modifier = Modifier.fillMaxWidth(),
-          horizontalArrangement = Arrangement.SpaceBetween,
-          verticalAlignment = Alignment.Top
+        // Extruded Circular "30 STAGES" Medallion on the left
+        Column(
+          horizontalAlignment = Alignment.CenterHorizontally,
+          verticalArrangement = Arrangement.Center,
+          modifier = Modifier
+            .size(64.dp)
+            .neuRaised(
+              cornerRadius = 32.dp,
+              elevation = 6.dp,
+              surfaceColor = palette.surfaceRaised
+            )
         ) {
-          Column(
-            modifier = Modifier
-              .weight(1f)
-              .padding(end = 12.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp)
-          ) {
-            Text(
-              text = "SOFT LIGHT × ADVERSARIAL RIGOR",
-              style = MaterialTheme.typography.labelSmall,
-              fontFamily = JetBrainsMonoFamily,
-              fontSize = 9.5.sp,
-              letterSpacing = 1.4.sp,
-              fontWeight = FontWeight.Bold,
-              color = CupertinoBlue
-            )
-            Text(
-              text = if (formState.title.isBlank()) {
-                "Paper Review Workbench"
-              } else {
-                DossierFormattingEngine.normalizeTitle(formState.title)
-              },
-              style = MaterialTheme.typography.titleLarge,
-              fontWeight = FontWeight.ExtraBold,
-              letterSpacing = (-0.4).sp,
-              color = MaterialTheme.colorScheme.onSurface,
-              maxLines = 2,
-              overflow = TextOverflow.Ellipsis
-            )
-            Text(
-              text = "${DossierFormattingEngine.formatCleanCitation(formState.authors, formState.year, "", fallback = resolvedPreFlight.detectedDiscipline)} • ${resolvedPreFlight.studyDesign.displayName}",
-              style = MaterialTheme.typography.bodySmall,
-              color = MaterialTheme.colorScheme.onSurfaceVariant,
-              maxLines = 1,
-              overflow = TextOverflow.Ellipsis
-            )
-          }
-
-          // Sculpted Corner Medallion modeled after the "DAY 08" Neumorphic tile
-          val tileRadius = 15.dp
-          Column(
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center,
-            modifier = Modifier
-              .size(width = 66.dp, height = 66.dp)
-              .neuRaised(
-                cornerRadius = tileRadius,
-                elevation = 5.dp,
-                surfaceColor = palette.surfaceRaised
-              )
-              .padding(6.dp)
-          ) {
-            Text(
-              text = "STAGES",
-              style = MaterialTheme.typography.labelSmall,
-              fontFamily = JetBrainsMonoFamily,
-              fontSize = 8.sp,
-              letterSpacing = 0.8.sp,
-              fontWeight = FontWeight.Bold,
-              color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-            Text(
-              text = "30",
-              style = MaterialTheme.typography.headlineSmall,
-              fontFamily = JetBrainsMonoFamily,
-              fontWeight = FontWeight.ExtraBold,
-              color = CupertinoBlue
-            )
-          }
+          Text(
+            text = "30",
+            style = MaterialTheme.typography.titleLarge,
+            fontFamily = JetBrainsMonoFamily,
+            fontWeight = FontWeight.ExtraBold,
+            color = MaterialTheme.colorScheme.primary
+          )
+          Text(
+            text = "STAGES",
+            style = MaterialTheme.typography.labelSmall,
+            fontFamily = JetBrainsMonoFamily,
+            fontSize = 7.5.sp,
+            letterSpacing = 0.7.sp,
+            fontWeight = FontWeight.Bold,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+          )
         }
 
-        // Action & Format Pill Row
-        Row(
-          modifier = Modifier.fillMaxWidth(),
-          horizontalArrangement = Arrangement.SpaceBetween,
-          verticalAlignment = Alignment.CenterVertically
+        Column(
+          modifier = Modifier.weight(1f),
+          verticalArrangement = Arrangement.spacedBy(4.dp)
         ) {
-          Box(
-            modifier = Modifier
-              .neuRecessed(
-                cornerRadius = 10.dp,
-                depth = 2.dp,
-                cavityColor = palette.surfaceRecessed
-              )
-              .padding(horizontal = 10.dp, vertical = 5.5.dp)
-          ) {
-            Text(
-              text = "PDF • WORD • LATEX • CODE",
-              style = MaterialTheme.typography.labelSmall,
-              fontFamily = JetBrainsMonoFamily,
-              fontSize = 9.sp,
-              letterSpacing = 0.5.sp,
-              fontWeight = FontWeight.Bold,
-              color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-          }
-
-          val runPillRadius = 11.dp
-          val runPillShape = SquircleShape(cornerRadius = runPillRadius, smoothing = 0.86f)
-          Box(
-            modifier = Modifier
-              .then(
-                if (isRunningNow) {
-                  Modifier.neuRecessed(
-                    cornerRadius = runPillRadius,
-                    depth = 2.5.dp,
-                    cavityColor = CupertinoBlue.copy(alpha = 0.2f)
-                  )
-                } else {
-                  Modifier.neuRaised(
-                    cornerRadius = runPillRadius,
-                    elevation = 4.dp,
-                    surfaceColor = CupertinoBlue,
-                    accentGlowColor = CupertinoBlue.copy(alpha = 0.35f)
-                  )
-                }
-              )
-              .clip(runPillShape)
-              .clickable(enabled = !isRunningNow) { onRunPipeline() }
-              .padding(horizontal = 13.dp, vertical = 6.5.dp)
-              .testTag("hero_quick_run_audit_button")
-          ) {
-            Text(
-              text = if (isRunningNow) "RUNNING..." else "▶ RUN AUDIT",
-              style = MaterialTheme.typography.labelSmall,
-              fontFamily = JetBrainsMonoFamily,
-              fontSize = 10.sp,
-              fontWeight = FontWeight.Bold,
-              color = if (isRunningNow) CupertinoBlue else Color.White
-            )
-          }
+          Text(
+            text = if (formState.title.isBlank()) {
+              "Paper Review Workbench"
+            } else {
+              DossierFormattingEngine.normalizeTitle(formState.title)
+            },
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.ExtraBold,
+            letterSpacing = (-0.3).sp,
+            color = MaterialTheme.colorScheme.primary,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis
+          )
+          Text(
+            text = "${DossierFormattingEngine.formatCleanCitation(formState.authors, formState.year, "", fallback = resolvedPreFlight.detectedDiscipline)} • ${resolvedPreFlight.studyDesign.displayName}",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+          )
         }
+      }
 
-        // Carved Recessed 4-Column Live Telemetry Bar
+      // 2. Side-by-Side Sculpted Bento Row (Telemetry Capsule + Run Audit Tactile Capsule)
+      Row(
+        modifier = Modifier
+          .fillMaxWidth()
+          .padding(horizontal = 4.dp),
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        verticalAlignment = Alignment.CenterVertically
+      ) {
+        // Left Raised Telemetry Capsule
         Row(
           modifier = Modifier
-            .fillMaxWidth()
-            .neuRecessed(
-              cornerRadius = 13.dp,
-              depth = 2.8.dp,
-              cavityColor = palette.surfaceRecessed
+            .weight(1.25f)
+            .neuRaised(
+              cornerRadius = 18.dp,
+              elevation = 6.dp,
+              surfaceColor = palette.surfaceRaised
             )
-            .padding(horizontal = 12.dp, vertical = 9.dp),
+            .padding(horizontal = 13.dp, vertical = 12.dp),
           horizontalArrangement = Arrangement.SpaceBetween,
           verticalAlignment = Alignment.CenterVertically
         ) {
-          HeroTelemetryMetric("FORMAT", formState.importedFormat.displayBadge, CupertinoBlue)
           HeroTelemetryMetric("WORDS", "${resolvedPreFlight.wordCount}", MaterialTheme.colorScheme.onSurface)
           HeroTelemetryMetric("QUANT", "${resolvedPreFlight.quantForensics.diagnosticTable.size}", CupertinoIndigo)
           HeroTelemetryMetric(
             label = "SCAN",
-            value = if (forensicAlertCount == 0) "CLEAN" else "$forensicAlertCount FLAGS",
+            value = if (forensicAlertCount == 0) "CLEAN" else "${forensicAlertCount}F",
             tint = if (forensicAlertCount == 0) CupertinoGreen else CupertinoAmber
+          )
+        }
+
+        // Right Raised Tactile "Run Audit" Bento Capsule (depresses into carved inset when running)
+        val runPillRadius = 18.dp
+        val runPillShape = SquircleShape(cornerRadius = runPillRadius, smoothing = 0.86f)
+        Box(
+          contentAlignment = Alignment.Center,
+          modifier = Modifier
+            .weight(0.75f)
+            .then(
+              if (isRunningNow) {
+                Modifier.neuRecessed(
+                  cornerRadius = runPillRadius,
+                  depth = 4.5.dp,
+                  cavityColor = palette.surfaceRecessed
+                )
+              } else {
+                Modifier.neuRaised(
+                  cornerRadius = runPillRadius,
+                  elevation = 6.dp,
+                  surfaceColor = palette.surfaceRaised
+                )
+              }
+            )
+            .clip(runPillShape)
+            .clickable(enabled = !isRunningNow) { onRunPipeline() }
+            .padding(horizontal = 12.dp, vertical = 14.dp)
+            .testTag("hero_quick_run_audit_button")
+        ) {
+          Text(
+            text = if (isRunningNow) "RUNNING…" else "▶ RUN AUDIT",
+            style = MaterialTheme.typography.labelMedium,
+            fontFamily = JetBrainsMonoFamily,
+            fontSize = 11.sp,
+            fontWeight = FontWeight.ExtraBold,
+            color = MaterialTheme.colorScheme.primary,
+            maxLines = 1
           )
         }
       }
     }
 
-    // Sharp-Edged iOS Squircle Sub-Tab Bar for the Upload Workbench
+    // Pure ui-neumorphism Tactile Sub-Tab Bar (Raised Inactive Pills / Carved Inset Active Pill)
     IosSubTabBar(
       tabs = subTabs,
       selectedIndex = activeWorkbenchSubTab,
@@ -412,11 +375,11 @@ fun WorkbenchScreen(
     when (activeWorkbenchSubTab) {
       0 -> {
         IosGroupedCard(
-          header = "1. Paper Input Source (PDF / Word / Text)"
+          header = "Paper Input Source"
         ) {
-          Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+          Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
             IosSegmentedControl(
-              items = listOf("PDF / Word File", "Paste / Type Text", "Sample Papers"),
+              items = listOf("Upload", "Paste", "Samples"),
               selectedIndex = formState.inputModeIndex,
               onSelect = { modeIdx ->
                 onInputModeChange(modeIdx)
@@ -436,8 +399,10 @@ fun WorkbenchScreen(
                 )
 
                 Row(
-                  horizontalArrangement = Arrangement.spacedBy(8.dp),
-                  modifier = Modifier.fillMaxWidth()
+                  horizontalArrangement = Arrangement.spacedBy(12.dp),
+                  modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 2.dp)
                 ) {
                   FormatUploadSquircleTile(
                     title = "PDF Paper",
@@ -606,50 +571,49 @@ fun WorkbenchScreen(
               }
             }
 
-            // Loaded Document Status Banner + PDF Page Thumbnails
+            // Loaded Document Status Banner + PDF Page Thumbnails (Carved Clay Basin)
             if (formState.importedFileBanner != null) {
-              val bannerShape = SquircleShape(cornerRadius = 9.dp, smoothing = 0.86f)
-              Surface(
-                color = CupertinoGreen.copy(alpha = 0.10f),
-                shape = bannerShape,
+              Column(
                 modifier = Modifier
                   .fillMaxWidth()
-                  .border(0.6.dp, CupertinoGreen.copy(alpha = 0.35f), bannerShape)
+                  .neuRecessed(
+                    cornerRadius = 16.dp,
+                    depth = 4.dp,
+                    cavityColor = palette.surfaceRecessed
+                  )
+                  .padding(13.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
               ) {
-                Column(
-                  modifier = Modifier.padding(11.dp),
-                  verticalArrangement = Arrangement.spacedBy(6.dp)
+                Row(
+                  verticalAlignment = Alignment.CenterVertically,
+                  horizontalArrangement = Arrangement.spacedBy(9.dp)
                 ) {
-                  Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                  ) {
-                    Icon(
-                      imageVector = Icons.Default.CheckCircle,
-                      contentDescription = null,
-                      tint = CupertinoGreen,
-                      modifier = Modifier.size(18.dp)
+                  Icon(
+                    imageVector = Icons.Default.CheckCircle,
+                    contentDescription = null,
+                    tint = CupertinoGreen,
+                    modifier = Modifier.size(19.dp)
+                  )
+                  Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                      text = formState.importedFileBanner,
+                      style = MaterialTheme.typography.labelMedium,
+                      color = CupertinoGreen,
+                      fontWeight = FontWeight.Bold
                     )
-                    Column(modifier = Modifier.weight(1f)) {
-                      Text(
-                        text = formState.importedFileBanner,
-                        style = MaterialTheme.typography.labelMedium,
-                        color = CupertinoGreen,
-                        fontWeight = FontWeight.Bold
-                      )
-                      Text(
-                        text = "Format: ${formState.importedFormat.displayBadge} • ${formState.importedWordCount} words • ~${formState.importedPageCount} page(s)",
-                        style = MaterialTheme.typography.labelSmall,
-                        fontFamily = JetBrainsMonoFamily,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                      )
-                    }
-                    IosSecondarySquircleButton(
-                      text = "Edit Text",
-                      onClick = { activeWorkbenchSubTab = 1 },
-                      tintColor = CupertinoBlue
+                    Text(
+                      text = "${formState.importedFormat.displayBadge} • ${formState.importedWordCount}w • ~${formState.importedPageCount}p",
+                      style = MaterialTheme.typography.labelSmall,
+                      fontFamily = JetBrainsMonoFamily,
+                      color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                   }
+                  IosSecondarySquircleButton(
+                    text = "Edit",
+                    onClick = { activeWorkbenchSubTab = 1 },
+                    tintColor = MaterialTheme.colorScheme.primary
+                  )
+                }
 
                   if (formState.pdfPageBitmaps.isNotEmpty()) {
                     Text(
@@ -695,7 +659,6 @@ fun WorkbenchScreen(
                           }
                         }
                       }
-                    }
                   }
                 }
               }
@@ -1255,14 +1218,10 @@ fun WorkbenchScreen(
                 fontWeight = FontWeight.Medium,
                 color = MaterialTheme.colorScheme.onSurface
               )
-              LinearProgressIndicator(
-                progress = { pipelineState.progress },
-                color = CupertinoBlue,
-                trackColor = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f),
-                modifier = Modifier
-                  .fillMaxWidth()
-                  .height(7.dp)
-                  .clip(SquircleShape(cornerRadius = 4.dp, smoothing = 0.88f))
+              com.example.ui.components.NeuProgressBar(
+                progress = pipelineState.progress,
+                height = 12.dp,
+                fillColor = MaterialTheme.colorScheme.primary
               )
             }
           }
@@ -1387,40 +1346,43 @@ private fun FormatUploadSquircleTile(
   modifier: Modifier = Modifier
 ) {
   val palette = LocalNeumorphicPalette.current
-  val tileRadius = 16.dp
+  val tileRadius = 18.dp
   val tileShape = SquircleShape(cornerRadius = tileRadius, smoothing = 0.86f)
   Column(
     horizontalAlignment = Alignment.CenterHorizontally,
-    verticalArrangement = Arrangement.spacedBy(6.dp),
+    verticalArrangement = Arrangement.spacedBy(7.dp),
     modifier = modifier
-      .padding(vertical = 2.dp)
+      .padding(vertical = 3.dp)
       .neuRaised(
         cornerRadius = tileRadius,
-        elevation = 4.8.dp,
-        surfaceColor = palette.surfaceElevated
+        elevation = 6.dp,
+        surfaceColor = palette.surfaceRaised
       )
       .clip(tileShape)
       .clickable(onClick = onClick)
-      .padding(vertical = 14.dp, horizontal = 6.dp)
+      .padding(vertical = 15.dp, horizontal = 6.dp)
   ) {
     IosSquircleIconBadge(
       icon = icon,
       tint = accentColor,
-      size = 42.dp,
-      cornerRadius = 13.dp
+      size = 44.dp,
+      cornerRadius = 22.dp
     )
     Text(
       text = title,
       style = MaterialTheme.typography.labelLarge,
       fontWeight = FontWeight.Bold,
       letterSpacing = (-0.15).sp,
-      color = MaterialTheme.colorScheme.onSurface
+      color = MaterialTheme.colorScheme.onSurface,
+      maxLines = 1,
+      overflow = TextOverflow.Ellipsis
     )
     Text(
       text = subtitle,
       style = MaterialTheme.typography.labelSmall,
       fontSize = 10.sp,
-      color = MaterialTheme.colorScheme.onSurfaceVariant
+      color = MaterialTheme.colorScheme.onSurfaceVariant,
+      maxLines = 1
     )
   }
 }

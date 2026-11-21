@@ -786,41 +786,79 @@ object PdfReportExporter {
                 buildLayout(cellText, p, (colWidths[c] - 8f).coerceAtLeast(24f), 1.6f)
               }
               val rowH = maxOf(18f, (cellLayouts.maxOfOrNull { it.height } ?: 10).toFloat() + padV * 2)
-              if (cursorY + rowH > PAGE_HEIGHT - MARGIN_BOTTOM) {
-                startNewPage()
-                drawTableHeaderRow()
-              }
 
-              val top = cursorY
-              val rowRect = RectF(MARGIN_H, top, PAGE_WIDTH - MARGIN_H, top + rowH)
-              canvas.drawRect(rowRect, if (rowIdx % 2 == 0) zebraLightPaint else zebraAltPaint)
-              canvas.drawLine(MARGIN_H, top + rowH, PAGE_WIDTH - MARGIN_H, top + rowH, dividerPaint)
+              // P1 fix: If a table row is taller than a single printable page body, switch it to a
+              // paginated stacked card so long audit findings NEVER clip or overlap the footer.
+              if (shouldFallbackTableRowToPaginatedCard(rowH, maxPageBodyHeight)) {
+                ensureSpace(56f)
+                val rowTitle = rowCells.firstOrNull().orEmpty().ifBlank { "Audit Row ${rowIdx + 1}" }
+                val barTop = cursorY
+                canvas.drawRoundRect(
+                  RectF(MARGIN_H, barTop, PAGE_WIDTH - MARGIN_H, barTop + 17f),
+                  4f,
+                  4f,
+                  zebraAltPaint
+                )
+                canvas.drawLine(MARGIN_H, barTop + 17f, PAGE_WIDTH - MARGIN_H, barTop + 17f, dividerPaint)
+                val titleLayout = buildLayout(rowTitle, tableCellBoldPaint, CONTENT_WIDTH - 12f, 1.2f)
+                canvas.save()
+                canvas.translate(MARGIN_H + 6f, barTop + 3f)
+                titleLayout.draw(canvas)
+                canvas.restore()
+                cursorY = barTop + maxOf(19f, titleLayout.height + 6f)
 
-              var x = MARGIN_H
-              rowCells.forEachIndexed { c, cellText ->
-                val upperCell = cellText.trim().uppercase(Locale.US)
-                val isStatusCell = upperCell in setOf("PASS", "WARN", "FAIL", "INFO", "CRITICAL", "MAJOR", "MINOR")
-                if (isStatusCell) {
-                  val pillColor = when (upperCell) {
-                    "PASS" -> Color.rgb(22, 163, 74)
-                    "WARN", "MAJOR" -> Color.rgb(217, 119, 6)
-                    "FAIL", "CRITICAL" -> Color.rgb(220, 38, 38)
-                    else -> Color.rgb(79, 70, 229)
+                rowCells.forEachIndexed { c, cellText ->
+                  val headerLabel = block.headers.getOrNull(c).orEmpty().ifBlank { "Column ${c + 1}" }
+                  if (cellText.isNotBlank()) {
+                    drawLayoutPaginated(
+                      text = "${headerLabel.uppercase(Locale.US)}: $cellText",
+                      paint = if (c == 0) tableCellBoldPaint else tableCellPaint,
+                      width = CONTENT_WIDTH - 14f,
+                      leftX = MARGIN_H + 8f,
+                      lineAdd = 1.8f
+                    )
+                    cursorY += 2.5f
                   }
-                  val pillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = pillColor }
-                  val pw = (statusTextPaint.measureText(upperCell) + 9f).coerceAtMost(colWidths[c] - 6f)
-                  val pillTop = top + padV
-                  canvas.drawRoundRect(RectF(x + 3f, pillTop, x + 3f + pw, pillTop + 12.5f), 3f, 3f, pillPaint)
-                  canvas.drawText(upperCell, x + 7.5f, pillTop + 8.8f, statusTextPaint)
-                } else {
-                  canvas.save()
-                  canvas.translate(x + 4f, top + padV)
-                  cellLayouts[c].draw(canvas)
-                  canvas.restore()
                 }
-                x += colWidths[c]
+                canvas.drawLine(MARGIN_H, cursorY + 2f, PAGE_WIDTH - MARGIN_H, cursorY + 2f, dividerPaint)
+                cursorY += 7f
+              } else {
+                if (cursorY + rowH > PAGE_HEIGHT - MARGIN_BOTTOM) {
+                  startNewPage()
+                  drawTableHeaderRow()
+                }
+
+                val top = cursorY
+                val rowRect = RectF(MARGIN_H, top, PAGE_WIDTH - MARGIN_H, top + rowH)
+                canvas.drawRect(rowRect, if (rowIdx % 2 == 0) zebraLightPaint else zebraAltPaint)
+                canvas.drawLine(MARGIN_H, top + rowH, PAGE_WIDTH - MARGIN_H, top + rowH, dividerPaint)
+
+                var x = MARGIN_H
+                rowCells.forEachIndexed { c, cellText ->
+                  val upperCell = cellText.trim().uppercase(Locale.US)
+                  val isStatusCell = upperCell in setOf("PASS", "WARN", "FAIL", "INFO", "CRITICAL", "MAJOR", "MINOR")
+                  if (isStatusCell) {
+                    val pillColor = when (upperCell) {
+                      "PASS" -> Color.rgb(22, 163, 74)
+                      "WARN", "MAJOR" -> Color.rgb(217, 119, 6)
+                      "FAIL", "CRITICAL" -> Color.rgb(220, 38, 38)
+                      else -> Color.rgb(79, 70, 229)
+                    }
+                    val pillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = pillColor }
+                    val pw = (statusTextPaint.measureText(upperCell) + 9f).coerceAtMost(colWidths[c] - 6f)
+                    val pillTop = top + padV
+                    canvas.drawRoundRect(RectF(x + 3f, pillTop, x + 3f + pw, pillTop + 12.5f), 3f, 3f, pillPaint)
+                    canvas.drawText(upperCell, x + 7.5f, pillTop + 8.8f, statusTextPaint)
+                  } else {
+                    canvas.save()
+                    canvas.translate(x + 4f, top + padV)
+                    cellLayouts[c].draw(canvas)
+                    canvas.restore()
+                  }
+                  x += colWidths[c]
+                }
+                cursorY = top + rowH
               }
-              cursorY = top + rowH
             }
             cursorY += 7f
           }
@@ -840,24 +878,43 @@ object PdfReportExporter {
     }
 
     fun drawSectionHeader(sectionNum: String, title: String, stageTag: String) {
+      val measuredTagW = if (stageTag.isNotBlank()) sectionStagePaint.measureText(stageTag) else 0f
+      val headerMetrics = computeSectionHeaderMetrics(
+        contentWidth = CONTENT_WIDTH,
+        stageTagWidth = measuredTagW
+      )
+      val titleLayout = buildLayout(title, sectionHeaderPaint, headerMetrics.titleMaxWidth, 1.5f)
+      val tagLayout = if (stageTag.isNotBlank()) {
+        buildLayout(stageTag, sectionStagePaint, headerMetrics.tagMaxWidth, 1.2f)
+      } else null
+      val barH = maxOf(
+        24f,
+        maxOf(titleLayout.height, tagLayout?.height ?: 0).toFloat() + 11f
+      )
       // Keep-with-next: section header + at least 60pt of body stay on the same page
-      ensureSpace(92f)
+      ensureSpace(barH + 68f)
       cursorY += 6f
       val barTop = cursorY
-      val barH = 24f
       val barRect = RectF(MARGIN_H, barTop, PAGE_WIDTH - MARGIN_H, barTop + barH)
       canvas.drawRoundRect(barRect, 5f, 5f, sectionTintPaint)
 
       val badgeRect = RectF(MARGIN_H, barTop, MARGIN_H + 26f, barTop + barH)
       canvas.drawRoundRect(badgeRect, 5f, 5f, bluePaint)
       val numW = sectionNumPaint.measureText(sectionNum)
-      canvas.drawText(sectionNum, MARGIN_H + (26f - numW) / 2f, barTop + 15.5f, sectionNumPaint)
+      canvas.drawText(sectionNum, MARGIN_H + (26f - numW) / 2f, barTop + (barH / 2f) + 3.5f, sectionNumPaint)
 
-      canvas.drawText(title, MARGIN_H + 34f, barTop + 15.5f, sectionHeaderPaint)
+      canvas.save()
+      canvas.translate(MARGIN_H + 34f, barTop + (barH - titleLayout.height) / 2f)
+      titleLayout.draw(canvas)
+      canvas.restore()
 
-      if (stageTag.isNotBlank()) {
-        val stW = sectionStagePaint.measureText(stageTag)
-        canvas.drawText(stageTag, PAGE_WIDTH - MARGIN_H - stW - 8f, barTop + 15f, sectionStagePaint)
+      if (tagLayout != null) {
+        val actualTagW = (0 until tagLayout.lineCount).maxOfOrNull { tagLayout.getLineWidth(it) } ?: headerMetrics.tagMaxWidth
+        val tagX = (PAGE_WIDTH - MARGIN_H - actualTagW - 8f).coerceAtLeast(MARGIN_H + 34f + headerMetrics.titleMaxWidth + 6f)
+        canvas.save()
+        canvas.translate(tagX, barTop + (barH - tagLayout.height) / 2f)
+        tagLayout.draw(canvas)
+        canvas.restore()
       }
 
       cursorY = barTop + barH + 9f
@@ -1261,4 +1318,35 @@ object PdfReportExporter {
       textColor = Color.rgb(30, 41, 59)
     )
   }
+
+  internal data class SectionHeaderMetrics(
+    val titleMaxWidth: Float,
+    val tagMaxWidth: Float
+  )
+
+  /**
+   * Computes non-overlapping wrapped column widths for the section header title and stage tag.
+   */
+  internal fun computeSectionHeaderMetrics(
+    contentWidth: Float,
+    stageTagWidth: Float
+  ): SectionHeaderMetrics {
+    val reservedLeft = 34f // 26pt badge + 8pt gutter
+    val reservedRightPad = 8f
+    val gapBetween = 10f
+    val maxTagAllowed = (contentWidth * 0.28f).coerceAtLeast(64f)
+    val effectiveTagW = if (stageTagWidth <= 0f) 0f else stageTagWidth.coerceAtMost(maxTagAllowed)
+    val titleW = (contentWidth - reservedLeft - reservedRightPad - if (effectiveTagW > 0f) effectiveTagW + gapBetween else 0f)
+      .coerceAtLeast(160f)
+    return SectionHeaderMetrics(titleMaxWidth = titleW, tagMaxWidth = effectiveTagW)
+  }
+
+  /**
+   * Returns true when a rendered table row is too tall to fit safely on a single A4 body page
+   * without clipping or colliding with the footer, triggering paginated stacked-card rendering.
+   */
+  internal fun shouldFallbackTableRowToPaginatedCard(
+    measuredRowHeight: Float,
+    maxPageBodyHeight: Float
+  ): Boolean = measuredRowHeight > (maxPageBodyHeight - 40f)
 }

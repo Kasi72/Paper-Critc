@@ -90,12 +90,33 @@ fun ApiKeysAndProvidersSettingsContent(
     ?: DefaultAiProviderCatalog.presets.first()
 
   var showAddCustomCard by rememberSaveable { mutableStateOf(false) }
+  val vaultAvailable = remember { com.example.data.local.ApiKeyVault.isHardwareVaultAvailable() }
 
   Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+    if (!vaultAvailable) {
+      val warnShape = SquircleShape(cornerRadius = 10.dp, smoothing = 0.88f)
+      Box(
+        modifier = Modifier
+          .fillMaxWidth()
+          .clip(warnShape)
+          .background(CupertinoRed.copy(alpha = 0.10f))
+          .border(0.8.dp, CupertinoRed.copy(alpha = 0.35f), warnShape)
+          .padding(horizontal = 12.dp, vertical = 10.dp)
+          .testTag("credential_vault_unavailable_banner")
+      ) {
+        Text(
+          text = "Encrypted Credential Storage Unavailable: Android Keystore cannot be initialized on this device. Plaintext API key storage is blocked to protect your credentials; use Built-in Keyless Firebase AI Logic instead.",
+          style = MaterialTheme.typography.bodySmall,
+          color = CupertinoRed,
+          fontWeight = FontWeight.Medium
+        )
+      }
+    }
+
     // 1. Master AI Provider Routing Card (iOS Cupertino Switches)
     IosGroupedCard(
       header = "AI Analysis Routing & Free API Key Controls",
-      footer = "By default, Paper Critic uses Built-in Keyless Firebase AI Logic. Personal API keys are encrypted at rest with Android Keystore AES-256-GCM and excluded from cloud backups."
+      footer = "By default, Paper Critic uses Built-in Keyless Firebase AI Logic. Personal API keys require Android Keystore AES-256-GCM (fail-closed, never stored in plaintext), strict HTTPS endpoints, and are excluded from cloud backups."
     ) {
       Row(
         verticalAlignment = Alignment.CenterVertically,

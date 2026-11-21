@@ -271,6 +271,9 @@ interface PaperCriticSqlDao {
   @Query("SELECT * FROM sql_api_providers ORDER BY isFreeTierPreset DESC, serviceName ASC")
   fun observeApiProviders(): Flow<List<SqlApiProviderEntity>>
 
+  @Query("SELECT * FROM sql_api_providers")
+  suspend fun getAllApiProvidersOnce(): List<SqlApiProviderEntity>
+
   @Insert(onConflict = OnConflictStrategy.REPLACE)
   suspend fun upsertApiProvider(provider: SqlApiProviderEntity)
 

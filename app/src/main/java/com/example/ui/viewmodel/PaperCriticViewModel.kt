@@ -395,22 +395,61 @@ class PaperCriticViewModel(
   private val _statusBanner = MutableStateFlow<String?>(null)
   val statusBanner: StateFlow<String?> = _statusBanner.asStateFlow()
 
-  fun onAuthenticatedUserChanged(newUserId: String?) {
-    val previous = _authenticatedUserId.value
-    _authenticatedUserId.value = newUserId
-    if (!newUserId.isNullOrBlank() && previous != newUserId) {
-      syncPortfolioToCloud()
+  init {
+    viewModelScope.launch {
+      runCatching { localRepository.migratePlaintextApiKeysIfNeeded() }
+        .onSuccess { migrated ->
+          if (migrated > 0) {
+            Log.i(TAG, "Migrated $migrated legacy API key(s) to Android Keystore AES-256-GCM.")
+          } else if (migrated < 0) {
+            _statusBanner.value = "Encrypted credential storage (Android Keystore) is unavailable; legacy API keys are locked."
+          }
+        }
+        .onFailure { err ->
+          Log.w(TAG, "API key migration check failed", err)
+        }
     }
   }
 
-  fun syncPortfolioToCloud() {
-    if (_settingsState.value.confidentialLocalOnly) {
-      _statusBanner.value = "Confidential Local-Only Mode is active. Disable it in Settings → Cloud to sync to Firestore."
+  fun onAuthenticatedUserChanged(newUserId: String?) {
+    val previous = _authenticatedUserId.value
+    _authenticatedUserId.value = newUserId
+    val settings = _settingsState.value
+    if (!newUserId.isNullOrBlank() &&
+      previous != newUserId &&
+      shouldAllowPortfolioSync(
+        confidentialLocalOnly = settings.confidentialLocalOnly,
+        autoSaveToCloud = settings.autoSaveToCloud,
+        isAutomatic = true
+      )
+    ) {
+      syncPortfolioToCloud(isAutomatic = true)
+    }
+  }
+
+  fun syncPortfolioToCloud() = syncPortfolioToCloud(isAutomatic = false)
+
+  fun syncPortfolioToCloud(isAutomatic: Boolean) {
+    val settings = _settingsState.value
+    if (settings.confidentialLocalOnly) {
+      if (!isAutomatic) {
+        _statusBanner.value = "Confidential Local-Only Mode is active. Disable it in Settings → Cloud to sync to Firestore."
+      }
+      return
+    }
+    if (!shouldAllowPortfolioSync(
+        confidentialLocalOnly = settings.confidentialLocalOnly,
+        autoSaveToCloud = settings.autoSaveToCloud,
+        isAutomatic = isAutomatic
+      )
+    ) {
       return
     }
     val uid = _authenticatedUserId.value
     if (uid.isNullOrBlank()) {
-      _statusBanner.value = "Sign in with Google to sync your paper review portfolio across devices."
+      if (!isAutomatic) {
+        _statusBanner.value = "Sign in with Google to sync your paper review portfolio across devices."
+      }
       return
     }
     if (_isSyncingPortfolio.value) return
@@ -1097,11 +1136,31 @@ class PaperCriticViewModel(
 
   fun saveOrUpdateApiProvider(entry: AiApiProviderEntry) {
     viewModelScope.launch {
+      if (entry.protocolType != ApiProtocolType.FIREBASE_AI_LOGIC_KEYLESS) {
+        val urlValidation = runCatching {
+          ExternalApiGatewayClient.validateEndpointUrl(entry.baseUrl, resolveDns = false)
+        }
+        if (urlValidation.isFailure) {
+          val msg = urlValidation.exceptionOrNull()?.localizedMessage
+            ?: "Invalid provider endpoint URL. HTTPS is required."
+          _apiTestResultMessage.value = "❌ $msg"
+          _statusBanner.value = msg
+          return@launch
+        }
+      }
       val updatedEntry = entry.copy(
         enabled = entry.apiKey.isNotBlank() || entry.protocolType == ApiProtocolType.FIREBASE_AI_LOGIC_KEYLESS
       )
-      runCatching {
+      val saveOutcome = runCatching {
         localRepository.upsertApiProvider(updatedEntry)
+      }
+      if (saveOutcome.isFailure) {
+        val err = saveOutcome.exceptionOrNull()
+        val msg = err?.localizedMessage
+          ?: "Encrypted credential storage (Android Keystore) is unavailable. Key was not saved."
+        _apiTestResultMessage.value = "❌ $msg"
+        _statusBanner.value = msg
+        return@launch
       }
       if (updatedEntry.apiKey.isNotBlank() &&
         updatedEntry.protocolType != ApiProtocolType.FIREBASE_AI_LOGIC_KEYLESS
@@ -1113,7 +1172,7 @@ class PaperCriticViewModel(
           )
         }
       }
-      _statusBanner.value = "Saved API key & configuration for ${updatedEntry.serviceName}."
+      _statusBanner.value = "Saved encrypted API key & HTTPS configuration for ${updatedEntry.serviceName}."
     }
   }
 
@@ -1195,6 +1254,22 @@ class PaperCriticViewModel(
 
   companion object {
     private const val PREFS_NAME = "paper_critic_settings"
+
+    /**
+     * Authoritative privacy gate for cloud portfolio sync:
+     * - [confidentialLocalOnly] blocks ALL cloud sync (both automatic and manual).
+     * - When [isAutomatic] is true (e.g., on sign-in), [autoSaveToCloud] MUST also be enabled.
+     * - Explicit manual "Sync Now" ([isAutomatic] = false) is allowed when not in Confidential Local-Only mode.
+     */
+    internal fun shouldAllowPortfolioSync(
+      confidentialLocalOnly: Boolean,
+      autoSaveToCloud: Boolean,
+      isAutomatic: Boolean
+    ): Boolean {
+      if (confidentialLocalOnly) return false
+      if (isAutomatic && !autoSaveToCloud) return false
+      return true
+    }
 
     private fun loadSettingsFromPrefs(prefs: SharedPreferences?): AppSettingsState {
       if (prefs == null) return AppSettingsState()

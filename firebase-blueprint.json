@@ -2,7 +2,7 @@
   "entities": {
     "PaperReview": {
       "title": "PaperReview",
-      "description": "A structured adversarial peer review dossier for an academic journal manuscript generated via the multi-stage Reviewer2 & PhD-Skills pipeline.",
+      "description": "A structured critical appraisal and peer-review dossier with 6-axis rubric scores/justifications, separated scientific/extraction confidence, appraisal mode, provenance disclosure, and source-anchored evidence findings.",
       "type": "object",
       "properties": {
         "userId": {
@@ -31,7 +31,7 @@
         },
         "credibilityScore": {
           "type": "integer",
-          "description": "Overall methodological credibility score from 0 to 100"
+          "description": "Authoritative weighted 6-axis composite credibility score from 0 to 100"
         },
         "verdict": {
           "type": "string",
@@ -40,9 +40,101 @@
             "MINOR_REVISION",
             "MAJOR_REVISION",
             "REJECT_AND_RESUBMIT",
-            "REJECT"
+            "REJECT",
+            "HIGH_CREDIBILITY",
+            "SOUND_WITH_CAVEATS",
+            "REQUIRES_CORRECTION",
+            "MAJOR_CONCERNS",
+            "LOW_CREDIBILITY",
+            "HIGH_CERTAINTY",
+            "MODERATE_CERTAINTY",
+            "LOW_CERTAINTY",
+            "VERY_LOW_CERTAINTY"
           ],
-          "description": "Editorial peer-review decision verdict"
+          "description": "Mode-appropriate score-derived appraisal verdict"
+        },
+        "methodologyScore": {
+          "type": "integer",
+          "description": "Methodology rubric score (0-10)"
+        },
+        "significanceScore": {
+          "type": "integer",
+          "description": "Significance rubric score (0-10)"
+        },
+        "clarityScore": {
+          "type": "integer",
+          "description": "Clarity rubric score (0-10)"
+        },
+        "originalityScore": {
+          "type": "integer",
+          "description": "Originality rubric score (0-10)"
+        },
+        "mathRigorScore": {
+          "type": "integer",
+          "description": "Mathematical and statistical rigor rubric score (0-10)"
+        },
+        "reproducibilityScore": {
+          "type": "integer",
+          "description": "Reproducibility rubric score (0-10)"
+        },
+        "methodologyJustification": {
+          "type": "string",
+          "description": "Full untruncated methodological rubric justification"
+        },
+        "significanceJustification": {
+          "type": "string",
+          "description": "Full untruncated significance rubric justification"
+        },
+        "clarityJustification": {
+          "type": "string",
+          "description": "Full untruncated clarity rubric justification"
+        },
+        "originalityJustification": {
+          "type": "string",
+          "description": "Full untruncated originality rubric justification"
+        },
+        "mathRigorJustification": {
+          "type": "string",
+          "description": "Full untruncated quantitative and statistical rubric justification"
+        },
+        "reproducibilityJustification": {
+          "type": "string",
+          "description": "Full untruncated reproducibility rubric justification"
+        },
+        "refereeConfidence": {
+          "type": "integer",
+          "description": "Scientific judgment confidence score (1-5)"
+        },
+        "extractionConfidence": {
+          "type": "integer",
+          "description": "Document extraction and source grounding confidence score (1-5)"
+        },
+        "reviewMode": {
+          "type": "string",
+          "enum": [
+            "POST_PUBLICATION_APPRAISAL",
+            "JOURNAL_REFEREE",
+            "CLINICAL_EVIDENCE_APPRAISAL"
+          ],
+          "description": "Selected critical appraisal mode"
+        },
+        "coverageDisclosure": {
+          "type": "string",
+          "description": "Transparent page extraction, omission, and visual routing provenance summary"
+        },
+        "validationStatus": {
+          "type": "string",
+          "enum": [
+            "VERIFIED",
+            "ADJUDICATED_WITH_CAVEATS",
+            "PARTIALLY_VALIDATED",
+            "UNVERIFIED"
+          ],
+          "description": "Pipeline grounding and adjudication validation state"
+        },
+        "structuredFindingsJson": {
+          "type": "string",
+          "description": "Serialized JSON array of source-anchored ReviewFinding evidence ledger items"
         },
         "abstractSummary": {
           "type": "string",
@@ -62,7 +154,7 @@
         },
         "redTeamCritique": {
           "type": "string",
-          "description": "Stage 01 Red Team (Breaker/Butcher/Shredder) adversarial critique"
+          "description": "Stage 01 Red Team adversarial critique"
         },
         "blueTeamVerification": {
           "type": "string",
@@ -70,15 +162,15 @@
         },
         "mathAuditReport": {
           "type": "string",
-          "description": "Stage 01e-01fd equation proofread, LaTeX notation check, and derivation audit"
+          "description": "Stage 01e-01fd quantitative, statistical, and derivation audit"
         },
         "codeAuditReport": {
           "type": "string",
-          "description": "Stage 01i-01n & X-Ray code reproducibility and data leakage audit"
+          "description": "Stage 01i-01n reproducibility, provenance, and clinical applicability audit"
         },
         "editorNote": {
           "type": "string",
-          "description": "Stage 08b Editor's synthesis note and decision rationale"
+          "description": "Stage 08b Editor synthesis note and decision rationale"
         },
         "copyeditSuggestions": {
           "type": "string",
@@ -86,11 +178,11 @@
         },
         "reviewerQuestions": {
           "type": "string",
-          "description": "Anticipated Reviewer 2 questions and suggested ablation defenses"
+          "description": "Anticipated Reviewer 2 questions and suggested defenses"
         },
         "formattedDossier": {
           "type": "string",
-          "description": "Stage 10 plain-text assembled report in IS IT CREDIBLE? / reviewer2 format"
+          "description": "Stage 10 plain-text assembled appraisal dossier"
         },
         "bookmarked": {
           "type": "boolean",
@@ -144,7 +236,7 @@
       "schema": {
         "$ref": "#/entities/PaperReview"
       },
-      "description": "Per-user subcollection of critical journal paper reviews and adversarial audit dossiers."
+      "description": "Per-user subcollection of critical journal paper reviews and source-anchored appraisal dossiers."
     }
   }
 }

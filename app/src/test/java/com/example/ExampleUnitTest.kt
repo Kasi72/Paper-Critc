@@ -439,4 +439,395 @@ class ExampleUnitTest {
     assertEquals(2, hits.first().sectionTabIndex)
     assertEquals(0, hits.first().subSegmentIndex)
   }
+
+  // --- Audit P0 / P1 / P2 Regression & Integrity Test Suite ---
+
+  @Test
+  fun reviewRepositoryPayload_preservesAll18ProvenanceFieldsAndModeSpecificVerdicts() {
+    val findingsJson = """[{"id":"Q-01","status":"VERIFIED"}]"""
+    val review = PaperReview(
+      id = "local-doc-99",
+      userId = "uid-alice",
+      title = "Need Estimates of Psychiatric Beds",
+      authors = "Mundt et al.",
+      publicationYear = "2022",
+      venueOrCitation = "World Psychiatry",
+      isEmpirical = true,
+      credibilityScore = 99L, // Stale value must be reconciled to authoritative 64
+      verdict = "REQUIRES_CORRECTION",
+      methodologyScore = 6,
+      significanceScore = 8,
+      clarityScore = 7,
+      originalityScore = 7,
+      mathRigorScore = 5,
+      reproducibilityScore = 4,
+      methodologyJustification = "Random-effects meta-analysis performed across 65 studies.",
+      significanceJustification = "High policy significance globally.",
+      clarityJustification = "Clear PRISMA flow diagram.",
+      originalityJustification = "First global normative bed benchmark.",
+      mathRigorJustification = "Page 8 CI conflicts with Figure 2 on Page 9.",
+      reproducibilityJustification = "Protocol not pre-registered.",
+      refereeConfidence = 4,
+      extractionConfidence = 5,
+      reviewMode = ReviewMode.POST_PUBLICATION_APPRAISAL.name,
+      coverageDisclosure = "12/12 pages extracted • PDFBox",
+      validationStatus = "VERIFIED",
+      structuredFindingsJson = findingsJson,
+      abstractSummary = "Summary text."
+    )
+
+    val payload = com.example.data.repository.ReviewRepository.buildFirestorePayload(
+      review = review,
+      uid = "uid-alice",
+      createdAtValue = "TS_CREATE",
+      updatedAtValue = "TS_UPDATE"
+    )
+
+    // @DocumentId "id" must never be included in raw Map payload
+    assertFalse("Must not include id in raw Firestore payload", payload.containsKey("id"))
+    assertEquals(64L, payload["credibilityScore"])
+    assertEquals("REQUIRES_CORRECTION", payload["verdict"])
+    assertEquals("POST_PUBLICATION_APPRAISAL", payload["reviewMode"])
+    assertEquals("VERIFIED", payload["validationStatus"])
+    assertEquals(4, payload["refereeConfidence"])
+    assertEquals(5, payload["extractionConfidence"])
+    assertEquals("12/12 pages extracted • PDFBox", payload["coverageDisclosure"])
+    assertEquals(findingsJson, payload["structuredFindingsJson"])
+    assertEquals(6, payload["methodologyScore"])
+    assertEquals(5, payload["mathRigorScore"])
+    assertEquals("Page 8 CI conflicts with Figure 2 on Page 9.", payload["mathRigorJustification"])
+
+    // Clinical & Journal verdicts preserved without coercing to MINOR_REVISION
+    val clinicalPayload = com.example.data.repository.ReviewRepository.buildFirestorePayload(
+      review = review.copy(
+        reviewMode = ReviewMode.CLINICAL_EVIDENCE_APPRAISAL.name,
+        verdict = "HIGH_CERTAINTY"
+      ),
+      uid = "uid-alice",
+      createdAtValue = "TS_CREATE",
+      updatedAtValue = "TS_UPDATE"
+    )
+    assertEquals("HIGH_CERTAINTY", clinicalPayload["verdict"])
+  }
+
+  @Test
+  fun autoSyncPrivacyGate_blocksAutomaticUploadWhenAutoSaveDisabledOrConfidentialModeEnabled() {
+    // Confidential local-only blocks BOTH automatic and manual sync
+    assertFalse(
+      com.example.ui.viewmodel.PaperCriticViewModel.shouldAllowPortfolioSync(
+        confidentialLocalOnly = true,
+        autoSaveToCloud = true,
+        isAutomatic = true
+      )
+    )
+    assertFalse(
+      com.example.ui.viewmodel.PaperCriticViewModel.shouldAllowPortfolioSync(
+        confidentialLocalOnly = true,
+        autoSaveToCloud = true,
+        isAutomatic = false
+      )
+    )
+    // Auto-save disabled MUST block automatic sign-in upload
+    assertFalse(
+      com.example.ui.viewmodel.PaperCriticViewModel.shouldAllowPortfolioSync(
+        confidentialLocalOnly = false,
+        autoSaveToCloud = false,
+        isAutomatic = true
+      )
+    )
+    // Explicit manual "Sync Now" succeeds when confidential mode is off even if auto-save is off
+    assertTrue(
+      com.example.ui.viewmodel.PaperCriticViewModel.shouldAllowPortfolioSync(
+        confidentialLocalOnly = false,
+        autoSaveToCloud = false,
+        isAutomatic = false
+      )
+    )
+    // Automatic sync succeeds only when confidential is off AND auto-save is on
+    assertTrue(
+      com.example.ui.viewmodel.PaperCriticViewModel.shouldAllowPortfolioSync(
+        confidentialLocalOnly = false,
+        autoSaveToCloud = true,
+        isAutomatic = true
+      )
+    )
+  }
+
+  @Test
+  fun externalApiEndpointValidator_enforcesHttpsBlocksPrivateHostsAndKeepsGeminiKeyOutOfUrl() {
+    val blockedUrls = listOf(
+      "http://api.openai.com/v1/chat/completions",
+      "https://localhost:8080/v1/chat",
+      "https://127.0.0.1/v1/chat",
+      "https://169.254.169.254/latest/meta-data/",
+      "https://10.0.0.4/v1/chat",
+      "https://192.168.1.10/v1/chat",
+      "https://[::1]/v1/chat",
+      "https://user:pass@api.openai.com/v1/chat"
+    )
+    blockedUrls.forEach { bad ->
+      val failed = runCatching {
+        com.example.data.ai.ExternalApiGatewayClient.validateEndpointUrl(bad, resolveDns = false)
+      }.isFailure
+      assertTrue("Must reject unsafe endpoint: $bad", failed)
+    }
+
+    val valid = com.example.data.ai.ExternalApiGatewayClient.validateEndpointUrl(
+      "https://openrouter.ai/api/v1/chat/completions",
+      resolveDns = false
+    )
+    assertEquals("https", valid.protocol)
+    assertEquals("openrouter.ai", valid.host)
+
+    // Gemini direct REST URL must NEVER carry ?key= query parameter
+    val geminiUrl = com.example.data.ai.ExternalApiGatewayClient.buildGeminiDirectRestUrl(
+      baseUrl = "https://generativelanguage.googleapis.com/v1beta",
+      modelId = "gemini-2.5-flash"
+    )
+    assertFalse("Gemini URL must not embed API key in query string", geminiUrl.toString().contains("key="))
+    assertTrue(geminiUrl.toString().endsWith("/models/gemini-2.5-flash:generateContent"))
+  }
+
+  @Test
+  fun prepareManuscriptForPrompt_withoutReferencesHeadingUsesPageAwareSelectionAndDisclosesOmittedPages() {
+    val pages = (1..8).joinToString("\n\n") { pageNum ->
+      val body = when (pageNum) {
+        1 -> "Title and Abstract: Systematic appraisal of inpatient bed thresholds. " + "Context text. ".repeat(20)
+        5 -> "Results Table 2 Figure 2 pooled estimate 95% CI 3-15 p = 0.004 I² = 99%. " + "Quantitative detail. ".repeat(20)
+        8 -> "Discussion and Conclusion: Policy implications for LMIC and HIC facilities. " + "Closing synthesis. ".repeat(20)
+        else -> "Extended supplementary narrative appendix text for page $pageNum. ".repeat(30)
+      }
+      "[PAGE $pageNum]\n$body"
+    }
+
+    val prepared = Reviewer2PipelineService.prepareManuscriptForPrompt(pages, maxChars = 2200)
+    assertTrue("Must flag partial coverage", prepared.wasTrimmed)
+    assertTrue("Must record exact omitted page numbers", prepared.omittedPages.isNotEmpty())
+    assertFalse("Must never falsely claim no middle sections omitted", prepared.trimmedNote.contains("no middle sections omitted", ignoreCase = true))
+    assertTrue("Must retain Page 1 opening", prepared.text.contains("[PAGE 1]"))
+    assertTrue("Must retain high-signal Results Page 5", prepared.text.contains("[PAGE 5]"))
+    assertTrue("Must retain closing Discussion Page 8", prepared.text.contains("[PAGE 8]"))
+    assertTrue("Disclosure note must state partial coverage", prepared.trimmedNote.contains("Partial", ignoreCase = true))
+  }
+
+  @Test
+  fun quoteVerifier_requiresExactContiguousMatchAndMatchingPageForVerified() {
+    val manuscript = """
+      [PAGE 2]
+      Methods: Three authors independently extracted study characteristics from 65 eligible publications.
+
+      [PAGE 8]
+      Results: Long-stay psychiatric beds had a pooled estimate of 9, 95% CI 1.26 to 2.35 per 100,000 population.
+    """.trimIndent()
+
+    // 1. Exact contiguous quote + matching page -> EXACT without page mismatch
+    val exactOk = Reviewer2PipelineService.verifyQuoteInManuscript(
+      quote = "Three authors independently extracted study characteristics from 65 eligible publications",
+      manuscriptText = manuscript,
+      claimedPage = 2
+    )
+    assertEquals(Reviewer2PipelineService.QuoteMatchKind.EXACT, exactOk.matchKind)
+    assertEquals(2, exactOk.resolvedPage)
+    assertEquals(null, exactOk.pageMismatchWarning)
+    assertNotNull(exactOk.startOffset)
+    assertNotNull(exactOk.endOffset)
+    assertTrue(exactOk.startOffset!! >= 0 && exactOk.endOffset!! > exactOk.startOffset!!)
+    assertEquals(1, exactOk.occurrenceCount)
+
+    // 2. Exact quote but WRONG claimed page -> pageMismatchWarning != null -> downgraded in adjudication
+    val wrongPage = Reviewer2PipelineService.verifyQuoteInManuscript(
+      quote = "Three authors independently extracted study characteristics from 65 eligible publications",
+      manuscriptText = manuscript,
+      claimedPage = 9
+    )
+    assertEquals(Reviewer2PipelineService.QuoteMatchKind.EXACT, wrongPage.matchKind)
+    assertEquals(2, wrongPage.resolvedPage)
+    assertNotNull("Must flag wrong page citation", wrongPage.pageMismatchWarning)
+
+    // 3. Paraphrased / fuzzy quote -> FUZZY_LOCALIZED (must NEVER become VERIFIED in adjudication)
+    val fuzzy = Reviewer2PipelineService.verifyQuoteInManuscript(
+      quote = "Three authors independently extracted study details across 65 included publications",
+      manuscriptText = manuscript,
+      claimedPage = 2
+    )
+    assertEquals(Reviewer2PipelineService.QuoteMatchKind.FUZZY_LOCALIZED, fuzzy.matchKind)
+
+    val forensic = ManuscriptForensicEngine.analyzeManuscript(manuscript, isEmpiricalTrack = true)
+    val adjudicated = Reviewer2PipelineService.adjudicateFindingsAndScores(
+      rawFindings = listOf(
+        ReviewFinding(
+          id = "F-WRONG-PAGE",
+          title = "Wrong Page Citation",
+          allegation = "Extraction protocol had limitations.",
+          severity = "MINOR",
+          status = FindingStatus.VERIFIED,
+          supportingEvidence = listOf(
+            EvidenceAnchor(pageNumber = 9, section = "Methods", exactQuote = "Three authors independently extracted study characteristics from 65 eligible publications")
+          )
+        ),
+        ReviewFinding(
+          id = "F-FUZZY",
+          title = "Paraphrased Quote",
+          allegation = "Extraction protocol paraphrased.",
+          severity = "MINOR",
+          status = FindingStatus.VERIFIED,
+          supportingEvidence = listOf(
+            EvidenceAnchor(pageNumber = 2, section = "Methods", exactQuote = "Three authors independently extracted study details across 65 included publications")
+          )
+        )
+      ),
+      manuscriptText = manuscript,
+      forensicReport = forensic,
+      methodologyScore = 7,
+      significanceScore = 7,
+      clarityScore = 7,
+      originalityScore = 7,
+      mathRigorScore = 7,
+      reproducibilityScore = 7,
+      rawVerdict = "HIGH_CREDIBILITY",
+      reviewMode = ReviewMode.POST_PUBLICATION_APPRAISAL
+    )
+    val wrongPageOut = adjudicated.adjudicatedFindings.first { it.id == "F-WRONG-PAGE" }
+    assertEquals(FindingStatus.PARTIALLY_SUPPORTED, wrongPageOut.status)
+    assertTrue(wrongPageOut.verificationNotes.contains("Page mismatch", ignoreCase = true))
+
+    val fuzzyOut = adjudicated.adjudicatedFindings.first { it.id == "F-FUZZY" }
+    assertEquals(FindingStatus.PARTIALLY_SUPPORTED, fuzzyOut.status)
+  }
+
+  @Test
+  fun deterministicFindings_uncorroboratedCiRemainsPartiallySupportedAndVerdictsStrictlyFollowScoreBands() {
+    // No Figure 2 cross-reference -> deterministic CI alert must be framed cautiously as PARTIALLY_SUPPORTED
+    val uncorroboratedDoc = """
+      [PAGE 4]
+      Results: Subgroup analysis yielded a pooled estimate of 9, 95% CI 1.26 to 2.35 in the primary cohort.
+    """.trimIndent()
+    val forensic = ManuscriptForensicEngine.analyzeManuscript(uncorroboratedDoc, isEmpiricalTrack = true)
+    val adjudicated = Reviewer2PipelineService.adjudicateFindingsAndScores(
+      rawFindings = emptyList(),
+      manuscriptText = uncorroboratedDoc,
+      forensicReport = forensic,
+      methodologyScore = 4,
+      significanceScore = 5,
+      clarityScore = 5,
+      originalityScore = 5,
+      mathRigorScore = 4,
+      reproducibilityScore = 4,
+      rawVerdict = "HIGH_CREDIBILITY", // Contradicts low weighted score of 45
+      reviewMode = ReviewMode.POST_PUBLICATION_APPRAISAL,
+      extractionConfidence = 5
+    )
+
+    val q01 = adjudicated.adjudicatedFindings.firstOrNull { it.id == "Q-01" }
+    assertNotNull("Must still surface deterministic discrepancy", q01)
+    assertTrue(q01!!.title.contains("Requiring Source Reconciliation", ignoreCase = true))
+    assertEquals(
+      "Uncorroborated deterministic regex alert must not be overstated as VERIFIED",
+      FindingStatus.PARTIALLY_SUPPORTED,
+      q01.status
+    )
+
+    // Strictly score-derived verdicts across all 3 modes (low score 45 cannot stay HIGH_CREDIBILITY / ACCEPT / HIGH_CERTAINTY)
+    assertEquals(45, adjudicated.weightedCredibilityScore)
+    assertEquals("MAJOR_CONCERNS", adjudicated.resolvedVerdict)
+
+    assertEquals(
+      "REJECT_AND_RESUBMIT",
+      Reviewer2PipelineService.resolveVerdictForMode(
+        rawVerdict = "ACCEPT",
+        compositeScore = 45,
+        reviewMode = ReviewMode.JOURNAL_REFEREE,
+        hasVerifiedCriticalError = false
+      )
+    )
+    assertEquals(
+      "VERY_LOW_CERTAINTY",
+      Reviewer2PipelineService.resolveVerdictForMode(
+        rawVerdict = "HIGH_CERTAINTY",
+        compositeScore = 45,
+        reviewMode = ReviewMode.CLINICAL_EVIDENCE_APPRAISAL,
+        hasVerifiedCriticalError = false
+      )
+    )
+    // High score + verified critical finding must downgrade ACCEPT -> MAJOR_REVISION
+    assertEquals(
+      "MAJOR_REVISION",
+      Reviewer2PipelineService.resolveVerdictForMode(
+        rawVerdict = "ACCEPT",
+        compositeScore = 88,
+        reviewMode = ReviewMode.JOURNAL_REFEREE,
+        hasVerifiedCriticalError = true
+      )
+    )
+  }
+
+  @Test
+  fun extractionConfidenceCalibration_penalizesGarbledTextOmittedPagesAndUnanchoredInput() {
+    val garbled = "\uFFFD".repeat(30) + "###@@@%%% ".repeat(400)
+    assertEquals(
+      1,
+      Reviewer2PipelineService.computeCalibratedExtractionConfidence(
+        manuscriptText = garbled,
+        coverageReport = null,
+        omittedPromptPages = emptyList(),
+        wasPromptTrimmed = false,
+        adjudicatedFindings = emptyList()
+      )
+    )
+
+    val cleanUnanchored = "This is a well-formed academic sentence discussing clinical trial methodology and results. ".repeat(40)
+    assertEquals(
+      "Direct pasted text without PDF page provenance must cap at 4/5",
+      4,
+      Reviewer2PipelineService.computeCalibratedExtractionConfidence(
+        manuscriptText = cleanUnanchored,
+        coverageReport = null,
+        omittedPromptPages = emptyList(),
+        wasPromptTrimmed = false,
+        adjudicatedFindings = emptyList()
+      )
+    )
+
+    val cleanAnchored = "[PAGE 1]\n" + cleanUnanchored + "\n[PAGE 2]\n" + cleanUnanchored
+    assertEquals(
+      "Omitted prompt pages must cap extraction confidence at 3/5",
+      3,
+      Reviewer2PipelineService.computeCalibratedExtractionConfidence(
+        manuscriptText = cleanAnchored,
+        coverageReport = null,
+        omittedPromptPages = listOf(3, 4),
+        wasPromptTrimmed = true,
+        adjudicatedFindings = emptyList()
+      )
+    )
+  }
+
+  @Test
+  fun pdfLayoutGuards_triggerCardFallbackForTallTableRowsAndPreventHeaderCollision() {
+    assertTrue(
+      "Rows taller than available body height minus safety margin must switch to paginated card layout",
+      com.example.util.PdfReportExporter.shouldFallbackTableRowToPaginatedCard(
+        measuredRowHeight = 760f,
+        maxPageBodyHeight = 740f
+      )
+    )
+    assertFalse(
+      "Normal compact table rows should remain in table layout",
+      com.example.util.PdfReportExporter.shouldFallbackTableRowToPaginatedCard(
+        measuredRowHeight = 120f,
+        maxPageBodyHeight = 740f
+      )
+    )
+
+    val contentWidth = 515f
+    val metrics = com.example.util.PdfReportExporter.computeSectionHeaderMetrics(
+      contentWidth = contentWidth,
+      stageTagWidth = 220f // Extra-long stage tag must be clamped so it never collides with title
+    )
+    assertTrue(metrics.tagMaxWidth <= contentWidth * 0.28f + 0.1f)
+    assertTrue(
+      "Reserved left badge + title + gap + stage tag + right padding must fit inside contentWidth",
+      34f + metrics.titleMaxWidth + 10f + metrics.tagMaxWidth + 8f <= contentWidth + 0.5f
+    )
+  }
 }

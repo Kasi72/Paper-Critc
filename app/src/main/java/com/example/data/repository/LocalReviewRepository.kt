@@ -68,6 +68,27 @@ class LocalReviewRepository(private val sqlDao: PaperCriticSqlDao) {
     sqlDao.upsertApiProvider(SqlApiProviderEntity.fromDomain(entry))
   }
 
+  /**
+   * Immediately migrates any legacy unencrypted API key rows in Room SQLite to AES-256-GCM
+   * ciphertext when Android Keystore is available. Fails closed if Keystore is unavailable
+   * (returns migratedCount = -1 so UI can alert the user).
+   */
+  suspend fun migratePlaintextApiKeysIfNeeded(): Int {
+    val rows = sqlDao.getAllApiProvidersOnce()
+    val legacyRows = rows.filter { it.apiKey.isNotBlank() && !com.example.data.local.ApiKeyVault.isEncrypted(it.apiKey) }
+    if (legacyRows.isEmpty()) return 0
+    if (!com.example.data.local.ApiKeyVault.isHardwareVaultAvailable()) {
+      return -1
+    }
+    var migrated = 0
+    for (row in legacyRows) {
+      val encrypted = com.example.data.local.ApiKeyVault.encrypt(row.apiKey)
+      sqlDao.upsertApiProvider(row.copy(apiKey = encrypted, updatedAtEpochMs = System.currentTimeMillis()))
+      migrated++
+    }
+    return migrated
+  }
+
   suspend fun deleteApiProvider(providerId: String) {
     sqlDao.deleteApiProvider(providerId)
   }

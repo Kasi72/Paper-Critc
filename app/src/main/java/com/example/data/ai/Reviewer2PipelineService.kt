@@ -751,12 +751,29 @@ class Reviewer2PipelineService {
     }
     val forensicContext = forensicReport.toStructuredPromptContext()
 
-    // Preserve the entire paper body (up to 160,000 chars primary / 90,000 chars compact);
-    // never delete the middle Methods/Results section.
+    // Preserve the entire paper body (up to 160,000 chars primary / 90,000 chars compact) using
+    // page-aware selection with explicit omitted-page disclosure.
     val primaryPrepared = prepareManuscriptForPrompt(manuscriptText, maxChars = 160_000)
     val compactPrepared = prepareManuscriptForPrompt(manuscriptText, maxChars = 90_000)
-    val pass1Bitmaps = pdfPageBitmaps.take(4)
-    val pass2Bitmaps = if (manuscriptText.trim().length < 200) pdfPageBitmaps.take(3) else pdfPageBitmaps.take(2)
+    val visionPageNumbers = coverageReport?.visionPageNumbers.orEmpty()
+    val pass1VisionSelection = selectVisionPagesForPass(
+      allBitmaps = pdfPageBitmaps,
+      visionPageNumbers = visionPageNumbers,
+      forensicReport = forensicReport,
+      manuscriptText = manuscriptText,
+      maxBitmaps = 6,
+      prioritizeDiscrepancyAndFigures = false
+    )
+    val pass2VisionSelection = selectVisionPagesForPass(
+      allBitmaps = pdfPageBitmaps,
+      visionPageNumbers = visionPageNumbers,
+      forensicReport = forensicReport,
+      manuscriptText = manuscriptText,
+      maxBitmaps = if (manuscriptText.trim().length < 250) 6 else 4,
+      prioritizeDiscrepancyAndFigures = true
+    )
+    val pass1Bitmaps = pass1VisionSelection.first
+    val pass2Bitmaps = pass2VisionSelection.first
 
     val providerLabel = if (useExternalProvider) {
       " [${externalProvider.serviceName} • ${externalProvider.modelId}]"
@@ -1037,8 +1054,15 @@ class Reviewer2PipelineService {
     val rawSignificanceScore = pass2Json.optInt("significanceScore", 7).coerceIn(1, 10)
     val refereeConfidence = pass2Json.optInt("refereeConfidence", 4).coerceIn(1, 5)
 
-    // Parse LLM structuredFindings and run deterministic cross-pass adjudication + source-quote verification
+    // Parse LLM structuredFindings and run deterministic cross-pass adjudication + strict source-quote verification
     val rawStructuredFindings = parseStructuredFindingsFromJson(pass2Json.optJSONArray("structuredFindings"))
+    val preliminaryExtractionConfidence = computeCalibratedExtractionConfidence(
+      manuscriptText = manuscriptText,
+      coverageReport = coverageReport,
+      omittedPromptPages = primaryPrepared.omittedPages,
+      wasPromptTrimmed = primaryPrepared.wasTrimmed,
+      adjudicatedFindings = emptyList()
+    )
     val adjudicated = adjudicateFindingsAndScores(
       rawFindings = rawStructuredFindings,
       manuscriptText = manuscriptText,
@@ -1050,26 +1074,31 @@ class Reviewer2PipelineService {
       mathRigorScore = reconciledMathScore,
       reproducibilityScore = rawReproducibilityScore,
       rawVerdict = pass2Json.optString("verdict", ""),
-      reviewMode = options.reviewMode
+      reviewMode = options.reviewMode,
+      extractionConfidence = preliminaryExtractionConfidence
     )
 
     val credibilityScore = adjudicated.weightedCredibilityScore.toLong()
     val verdict = adjudicated.resolvedVerdict
     val structuredFindingsJson = ReviewFindingCodec.encode(adjudicated.adjudicatedFindings)
 
-    // Determine separated extractionConfidence & validationStatus transparently
-    val extractionConfidence = coverageReport?.extractionConfidence ?: when {
-      manuscriptText.length >= 4_000 -> 5
-      manuscriptText.length >= 1_200 -> 4
-      manuscriptText.length >= 300 -> 3
-      else -> 2
-    }
+    // Calibrated extraction confidence incorporating parser status, omissions, text quality & quote verifiability
+    val extractionConfidence = computeCalibratedExtractionConfidence(
+      manuscriptText = manuscriptText,
+      coverageReport = coverageReport,
+      omittedPromptPages = primaryPrepared.omittedPages,
+      wasPromptTrimmed = primaryPrepared.wasTrimmed,
+      adjudicatedFindings = adjudicated.adjudicatedFindings
+    )
     val anyJsonRepaired = pass1Result.wasRepaired || pass2Result.wasRepaired || (quantResultOrNull?.wasRepaired == true)
+    val hasPartialOrUnverified = adjudicated.adjudicatedFindings.any {
+      it.status == FindingStatus.CONTRADICTED ||
+        it.status == FindingStatus.UNVERIFIED ||
+        it.status == FindingStatus.PARTIALLY_SUPPORTED
+    }
     val validationStatus = when {
-      anyJsonRepaired -> "PARTIALLY_VALIDATED"
-      primaryPrepared.wasTrimmed || extractionConfidence <= 2 -> "PARTIALLY_VALIDATED"
-      adjudicated.adjudicatedFindings.any { it.status == FindingStatus.CONTRADICTED || it.status == FindingStatus.UNVERIFIED } ->
-        "ADJUDICATED_WITH_CAVEATS"
+      anyJsonRepaired || primaryPrepared.omittedPages.isNotEmpty() || extractionConfidence <= 2 -> "PARTIALLY_VALIDATED"
+      primaryPrepared.wasTrimmed || hasPartialOrUnverified -> "ADJUDICATED_WITH_CAVEATS"
       else -> "VERIFIED"
     }
     val coverageDisclosure = buildString {
@@ -1078,6 +1107,11 @@ class Reviewer2PipelineService {
       } else {
         val wordCnt = if (manuscriptText.isBlank()) 0 else manuscriptText.trim().split(Regex("""\s+""")).size
         append("Direct text input • %,d words • %,d chars • Extraction Confidence: %d/5".format(Locale.US, wordCnt, manuscriptText.length, extractionConfidence))
+      }
+      if (pass1VisionSelection.second.isNotEmpty() || pass2VisionSelection.second.isNotEmpty()) {
+        val p1Tags = pass1VisionSelection.second.joinToString(",") { "P$it" }
+        val p2Tags = pass2VisionSelection.second.joinToString(",") { "P$it" }
+        append(" • Vision routed: Pass1[$p1Tags], Pass2[$p2Tags]")
       }
       if (primaryPrepared.wasTrimmed && primaryPrepared.trimmedNote.isNotBlank()) {
         append(" • ${primaryPrepared.trimmedNote}")
@@ -1941,7 +1975,23 @@ class Reviewer2PipelineService {
   internal data class PromptPreparedManuscript(
     val text: String,
     val wasTrimmed: Boolean,
-    val trimmedNote: String
+    val trimmedNote: String,
+    val omittedPages: List<Int> = emptyList()
+  )
+
+  internal enum class QuoteMatchKind {
+    EXACT,
+    FUZZY_LOCALIZED,
+    NONE
+  }
+
+  internal data class QuoteVerificationResult(
+    val matchKind: QuoteMatchKind,
+    val resolvedPage: Int,
+    val startOffset: Int? = null,
+    val endOffset: Int? = null,
+    val occurrenceCount: Int = 0,
+    val pageMismatchWarning: String? = null
   )
 
   internal data class AdjudicationResult(
@@ -1957,10 +2007,82 @@ class Reviewer2PipelineService {
   )
 
   companion object {
+    private val PAGE_BLOCK_HEADER_REGEX = Regex("""(?m)^\[PAGE\s+(\d+)\]\s*$""")
+
     /**
-     * Preserves the complete manuscript body (Introduction, Methods, Results, Tables, Figures,
-     * Discussion) without middle truncation. Only when a very long manuscript exceeds [maxChars]
-     * does it trim the trailing References/Bibliography list first, disclosing any trim explicitly.
+     * Routes rendered PDF page bitmaps to Pass 1 / Pass 2 using page-number metadata so
+     * high-value Figures, Tables, and pages flagged by deterministic CI/Statcheck alerts
+     * reach Pass 2 adjudication (rather than blindly truncating to `take(2)`).
+     */
+    internal fun selectVisionPagesForPass(
+      allBitmaps: List<Bitmap>,
+      visionPageNumbers: List<Int>,
+      forensicReport: ForensicPreFlightReport?,
+      manuscriptText: String,
+      maxBitmaps: Int,
+      prioritizeDiscrepancyAndFigures: Boolean
+    ): Pair<List<Bitmap>, List<Int>> {
+      if (allBitmaps.isEmpty() || maxBitmaps <= 0) return emptyList<Bitmap>() to emptyList()
+      val indexed = allBitmaps.mapIndexedNotNull { idx, bmp ->
+        if (bmp.isRecycled) null else Triple(idx, visionPageNumbers.getOrNull(idx) ?: (idx + 1), bmp)
+      }
+      if (indexed.size <= maxBitmaps) {
+        return indexed.map { it.third } to indexed.map { it.second }
+      }
+      if (!prioritizeDiscrepancyAndFigures) {
+        val chosen = indexed.take(maxBitmaps)
+        return chosen.map { it.third } to chosen.map { it.second }
+      }
+
+      val flaggedPages = buildSet {
+        forensicReport?.quantForensics?.confidenceIntervalChecks
+          ?.filter { it.status == QuantFindingStatus.FAIL }
+          ?.forEach { ci ->
+            if (ci.pageNumber > 0) add(ci.pageNumber)
+            Regex("""Page\s+(\d+)""", RegexOption.IGNORE_CASE).findAll(ci.crossReferenceNote)
+              .forEach { m -> m.groupValues[1].toIntOrNull()?.let { add(it) } }
+          }
+        forensicReport?.quantForensics?.statcheckResults
+          ?.filter { it.status == QuantFindingStatus.FAIL && it.pageNumber > 0 }
+          ?.forEach { add(it.pageNumber) }
+      }
+      val figurePageSet = extractPageBlocks(manuscriptText)
+        .filter { (_, body) ->
+          Regex("""\b(?:figure|fig\.|forest\s+plot|funnel\s+plot|table\s*\d+)\b""", RegexOption.IGNORE_CASE)
+            .containsMatchIn(body)
+        }
+        .map { it.first }
+        .toSet()
+
+      val ranked = indexed.sortedByDescending { (_, pageNum, _) ->
+        var score = 0
+        if (pageNum in flaggedPages) score += 100
+        if (pageNum in figurePageSet) score += 50
+        if (pageNum == 1) score += 10
+        score
+      }.take(maxBitmaps).sortedBy { it.second }
+
+      return ranked.map { it.third } to ranked.map { it.second }
+    }
+
+    private fun extractPageBlocks(text: String): List<Pair<Int, String>> {
+      val matches = PAGE_BLOCK_HEADER_REGEX.findAll(text).toList()
+      if (matches.isEmpty()) return emptyList()
+      return matches.mapIndexed { idx, match ->
+        val pageNum = match.groupValues[1].toIntOrNull() ?: (idx + 1)
+        val bodyStart = (match.range.last + 1).coerceAtMost(text.length)
+        val bodyEnd = if (idx + 1 < matches.size) matches[idx + 1].range.first else text.length
+        pageNum to text.substring(bodyStart, bodyEnd).trim()
+      }
+    }
+
+    /**
+     * Page-aware prompt budget selector:
+     * 1. Returns the complete document unchanged when within [maxChars] (`omittedPages = emptyList()`).
+     * 2. Trims trailing References/Bibliography sections first when present.
+     * 3. If still over budget (or when no References heading exists), preserves high-value pages
+     *    across opening/Methods, Results/Figures/Tables, and Discussion/Conclusion while explicitly
+     *    disclosing every omitted page number—never falsely claiming full coverage.
      */
     internal fun prepareManuscriptForPrompt(
       raw: String,
@@ -1968,17 +2090,18 @@ class Reviewer2PipelineService {
     ): PromptPreparedManuscript {
       val clean = raw.trim()
       if (clean.length <= maxChars) {
-        return PromptPreparedManuscript(clean, wasTrimmed = false, trimmedNote = "")
+        return PromptPreparedManuscript(clean, wasTrimmed = false, trimmedNote = "", omittedPages = emptyList())
       }
 
-      // First try trimming only the trailing References/Bibliography section (systematic reviews often have large bibliographies starting around 40-60%)
+      // 1. Try trimming only the trailing References/Bibliography section first
       val refHeaderRegex = Regex("""(?im)^\s*(?:references|bibliography|works\s+cited)\s*$""")
       val refMatch = refHeaderRegex.findAll(clean).lastOrNull { it.range.first >= (clean.length * 0.35).toInt() }
       if (refMatch != null) {
         val bodyPart = clean.substring(0, refMatch.range.first).trimEnd()
         val refPart = clean.substring(refMatch.range.first)
         if (bodyPart.length <= maxChars - 300) {
-          val remainingForRefs = (maxChars - bodyPart.length - 160).coerceAtLeast(0)
+          val remainingForRefs = (maxChars - bodyPart.length - 180).coerceAtLeast(0)
+          val omittedRefPages = extractPageBlocks(refPart.drop(remainingForRefs)).map { it.first }
           val assembled = buildString {
             append(bodyPart)
             append("\n\n")
@@ -1989,21 +2112,140 @@ class Reviewer2PipelineService {
               append("[... References list omitted (${refPart.length} chars); full main body preserved ...]")
             }
           }
+          val note = if (omittedRefPages.isNotEmpty()) {
+            "Full main body preserved; trailing bibliography trimmed (omitted reference pages: ${omittedRefPages.joinToString(",") { "P$it" }})."
+          } else {
+            "Full main body preserved; trailing bibliography trimmed to fit prompt window."
+          }
           return PromptPreparedManuscript(
             text = assembled,
             wasTrimmed = true,
-            trimmedNote = "Full main body preserved; trailing bibliography trimmed to fit prompt window."
+            trimmedNote = note,
+            omittedPages = emptyList() // Main body pages intact; bibliography-only trim disclosed in trimmedNote
           )
         }
       }
 
-      val truncated = clean.take(maxChars - 160) +
-        "\n\n[... Tail of document truncated (${clean.length - (maxChars - 160)} chars) after preserving complete opening ${maxChars - 160} characters ...]"
+      // 2. Page-aware stratified retention when page markers exist (never silently drop Results/Discussion tail!)
+      val pageBlocks = extractPageBlocks(clean)
+      if (pageBlocks.size >= 3) {
+        val highSignalRegex = Regex(
+          """\b(?:results?|methods?|discussion|conclusion|table\s*\d+|figure\s*\d+|fig\.\s*\d+|95%\s*ci|meta-?analysis|meta-?regression|p\s*[=<>≤]|i²|i2)\b""",
+          RegexOption.IGNORE_CASE
+        )
+        // Prioritize Page 1, last body page, and high-signal Results/Tables/Figures pages
+        val scored = pageBlocks.mapIndexed { idx, (pageNum, body) ->
+          val signalHits = highSignalRegex.findAll(body).count()
+          val priority = when {
+            idx == 0 -> 10_000
+            idx == pageBlocks.lastIndex -> 5_000
+            idx == 1 -> 4_000
+            else -> signalHits * 100
+          }
+          Triple(pageNum, "[PAGE $pageNum]\n$body", priority)
+        }
+
+        val selectedPageNums = linkedSetOf<Int>()
+        var usedChars = 0
+        val budget = (maxChars - 240).coerceAtLeast(400)
+        for ((pageNum, formatted, _) in scored.sortedByDescending { it.third }) {
+          val len = formatted.length + 2
+          if (usedChars + len <= budget) {
+            selectedPageNums.add(pageNum)
+            usedChars += len
+          }
+        }
+        // Always include at least Page 1 truncated if even Page 1 alone exceeds budget
+        if (selectedPageNums.isEmpty()) {
+          val first = pageBlocks.first()
+          selectedPageNums.add(first.first)
+        }
+
+        val omitted = pageBlocks.map { it.first }.filter { it !in selectedPageNums }.sorted()
+        val orderedBody = pageBlocks
+          .filter { it.first in selectedPageNums }
+          .joinToString("\n\n") { (p, b) -> "[PAGE $p]\n$b" }
+          .take(budget)
+        val omittedSummary = omitted.joinToString(",") { "P$it" }
+        val assembled = "$orderedBody\n\n[... Partial coverage: page(s) $omittedSummary omitted to fit prompt window ...]"
+        return PromptPreparedManuscript(
+          text = assembled,
+          wasTrimmed = true,
+          trimmedNote = "Partial prompt coverage: page(s) $omittedSummary omitted (retained ${selectedPageNums.size}/${pageBlocks.size} pages across opening, results/figures, and closing sections).",
+          omittedPages = omitted
+        )
+      }
+
+      // 3. Unpaged fallback: preserve opening + closing rather than dropping Discussion/Conclusion blindly, and disclose exact omitted span
+      val headLen = ((maxChars - 240) * 0.72).toInt().coerceAtLeast(200)
+      val tailLen = (maxChars - 240 - headLen).coerceAtLeast(100)
+      val omittedCharCount = (clean.length - headLen - tailLen).coerceAtLeast(0)
+      val assembled = clean.take(headLen) +
+        "\n\n[... Unpaged document exceeded prompt budget: $omittedCharCount middle characters omitted between opening and closing sections ...]\n\n" +
+        clean.takeLast(tailLen)
       return PromptPreparedManuscript(
-        text = truncated,
+        text = assembled,
         wasTrimmed = true,
-        trimmedNote = "Document tail trimmed at %,d chars (no middle sections omitted).".format(Locale.US, maxChars)
+        trimmedNote = "Partial coverage: %,d unpaged characters omitted to fit %,d-char prompt window.".format(Locale.US, omittedCharCount, maxChars),
+        omittedPages = listOf(-1)
       )
+    }
+
+    internal fun computeCalibratedExtractionConfidence(
+      manuscriptText: String,
+      coverageReport: DocumentCoverageReport?,
+      omittedPromptPages: List<Int>,
+      wasPromptTrimmed: Boolean,
+      adjudicatedFindings: List<ReviewFinding>
+    ): Int {
+      var score = if (coverageReport != null) {
+        var c = coverageReport.extractionConfidence.coerceIn(1, 5)
+        if (coverageReport.omittedPages.isNotEmpty()) c = minOf(c, 3)
+        if (coverageReport.warnings.any { it.contains("scanned", ignoreCase = true) || it.contains("fallback", ignoreCase = true) }) {
+          c = minOf(c, 2)
+        }
+        c
+      } else {
+        // Direct text input without PDF parser provenance: inspect structural quality & integrity
+        val clean = manuscriptText.trim()
+        if (clean.length < 200) {
+          1
+        } else {
+          val replacementChars = clean.count { it == '\uFFFD' }
+          val controlGarbage = clean.count { it.code < 32 && it != '\n' && it != '\r' && it != '\t' }
+          val alphaNumCount = clean.count { it.isLetterOrDigit() }
+          val alphaRatio = alphaNumCount.toDouble() / clean.length.coerceAtLeast(1).toDouble()
+          val words = clean.split(Regex("""\s+""")).filter { it.isNotBlank() }
+          val hasPageAnchors = PAGE_BLOCK_HEADER_REGEX.containsMatchIn(clean)
+          val sentenceCount = clean.count { it == '.' || it == '?' || it == '!' }
+
+          when {
+            replacementChars > 5 || controlGarbage > 10 || alphaRatio < 0.55 || words.size < 40 -> 1
+            alphaRatio < 0.68 || sentenceCount < 4 -> 2
+            words.size < 250 -> 3
+            hasPageAnchors && words.size >= 500 -> 5
+            else -> 4 // Unanchored direct text without PDF page provenance caps at 4/5
+          }
+        }
+      }
+
+      if (omittedPromptPages.isNotEmpty()) {
+        score = minOf(score, 3)
+      } else if (wasPromptTrimmed && score == 5) {
+        score = 4
+      }
+
+      // If more than half of model-generated findings failed quote verification, cap extraction confidence at 3
+      val quoteChecked = adjudicatedFindings.filter { !it.id.startsWith("Q-") }
+      if (quoteChecked.size >= 3) {
+        val unverifiedOrMismatch = quoteChecked.count {
+          it.status == FindingStatus.UNVERIFIED || it.verificationNotes.contains("Page mismatch", ignoreCase = true)
+        }
+        if (unverifiedOrMismatch * 2 > quoteChecked.size) {
+          score = minOf(score, 3)
+        }
+      }
+      return score.coerceIn(1, 5)
     }
 
     internal fun extractRubricRationales(summary: String): Map<String, String> {
@@ -2076,56 +2318,165 @@ class Reviewer2PipelineService {
       }
     }
 
+    private fun normalizeForExactQuoteMatch(input: String): String {
+      return input
+        .lowercase(Locale.US)
+        .replace('–', '-')
+        .replace('—', '-')
+        .replace('−', '-')
+        .replace('“', '"')
+        .replace('”', '"')
+        .replace('’', '\'')
+        .replace('‘', '\'')
+        .replace(Regex("""\s+"""), " ")
+        .trim()
+    }
+
     /**
-     * Verifies whether a cited quote genuinely appears in [manuscriptText] using normalized
-     * substring matching or ≥60% content-token overlap, preventing hallucinated VERIFIED claims.
+     * Strict source-quote grounding verifier:
+     * - [QuoteMatchKind.EXACT]: requires a contiguous normalized substring match in [manuscriptText],
+     *   records offsets and occurrence count, and checks whether [claimedPage] matches the actual page.
+     * - [QuoteMatchKind.FUZZY_LOCALIZED]: allows ≥65% content-token overlap ONLY within a contiguous
+     *   500-char window (never scattered across unrelated pages). Strictly maps to PARTIALLY_SUPPORTED,
+     *   NEVER VERIFIED.
+     * - [QuoteMatchKind.NONE]: maps to UNVERIFIED.
      */
-    internal fun verifyQuoteInManuscript(quote: String, manuscriptText: String): Pair<Boolean, Int> {
+    internal fun verifyQuoteInManuscript(
+      quote: String,
+      manuscriptText: String,
+      claimedPage: Int = 0
+    ): QuoteVerificationResult {
       val cleanQuote = quote.trim().trim('"', '“', '”', '\'')
-      if (cleanQuote.length < 8 || manuscriptText.isBlank()) return false to 0
-
-      val normDoc = manuscriptText.lowercase(Locale.US).replace(Regex("""\s+"""), " ")
-      val normQuote = cleanQuote.lowercase(Locale.US).replace(Regex("""\s+"""), " ")
-
-      val exactIdx = normDoc.indexOf(normQuote)
-      if (exactIdx >= 0) {
-        val rawIdx = approximateOffsetInRaw(manuscriptText, cleanQuote.take(24))
-        val page = QuantitativeForensicAnalyzer.resolvePageNumberAtOffset(manuscriptText, rawIdx)
-        return true to page
+      if (cleanQuote.length < 8 || manuscriptText.isBlank()) {
+        return QuoteVerificationResult(QuoteMatchKind.NONE, resolvedPage = 0)
       }
 
-      // Relaxed token-overlap check (handles OCR hyphens, Unicode minus vs ASCII dash, minor spacing)
-      val stopWords = setOf("the", "and", "for", "with", "that", "this", "from", "were", "was", "are", "not", "but", "into", "their", "have", "has", "also")
+      val normQuote = normalizeForExactQuoteMatch(cleanQuote)
+      // Build a character-index mapping from normalized text back to raw text offsets
+      val normBuilder = StringBuilder(manuscriptText.length)
+      val normToRawIdx = IntArray(manuscriptText.length + 1)
+      var prevSpace = true
+      for (i in manuscriptText.indices) {
+        val rawCh = manuscriptText[i]
+        val mapped = when (rawCh) {
+          '–', '—', '−' -> '-'
+          '“', '”' -> '"'
+          '’', '‘' -> '\''
+          else -> rawCh.lowercaseChar()
+        }
+        if (mapped.isWhitespace()) {
+          if (!prevSpace) {
+            normToRawIdx[normBuilder.length] = i
+            normBuilder.append(' ')
+            prevSpace = true
+          }
+        } else {
+          normToRawIdx[normBuilder.length] = i
+          normBuilder.append(mapped)
+          prevSpace = false
+        }
+      }
+      val normDoc = normBuilder.toString().trimEnd()
+
+      // 1. Exact contiguous normalized match (find all occurrences to respect page match & uniqueness)
+      val exactMatches = mutableListOf<Triple<Int, Int, Int>>() // (rawStart, rawEnd, page)
+      var searchFrom = 0
+      while (searchFrom < normDoc.length) {
+        val idx = normDoc.indexOf(normQuote, searchFrom)
+        if (idx < 0) break
+        val rawStart = normToRawIdx[idx]
+        val endNormPos = (idx + normQuote.length - 1).coerceAtMost(normDoc.length - 1)
+        val rawEnd = (normToRawIdx[endNormPos] + 1).coerceAtMost(manuscriptText.length)
+        val page = QuantitativeForensicAnalyzer.resolvePageNumberAtOffset(manuscriptText, rawStart)
+        exactMatches.add(Triple(rawStart, rawEnd, page))
+        searchFrom = idx + 1
+      }
+
+      if (exactMatches.isNotEmpty()) {
+        val preferred = if (claimedPage > 0) {
+          exactMatches.firstOrNull { it.third == claimedPage } ?: exactMatches.first()
+        } else {
+          exactMatches.first()
+        }
+        val pageMismatch = if (claimedPage > 0 && preferred.third > 0 && preferred.third != claimedPage) {
+          "Page mismatch: finding cited Page $claimedPage, but exact quote appears on Page ${preferred.third}."
+        } else {
+          null
+        }
+        return QuoteVerificationResult(
+          matchKind = QuoteMatchKind.EXACT,
+          resolvedPage = preferred.third,
+          startOffset = preferred.first,
+          endOffset = preferred.second,
+          occurrenceCount = exactMatches.size,
+          pageMismatchWarning = pageMismatch
+        )
+      }
+
+      // 2. Localized sliding-window fuzzy token overlap (strictly PARTIALLY_SUPPORTED, never VERIFIED)
+      val stopWords = setOf(
+        "the", "and", "for", "with", "that", "this", "from", "were", "was",
+        "are", "not", "but", "into", "their", "have", "has", "also", "which", "these"
+      )
       val quoteTokens = normQuote.split(Regex("""[^a-z0-9.²]+"""))
         .filter { it.length >= 3 && it !in stopWords }
         .distinct()
-      if (quoteTokens.size < 2) return false to 0
-
-      val matchedTokens = quoteTokens.count { tok -> normDoc.contains(tok) }
-      val ratio = matchedTokens.toDouble() / quoteTokens.size.toDouble()
-      if (ratio >= 0.62) {
-        val anchorTok = quoteTokens.maxByOrNull { it.length } ?: ""
-        val rawIdx = manuscriptText.indexOf(anchorTok, ignoreCase = true).coerceAtLeast(0)
-        val page = QuantitativeForensicAnalyzer.resolvePageNumberAtOffset(manuscriptText, rawIdx)
-        return true to page
+      if (quoteTokens.size < 3) {
+        return QuoteVerificationResult(QuoteMatchKind.NONE, resolvedPage = 0)
       }
-      return false to 0
-    }
 
-    private fun approximateOffsetInRaw(raw: String, prefix: String): Int {
-      if (prefix.isBlank()) return 0
-      val direct = raw.indexOf(prefix, ignoreCase = true)
-      if (direct >= 0) return direct
-      val firstWord = prefix.split(Regex("""\s+""")).firstOrNull { it.length >= 4 } ?: return 0
-      return raw.indexOf(firstWord, ignoreCase = true).coerceAtLeast(0)
+      val windowSize = (normQuote.length * 2).coerceIn(220, 520)
+      val step = 100
+      var bestRatio = 0.0
+      var bestNormStart = -1
+      var pos = 0
+      while (pos < normDoc.length) {
+        val winEnd = (pos + windowSize).coerceAtMost(normDoc.length)
+        val window = normDoc.substring(pos, winEnd)
+        val hits = quoteTokens.count { tok -> window.contains(tok) }
+        val ratio = hits.toDouble() / quoteTokens.size.toDouble()
+        if (ratio > bestRatio) {
+          bestRatio = ratio
+          bestNormStart = pos
+        }
+        if (winEnd == normDoc.length) break
+        pos += step
+      }
+
+      if (bestRatio >= 0.65 && bestNormStart >= 0) {
+        val rawStart = normToRawIdx[bestNormStart]
+        val rawEnd = (rawStart + windowSize).coerceAtMost(manuscriptText.length)
+        val resolvedPage = QuantitativeForensicAnalyzer.resolvePageNumberAtOffset(manuscriptText, rawStart)
+        val pageMismatch = if (claimedPage > 0 && resolvedPage > 0 && resolvedPage != claimedPage) {
+          "Page mismatch: cited Page $claimedPage, closest partial match near Page $resolvedPage."
+        } else {
+          null
+        }
+        return QuoteVerificationResult(
+          matchKind = QuoteMatchKind.FUZZY_LOCALIZED,
+          resolvedPage = resolvedPage,
+          startOffset = rawStart,
+          endOffset = rawEnd,
+          occurrenceCount = 1,
+          pageMismatchWarning = pageMismatch
+        )
+      }
+
+      return QuoteVerificationResult(QuoteMatchKind.NONE, resolvedPage = 0)
     }
 
     /**
      * Cross-Pass Adjudicator:
-     * 1. Verifies every LLM finding's supporting quote against the actual source text (downgrading ungrounded VERIFIED claims to UNVERIFIED).
-     * 2. Rejects false absence claims (e.g., claiming random-effects meta-analysis, I², meta-regression, or independent extraction is absent when explicit counterevidence exists in the text).
-     * 3. Injects confirmed deterministic QuantitativeForensicAnalyzer FAIL discrepancies (e.g., impossible CI bounds cross-referenced with Figures) as VERIFIED findings.
-     * 4. Reconciles the headline credibilityScore strictly to PaperReviewRubric.computeWeightedScore(...) and aligns the verdict to [reviewMode].
+     * 1. Rejects false absence claims with counter-evidence snippets.
+     * 2. Enforces strict exact-quote grounding for VERIFIED status; fuzzy localized matches or
+     *    page-mismatched quotes are strictly downgraded to PARTIALLY_SUPPORTED with explicit warnings;
+     *    ungrounded quotes become UNVERIFIED.
+     * 3. Injects deterministic QuantitativeForensicAnalyzer FAIL discrepancies framed carefully as
+     *    "Deterministic Discrepancy Requiring Source Reconciliation" (VERIFIED only when exact-grounded
+     *    and corroborated by an internal cross-reference discrepancy under high extraction confidence;
+     *    otherwise PARTIALLY_SUPPORTED pending table/figure/supplement reconciliation).
+     * 4. Reconciles credibilityScore strictly to PaperReviewRubric.computeWeightedScore(...) and
+     *    derives the final verdict exclusively from score bands, verified critical errors, and mode rules.
      */
     internal fun adjudicateFindingsAndScores(
       rawFindings: List<ReviewFinding>,
@@ -2138,7 +2489,8 @@ class Reviewer2PipelineService {
       mathRigorScore: Int,
       reproducibilityScore: Int,
       rawVerdict: String,
-      reviewMode: ReviewMode
+      reviewMode: ReviewMode,
+      extractionConfidence: Int = 5
     ): AdjudicationResult {
       val absenceCounterChecks = listOf(
         Triple(
@@ -2186,7 +2538,9 @@ class Reviewer2PipelineService {
                 EvidenceAnchor(
                   pageNumber = counterPage,
                   section = if (counterPage > 0) "Page $counterPage" else "Manuscript text",
-                  exactQuote = snippet
+                  exactQuote = snippet,
+                  startOffset = snippetStart,
+                  endOffset = snippetEnd
                 )
               )
               updatedStatus = FindingStatus.CONTRADICTED
@@ -2196,20 +2550,52 @@ class Reviewer2PipelineService {
           }
         }
 
-        // 2. Verify supporting quote grounding for any finding still marked VERIFIED
-        if (updatedStatus == FindingStatus.VERIFIED) {
+        // 2. Strict exact vs. fuzzy quote grounding for any finding claiming VERIFIED or PARTIALLY_SUPPORTED
+        if (updatedStatus == FindingStatus.VERIFIED || updatedStatus == FindingStatus.PARTIALLY_SUPPORTED) {
           val primaryAnchor = updatedSupporting.firstOrNull()
           val quote = primaryAnchor?.exactQuote.orEmpty()
+          val claimedPage = primaryAnchor?.pageNumber ?: 0
           if (quote.isBlank()) {
             updatedStatus = FindingStatus.UNVERIFIED
-            notes.add("Downgraded from VERIFIED: no verbatim manuscript quote provided.")
+            notes.add("Downgraded: no verbatim manuscript quote provided.")
           } else {
-            val (matched, resolvedPage) = verifyQuoteInManuscript(quote, manuscriptText)
-            if (!matched) {
-              updatedStatus = FindingStatus.UNVERIFIED
-              notes.add("Downgraded from VERIFIED: cited quote could not be verified in extracted source text.")
-            } else if (primaryAnchor != null && primaryAnchor.pageNumber == 0 && resolvedPage > 0) {
-              updatedSupporting = listOf(primaryAnchor.copy(pageNumber = resolvedPage)) + updatedSupporting.drop(1)
+            val verification = verifyQuoteInManuscript(
+              quote = quote,
+              manuscriptText = manuscriptText,
+              claimedPage = claimedPage
+            )
+            when (verification.matchKind) {
+              QuoteMatchKind.EXACT -> {
+                if (primaryAnchor != null) {
+                  val correctedAnchor = primaryAnchor.copy(
+                    pageNumber = if (verification.resolvedPage > 0) verification.resolvedPage else primaryAnchor.pageNumber,
+                    startOffset = verification.startOffset,
+                    endOffset = verification.endOffset
+                  )
+                  updatedSupporting = listOf(correctedAnchor) + updatedSupporting.drop(1)
+                }
+                if (verification.pageMismatchWarning != null) {
+                  updatedStatus = FindingStatus.PARTIALLY_SUPPORTED
+                  notes.add(verification.pageMismatchWarning)
+                }
+              }
+              QuoteMatchKind.FUZZY_LOCALIZED -> {
+                updatedStatus = FindingStatus.PARTIALLY_SUPPORTED
+                if (primaryAnchor != null) {
+                  val correctedAnchor = primaryAnchor.copy(
+                    pageNumber = if (verification.resolvedPage > 0) verification.resolvedPage else primaryAnchor.pageNumber,
+                    startOffset = verification.startOffset,
+                    endOffset = verification.endOffset
+                  )
+                  updatedSupporting = listOf(correctedAnchor) + updatedSupporting.drop(1)
+                }
+                val mismatchSuffix = verification.pageMismatchWarning?.let { " $it" }.orEmpty()
+                notes.add("Downgraded from VERIFIED to PARTIALLY SUPPORTED: quote is paraphrased/composite rather than verbatim.$mismatchSuffix")
+              }
+              QuoteMatchKind.NONE -> {
+                updatedStatus = FindingStatus.UNVERIFIED
+                notes.add("Downgraded to UNVERIFIED: cited quote was not found in extracted source text.")
+              }
             }
           }
         }
@@ -2222,7 +2608,7 @@ class Reviewer2PipelineService {
         )
       }.toMutableList()
 
-      // 3. Auto-inject deterministic QuantitativeForensicAnalyzer confirmed FAIL findings (e.g., impossible CI)
+      // 3. Auto-inject deterministic QuantitativeForensicAnalyzer FAIL findings with careful epistemic status
       if (forensicReport != null) {
         var nextQuantIdx = 1
         forensicReport.quantForensics.confidenceIntervalChecks
@@ -2234,30 +2620,48 @@ class Reviewer2PipelineService {
                   existing.supportingEvidence.any { it.pageNumber == ci.pageNumber && ci.pageNumber > 0 })
             }
             if (!alreadyCovered) {
+              val hasCrossRefCorroboration = ci.crossReferenceNote.isNotBlank()
+              val quoteCheck = verifyQuoteInManuscript(ci.rawClaim, manuscriptText, ci.pageNumber)
+              val isCorroboratedVerified = hasCrossRefCorroboration &&
+                quoteCheck.matchKind == QuoteMatchKind.EXACT &&
+                extractionConfidence >= 4
+              val deterministicStatus = if (isCorroboratedVerified) {
+                FindingStatus.VERIFIED
+              } else {
+                FindingStatus.PARTIALLY_SUPPORTED
+              }
               val detail = buildString {
                 append(ci.note)
-                if (ci.crossReferenceNote.isNotBlank()) {
-                  append(" Cross-reference: ${ci.crossReferenceNote}")
+                if (hasCrossRefCorroboration) {
+                  append(" Internal cross-reference discrepancy: ${ci.crossReferenceNote}")
+                } else {
+                  append(" Deterministic discrepancy requiring source reconciliation against primary tables, figures, units/transformations, and supplementary files.")
                 }
               }
               verifiedFindings.add(
                 0,
                 ReviewFinding(
                   id = "Q-0$nextQuantIdx",
-                  title = "Mathematically Impossible Confidence Interval (${ci.rawClaim})",
+                  title = "Deterministic CI Discrepancy Requiring Source Reconciliation (${ci.rawClaim})",
                   allegation = detail,
                   severity = "CRITICAL",
-                  status = FindingStatus.VERIFIED,
+                  status = deterministicStatus,
                   supportingEvidence = listOf(
                     EvidenceAnchor(
                       pageNumber = ci.pageNumber,
                       section = if (ci.pageNumber > 0) "Page ${ci.pageNumber}" else "Results",
-                      exactQuote = ci.rawClaim
+                      exactQuote = ci.rawClaim,
+                      startOffset = quoteCheck.startOffset,
+                      endOffset = quoteCheck.endOffset
                     )
                   ),
-                  methodologicalJustification = "A point estimate must lie strictly within its reported 95% confidence interval [lower, upper]. An out-of-bounds CI indicates a reporting error, unit/scale mismatch, or transcription error.",
-                  recommendedCorrection = "Verify raw pooled estimate and confidence bounds against primary tables/figures and issue a numerical correction or erratum.",
-                  verificationNotes = "Verified deterministically by Paper Critic CI Geometry Engine."
+                  methodologicalJustification = "A point estimate must lie within its 95% confidence interval [lower, upper]. Potential causes include a narrative transcription typo, unit/scale transformation mismatch, duplicate outcome mapping, or PDF extraction/OCR artifact.",
+                  recommendedCorrection = "Reconcile the reported narrative estimate and CI directly against primary tables, forest plots/figures, and supplementary spreadsheets; issue a numerical erratum if confirmed in the published source.",
+                  verificationNotes = if (isCorroboratedVerified) {
+                    "Deterministic CI check confirmed via exact text match and corroborated by conflicting Figure/Table bounds."
+                  } else {
+                    "Deterministic discrepancy requiring manual reconciliation against original tables, figures, and supplements (uncorroborated by cross-reference or degraded extraction confidence)."
+                  }
                 )
               )
               nextQuantIdx++
@@ -2270,24 +2674,27 @@ class Reviewer2PipelineService {
           .forEach { st ->
             val alreadyCovered = verifiedFindings.any { it.allegation.contains(st.rawClaim.take(16), ignoreCase = true) }
             if (!alreadyCovered) {
+              val quoteCheck = verifyQuoteInManuscript(st.rawClaim, manuscriptText, st.pageNumber)
               verifiedFindings.add(
                 0,
                 ReviewFinding(
                   id = "Q-0$nextQuantIdx",
-                  title = "Statcheck p-Value Discrepancy (${st.rawClaim})",
-                  allegation = "${st.note} (Recomputed two-tailed p = ${String.format(Locale.US, "%.4f", st.recomputedP)}).",
+                  title = "Deterministic Statcheck Discrepancy Requiring Reconciliation (${st.rawClaim})",
+                  allegation = "${st.note} (Recomputed two-tailed p = ${String.format(Locale.US, "%.4f", st.recomputedP)}). Requires verification for one-tailed testing, rounding, corrections, or transcription errors.",
                   severity = "CRITICAL",
-                  status = FindingStatus.VERIFIED,
+                  status = FindingStatus.PARTIALLY_SUPPORTED,
                   supportingEvidence = listOf(
                     EvidenceAnchor(
                       pageNumber = st.pageNumber,
                       section = if (st.pageNumber > 0) "Page ${st.pageNumber}" else "Statistical Results",
-                      exactQuote = st.rawClaim
+                      exactQuote = st.rawClaim,
+                      startOffset = quoteCheck.startOffset,
+                      endOffset = quoteCheck.endOffset
                     )
                   ),
-                  methodologicalJustification = "Exact test-statistic recomputation disagrees with the reported significance threshold.",
-                  recommendedCorrection = "Recompute test statistic, degrees of freedom, and exact two-tailed p-value from primary data.",
-                  verificationNotes = "Verified deterministically by Paper Critic Statcheck Engine."
+                  methodologicalJustification = "Exact two-tailed test-statistic recomputation disagrees with the reported p-value threshold; alternative explanations include one-tailed testing, multiple-comparison adjustment, rounding, or transcription/extraction errors.",
+                  recommendedCorrection = "Reconcile test statistic, degrees of freedom, tail direction, and exact p-value against primary tables and statistical output.",
+                  verificationNotes = "Deterministic discrepancy requiring source reconciliation against tables, supplements, and test specification."
                 )
               )
               nextQuantIdx++
@@ -2334,54 +2741,39 @@ class Reviewer2PipelineService {
       )
     }
 
+    /**
+     * Derives the final appraisal verdict strictly from authoritative score bands, verified
+     * critical findings, and [reviewMode] rules. Any model-supplied [rawVerdict] is strictly
+     * advisory and can NEVER override score-band consistency (e.g., a score of 45 can never
+     * receive HIGH_CREDIBILITY, ACCEPT, or HIGH_CERTAINTY).
+     */
     internal fun resolveVerdictForMode(
       rawVerdict: String,
       compositeScore: Int,
       reviewMode: ReviewMode,
       hasVerifiedCriticalError: Boolean = false
     ): String {
-      val upper = rawVerdict.trim().uppercase(Locale.US)
+      val clamped = compositeScore.coerceIn(0, 100)
       return when (reviewMode) {
-        ReviewMode.POST_PUBLICATION_APPRAISAL -> {
-          val allowed = setOf("HIGH_CREDIBILITY", "SOUND_WITH_CAVEATS", "REQUIRES_CORRECTION", "MAJOR_CONCERNS", "LOW_CREDIBILITY")
-          if (upper in allowed && !(hasVerifiedCriticalError && upper == "HIGH_CREDIBILITY")) {
-            upper
-          } else {
-            when {
-              compositeScore >= 85 && !hasVerifiedCriticalError -> "HIGH_CREDIBILITY"
-              compositeScore >= 70 && !hasVerifiedCriticalError -> "SOUND_WITH_CAVEATS"
-              compositeScore >= 55 || hasVerifiedCriticalError -> "REQUIRES_CORRECTION"
-              compositeScore >= 40 -> "MAJOR_CONCERNS"
-              else -> "LOW_CREDIBILITY"
-            }
-          }
+        ReviewMode.POST_PUBLICATION_APPRAISAL -> when {
+          clamped >= 85 && !hasVerifiedCriticalError -> "HIGH_CREDIBILITY"
+          clamped >= 70 && !hasVerifiedCriticalError -> "SOUND_WITH_CAVEATS"
+          clamped >= 55 || (clamped >= 40 && hasVerifiedCriticalError) -> "REQUIRES_CORRECTION"
+          clamped >= 40 -> "MAJOR_CONCERNS"
+          else -> "LOW_CREDIBILITY"
         }
-        ReviewMode.CLINICAL_EVIDENCE_APPRAISAL -> {
-          val allowed = setOf("HIGH_CERTAINTY", "MODERATE_CERTAINTY", "LOW_CERTAINTY", "VERY_LOW_CERTAINTY")
-          if (upper in allowed && !(hasVerifiedCriticalError && upper == "HIGH_CERTAINTY")) {
-            upper
-          } else {
-            when {
-              compositeScore >= 85 && !hasVerifiedCriticalError -> "HIGH_CERTAINTY"
-              compositeScore >= 68 -> "MODERATE_CERTAINTY"
-              compositeScore >= 48 -> "LOW_CERTAINTY"
-              else -> "VERY_LOW_CERTAINTY"
-            }
-          }
+        ReviewMode.CLINICAL_EVIDENCE_APPRAISAL -> when {
+          clamped >= 85 && !hasVerifiedCriticalError -> "HIGH_CERTAINTY"
+          clamped >= 68 && !hasVerifiedCriticalError -> "MODERATE_CERTAINTY"
+          clamped >= 48 -> "LOW_CERTAINTY"
+          else -> "VERY_LOW_CERTAINTY"
         }
-        ReviewMode.JOURNAL_REFEREE -> {
-          val allowed = setOf("ACCEPT", "MINOR_REVISION", "MAJOR_REVISION", "REJECT_AND_RESUBMIT", "REJECT")
-          if (upper in allowed && !(hasVerifiedCriticalError && upper == "ACCEPT")) {
-            upper
-          } else {
-            when {
-              compositeScore >= 85 && !hasVerifiedCriticalError -> "ACCEPT"
-              compositeScore >= 72 && !hasVerifiedCriticalError -> "MINOR_REVISION"
-              compositeScore >= 55 -> "MAJOR_REVISION"
-              compositeScore >= 40 -> "REJECT_AND_RESUBMIT"
-              else -> "REJECT"
-            }
-          }
+        ReviewMode.JOURNAL_REFEREE -> when {
+          clamped >= 85 && !hasVerifiedCriticalError -> "ACCEPT"
+          clamped >= 72 && !hasVerifiedCriticalError -> "MINOR_REVISION"
+          clamped >= 55 || (clamped >= 45 && hasVerifiedCriticalError) -> "MAJOR_REVISION"
+          clamped >= 40 -> "REJECT_AND_RESUBMIT"
+          else -> "REJECT"
         }
       }
     }

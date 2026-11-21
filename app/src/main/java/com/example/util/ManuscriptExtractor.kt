@@ -45,6 +45,7 @@ data class DocumentCoverageReport(
   val totalChars: Int,
   val totalWords: Int,
   val lowTextPages: List<Int> = emptyList(),
+  val omittedPages: List<Int> = emptyList(),
   val visionPagesAttached: Int = 0,
   val visionPageNumbers: List<Int> = emptyList(),
   val extractionEngine: String = "PDFBox-Android",
@@ -52,7 +53,7 @@ data class DocumentCoverageReport(
   val warnings: List<String> = emptyList()
 ) {
   val isHighCoverage: Boolean
-    get() = extractionConfidence >= 4 && warnings.isEmpty()
+    get() = extractionConfidence >= 4 && warnings.isEmpty() && omittedPages.isEmpty()
 
   fun toDisclosureLine(): String = buildString {
     append("$extractedPages/$totalPages page(s) extracted")
@@ -64,6 +65,9 @@ data class DocumentCoverageReport(
     }
     append(" • Engine: $extractionEngine")
     append(" • Extraction Confidence: $extractionConfidence/5")
+    if (omittedPages.isNotEmpty()) {
+      append(" • Omitted pages: ${omittedPages.joinToString(",") { "P$it" }}")
+    }
     if (lowTextPages.isNotEmpty()) {
       append(" • Low-text/figure pages: ${lowTextPages.joinToString(",") { "P$it" }}")
     }
@@ -96,8 +100,8 @@ data class ExtractedManuscriptFile(
 
 object ManuscriptExtractor {
 
-  private const val MAX_PDF_INPUT_BYTES = 25_000_000 // 25 MB full journal articles & supplements
-  private const val MAX_EXTRACTED_CHARS = 250_000
+  private const val MAX_PDF_INPUT_BYTES = 40_000_000 // 40 MB full journal articles & supplements
+  private const val MAX_EXTRACTED_CHARS = 400_000
   private const val MAX_VISION_PAGES = 6
 
   @Volatile
@@ -361,16 +365,151 @@ object ManuscriptExtractor {
       readBytesBounded(it, MAX_PDF_INPUT_BYTES)
     } ?: ByteArray(0)
 
+    val byteExtraction = extractPdfPagesFromBytes(
+      rawBytes = rawBytes,
+      fileName = fileName,
+      maxChars = MAX_EXTRACTED_CHARS
+    )
+    val extractedPages = byteExtraction.extractedPages
+    val warnings = byteExtraction.warnings.toMutableList()
+    var totalPageCount = byteExtraction.totalPageCount
+    var extractionEngine = byteExtraction.extractionEngine
+    val omittedPages = byteExtraction.omittedPages.toMutableList()
+
+    if (rawBytes.size >= MAX_PDF_INPUT_BYTES) {
+      warnings.add("PDF exceeded 40 MB input ceiling; trailing bytes were not read.")
+    }
+
+    // 2. Smart visual page rendering via Android PdfRenderer:
+    //    Prioritize Page 1 (title/abstract) + pages containing Figures/Tables/Results + low-text-density pages
+    //    (up to MAX_VISION_PAGES = 6) so charts like Figure 2 on Page 9 are inspected visually!
+    val renderedPages = mutableListOf<Bitmap>()
+    val renderedPageNumbers = mutableListOf<Int>()
+
+    runCatching {
+      context.contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
+        PdfRenderer(pfd).use { renderer ->
+          totalPageCount = maxOf(totalPageCount, renderer.pageCount.coerceAtLeast(1))
+          if (renderPdfBitmaps) {
+            val targetPageIndices = selectHighValueVisionPages(
+              totalPages = renderer.pageCount,
+              extractedPages = extractedPages,
+              maxPages = MAX_VISION_PAGES
+            )
+            for (pageIdx in targetPageIndices) {
+              renderer.openPage(pageIdx).use { page ->
+                val targetWidth = 900
+                val scale = targetWidth.toFloat() / page.width.coerceAtLeast(1)
+                val targetHeight = (page.height * scale).toInt().coerceIn(420, 1450)
+                val bitmap = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
+                bitmap.eraseColor(Color.WHITE)
+                page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                renderedPages.add(bitmap)
+                renderedPageNumbers.add(pageIdx + 1)
+              }
+            }
+          }
+        }
+      }
+    }.onFailure { err ->
+      Log.w(EXTRACTOR_TAG, "PdfRenderer failed for $fileName", err)
+      warnings.add("Visual page renderer unavailable for this PDF; figure graphics could not be visually inspected.")
+    }
+
+    val lowTextPageNums = extractedPages.filter { it.hasLowTextDensity }.map { it.pageNumber }
+    val extractedNonEmptyCount = extractedPages.count { it.wordCount >= 10 && it.pageNumber !in omittedPages }
+
+    val finalText = if (byteExtraction.isScannedVisionOnly) {
+      extractionEngine = "Vision-Only PDF (Scanned / Image-Based)"
+      warnings.removeAll { it.contains("No embedded text layer", ignoreCase = true) }
+      warnings.add("No embedded text layer detected (scanned PDF). Analysis relies on ${renderedPages.size} rendered page image(s).")
+      "PDF MANUSCRIPT (SCANNED / IMAGE-BASED): $fileName ($totalPageCount pages, ${renderedPages.size} page visuals attached).\n" +
+        "Inferred Title: ${cleanBaseTitle(fileName)}"
+    } else {
+      byteExtraction.extractedText
+    }
+
+    if (lowTextPageNums.isNotEmpty() && lowTextPageNums.size < totalPageCount) {
+      val uninspectedLowText = lowTextPageNums.filter { it !in renderedPageNumbers }
+      if (uninspectedLowText.isNotEmpty()) {
+        warnings.add("Low-text / graphic-heavy page(s) ${uninspectedLowText.joinToString(",") { "P$it" }} were not visually rendered.")
+      }
+    }
+
+    val totalWords = countWords(finalText)
+    val extractionConfidence = computePdfExtractionConfidence(
+      totalPages = totalPageCount,
+      extractedNonEmptyPages = extractedNonEmptyCount,
+      totalWords = totalWords,
+      isPdfBoxUsed = byteExtraction.pdfBoxSucceeded,
+      warningCount = warnings.size + if (omittedPages.isNotEmpty()) 1 else 0
+    )
+
+    val coverage = DocumentCoverageReport(
+      totalPages = totalPageCount,
+      extractedPages = if (extractedPages.isNotEmpty()) extractedNonEmptyCount else if (totalWords > 80) totalPageCount else 0,
+      totalChars = finalText.length,
+      totalWords = totalWords,
+      lowTextPages = lowTextPageNums,
+      omittedPages = omittedPages.distinct().sorted(),
+      visionPagesAttached = renderedPages.size,
+      visionPageNumbers = renderedPageNumbers,
+      extractionEngine = extractionEngine,
+      extractionConfidence = extractionConfidence,
+      warnings = warnings.distinct()
+    )
+
+    val inferredTitle = inferTitleFromFirstPage(extractedPages.firstOrNull()?.text.orEmpty(), fileName)
+
+    val notice = if (warnings.isEmpty() && omittedPages.isEmpty()) {
+      "Extracted $totalPageCount/$totalPageCount pages (%,d words, ${renderedPages.size} visual page(s)) via PDFBox".format(Locale.US, totalWords)
+    } else {
+      val primaryNote = warnings.firstOrNull()
+        ?: "Omitted pages: ${omittedPages.joinToString(",") { "P$it" }}"
+      "Imported PDF ($totalPageCount pages, %,d words • Coverage ${extractionConfidence}/5 — $primaryNote)".format(Locale.US, totalWords)
+    }
+
+    return ExtractedManuscriptFile(
+      fileName = fileName,
+      format = ManuscriptInputFormat.PDF,
+      inferredTitle = inferredTitle,
+      pageCount = totalPageCount,
+      wordCount = totalWords,
+      extractedText = finalText,
+      pages = extractedPages,
+      pdfPageBitmaps = renderedPages,
+      visionPageNumbers = renderedPageNumbers,
+      coverageReport = coverage,
+      summaryNotice = notice
+    )
+  }
+
+  internal data class PdfByteExtractionResult(
+    val extractedText: String,
+    val extractedPages: List<ExtractedPage>,
+    val totalPageCount: Int,
+    val omittedPages: List<Int>,
+    val extractionEngine: String,
+    val pdfBoxSucceeded: Boolean,
+    val isScannedVisionOnly: Boolean,
+    val warnings: List<String>
+  )
+
+  /**
+   * Pure byte-level Apache PDFBox extraction with page-anchored assembly and explicit omitted-page
+   * tracking (usable directly in unit/Robolectric tests with real PDFBox PDF fixtures).
+   */
+  internal fun extractPdfPagesFromBytes(
+    rawBytes: ByteArray,
+    fileName: String,
+    maxChars: Int = MAX_EXTRACTED_CHARS
+  ): PdfByteExtractionResult {
     val extractedPages = mutableListOf<ExtractedPage>()
     val warnings = mutableListOf<String>()
+    val omittedPages = mutableListOf<Int>()
     var totalPageCount = 1
     var extractionEngine = "PDFBox-Android (Full ToUnicode)"
 
-    if (rawBytes.size >= MAX_PDF_INPUT_BYTES) {
-      warnings.add("PDF exceeded 25 MB safety limit; document may be partially read.")
-    }
-
-    // 1. Primary extraction via Apache PDFBox Android — page by page with spatial reading order
     val pdfBoxResult = runCatching {
       PDDocument.load(rawBytes).use { doc ->
         totalPageCount = doc.numberOfPages.coerceAtLeast(1)
@@ -416,125 +555,58 @@ object ManuscriptExtractor {
       )
     }
 
-    // 2. Smart visual page rendering via Android PdfRenderer:
-    //    Prioritize Page 1 (title/abstract) + pages containing Figures/Tables/Results + low-text-density pages
-    //    (up to MAX_VISION_PAGES = 6) so charts like Figure 2 on Page 9 are inspected visually!
-    val renderedPages = mutableListOf<Bitmap>()
-    val renderedPageNumbers = mutableListOf<Int>()
-
-    runCatching {
-      context.contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
-        PdfRenderer(pfd).use { renderer ->
-          totalPageCount = maxOf(totalPageCount, renderer.pageCount.coerceAtLeast(1))
-          if (renderPdfBitmaps) {
-            val targetPageIndices = selectHighValueVisionPages(
-              totalPages = renderer.pageCount,
-              extractedPages = extractedPages,
-              maxPages = MAX_VISION_PAGES
-            )
-            for (pageIdx in targetPageIndices) {
-              renderer.openPage(pageIdx).use { page ->
-                val targetWidth = 900
-                val scale = targetWidth.toFloat() / page.width.coerceAtLeast(1)
-                val targetHeight = (page.height * scale).toInt().coerceIn(420, 1450)
-                val bitmap = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
-                bitmap.eraseColor(Color.WHITE)
-                page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-                renderedPages.add(bitmap)
-                renderedPageNumbers.add(pageIdx + 1)
-              }
-            }
-          }
-        }
+    // Page-aware assembly: track exact pages omitted if a massive document exceeds maxChars
+    val assembledBuilder = StringBuilder()
+    var hasReachedCeiling = false
+    for (pg in extractedPages) {
+      if (pg.text.isBlank()) continue
+      val block = "[PAGE ${pg.pageNumber}]\n${pg.text}\n\n"
+      if (!hasReachedCeiling && assembledBuilder.length + block.length <= maxChars) {
+        assembledBuilder.append(block)
+      } else {
+        hasReachedCeiling = true
+        omittedPages.add(pg.pageNumber)
       }
-    }.onFailure { err ->
-      Log.w(EXTRACTOR_TAG, "PdfRenderer failed for $fileName", err)
-      warnings.add("Visual page renderer unavailable for this PDF; figure graphics could not be visually inspected.")
+    }
+    val assembledPagesText = assembledBuilder.toString().trim()
+
+    if (omittedPages.isNotEmpty()) {
+      warnings.add(
+        "Extraction ceiling (%,d chars) reached; page(s) %s omitted from extracted text.".format(
+          Locale.US,
+          maxChars,
+          omittedPages.joinToString(",") { "P$it" }
+        )
+      )
     }
 
-    // 3. Assemble complete page-anchored manuscript text
-    val assembledPagesText = buildString {
-      extractedPages.forEach { pg ->
-        if (pg.text.isNotBlank()) {
-          appendLine("[PAGE ${pg.pageNumber}]")
-          appendLine(pg.text)
-          appendLine()
-        }
-      }
-    }.trim()
-
-    val finalText: String
-    val lowTextPageNums = extractedPages.filter { it.hasLowTextDensity }.map { it.pageNumber }
-    val extractedNonEmptyCount = extractedPages.count { it.wordCount >= 10 }
-
-    if (assembledPagesText.length >= 100) {
-      finalText = assembledPagesText.take(MAX_EXTRACTED_CHARS)
-      if (assembledPagesText.length > MAX_EXTRACTED_CHARS) {
-        warnings.add("Document exceeded $MAX_EXTRACTED_CHARS chars; trailing bibliography clipped.")
-      }
+    var isScannedVisionOnly = false
+    val finalText = if (assembledPagesText.length >= 100) {
+      assembledPagesText
     } else {
       val fallbackText = extractReadableRunsFromPdfBytes(rawBytes)
       if (fallbackText.length >= 120) {
         extractionEngine = "Fallback Stream Scanner (Low Fidelity)"
         warnings.add("PDF appears scanned or uses non-standard font encoding; text extraction is partial.")
-        finalText = fallbackText.take(MAX_EXTRACTED_CHARS)
+        fallbackText.take(maxChars)
       } else {
+        isScannedVisionOnly = true
         extractionEngine = "Vision-Only PDF (Scanned / Image-Based)"
-        warnings.add("No embedded text layer detected (scanned PDF). Analysis relies on ${renderedPages.size} rendered page image(s).")
-        finalText = "PDF MANUSCRIPT (SCANNED / IMAGE-BASED): $fileName ($totalPageCount pages, ${renderedPages.size} page visuals attached).\n" +
+        warnings.add("No embedded text layer detected (scanned PDF). OCR or visual inspection is required.")
+        "PDF MANUSCRIPT (SCANNED / IMAGE-BASED): $fileName ($totalPageCount pages).\n" +
           "Inferred Title: ${cleanBaseTitle(fileName)}"
       }
     }
 
-    if (lowTextPageNums.isNotEmpty() && lowTextPageNums.size < totalPageCount) {
-      val uninspectedLowText = lowTextPageNums.filter { it !in renderedPageNumbers }
-      if (uninspectedLowText.isNotEmpty()) {
-        warnings.add("Low-text / graphic-heavy page(s) ${uninspectedLowText.joinToString(",") { "P$it" }} were not visually rendered.")
-      }
-    }
-
-    val totalWords = countWords(finalText)
-    val extractionConfidence = computePdfExtractionConfidence(
-      totalPages = totalPageCount,
-      extractedNonEmptyPages = extractedNonEmptyCount,
-      totalWords = totalWords,
-      isPdfBoxUsed = pdfBoxResult.isSuccess,
-      warningCount = warnings.size
-    )
-
-    val coverage = DocumentCoverageReport(
-      totalPages = totalPageCount,
-      extractedPages = if (extractedPages.isNotEmpty()) extractedNonEmptyCount else if (totalWords > 80) totalPageCount else 0,
-      totalChars = finalText.length,
-      totalWords = totalWords,
-      lowTextPages = lowTextPageNums,
-      visionPagesAttached = renderedPages.size,
-      visionPageNumbers = renderedPageNumbers,
-      extractionEngine = extractionEngine,
-      extractionConfidence = extractionConfidence,
-      warnings = warnings.distinct()
-    )
-
-    val inferredTitle = inferTitleFromFirstPage(extractedPages.firstOrNull()?.text.orEmpty(), fileName)
-
-    val notice = if (warnings.isEmpty()) {
-      "Extracted $totalPageCount/$totalPageCount pages (%,d words, ${renderedPages.size} visual page(s)) via PDFBox".format(Locale.US, totalWords)
-    } else {
-      "Imported PDF ($totalPageCount pages, %,d words • Coverage ${extractionConfidence}/5 — ${warnings.first()})".format(Locale.US, totalWords)
-    }
-
-    return ExtractedManuscriptFile(
-      fileName = fileName,
-      format = ManuscriptInputFormat.PDF,
-      inferredTitle = inferredTitle,
-      pageCount = totalPageCount,
-      wordCount = totalWords,
+    return PdfByteExtractionResult(
       extractedText = finalText,
-      pages = extractedPages,
-      pdfPageBitmaps = renderedPages,
-      visionPageNumbers = renderedPageNumbers,
-      coverageReport = coverage,
-      summaryNotice = notice
+      extractedPages = extractedPages,
+      totalPageCount = totalPageCount,
+      omittedPages = omittedPages,
+      extractionEngine = extractionEngine,
+      pdfBoxSucceeded = pdfBoxResult.isSuccess,
+      isScannedVisionOnly = isScannedVisionOnly,
+      warnings = warnings
     )
   }
 

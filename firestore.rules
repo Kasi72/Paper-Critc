@@ -6,40 +6,45 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
-    function isSignedIn() {
-      return request.auth != null;
-    }
-
     function isOwner(userId) {
-      return isSignedIn() && request.auth.uid == userId;
+      return request.auth != null && request.auth.uid == userId;
     }
 
     function isValidId(id) {
       return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
     }
 
-    function incoming() {
-      return request.resource.data;
+    function hasAllowedReviewKeys(data) {
+      return data.keys().hasOnly([
+        'userId', 'title', 'authors', 'publicationYear', 'venueOrCitation',
+        'isEmpirical', 'credibilityScore', 'verdict',
+        'methodologyScore', 'significanceScore', 'clarityScore',
+        'originalityScore', 'mathRigorScore', 'reproducibilityScore',
+        'methodologyJustification', 'significanceJustification', 'clarityJustification',
+        'originalityJustification', 'mathRigorJustification', 'reproducibilityJustification',
+        'refereeConfidence', 'extractionConfidence', 'reviewMode',
+        'coverageDisclosure', 'validationStatus', 'structuredFindingsJson',
+        'abstractSummary', 'researchQuestion', 'keyMethodology', 'coreContributions',
+        'redTeamCritique', 'blueTeamVerification', 'mathAuditReport',
+        'codeAuditReport', 'editorNote', 'copyeditSuggestions',
+        'reviewerQuestions', 'formattedDossier', 'bookmarked',
+        'personalNotes', 'createdAt', 'updatedAt'
+      ]);
     }
 
-    function existing() {
-      return resource.data;
-    }
-
-    function isValidVerdict(verdict) {
-      return verdict is string &&
-             verdict in ['ACCEPT', 'MINOR_REVISION', 'MAJOR_REVISION', 'REJECT_AND_RESUBMIT', 'REJECT'];
-    }
-
-    function isValidPaperReview(data) {
-      return data.userId is string && data.userId == request.auth.uid && data.userId.size() >= 1 && data.userId.size() <= 128 &&
+    function isValidCoreReview(data) {
+      return data.userId == request.auth.uid &&
              data.title is string && data.title.size() >= 1 && data.title.size() <= 500 &&
              data.authors is string && data.authors.size() >= 1 && data.authors.size() <= 500 &&
              data.publicationYear is string && data.publicationYear.size() >= 1 && data.publicationYear.size() <= 20 &&
              data.venueOrCitation is string && data.venueOrCitation.size() <= 500 &&
              data.isEmpirical is bool &&
              data.credibilityScore is int && data.credibilityScore >= 0 && data.credibilityScore <= 100 &&
-             isValidVerdict(data.verdict) &&
+             data.verdict in [
+               'ACCEPT', 'MINOR_REVISION', 'MAJOR_REVISION', 'REJECT_AND_RESUBMIT', 'REJECT',
+               'HIGH_CREDIBILITY', 'SOUND_WITH_CAVEATS', 'REQUIRES_CORRECTION', 'MAJOR_CONCERNS', 'LOW_CREDIBILITY',
+               'HIGH_CERTAINTY', 'MODERATE_CERTAINTY', 'LOW_CERTAINTY', 'VERY_LOW_CERTAINTY'
+             ] &&
              data.abstractSummary is string && data.abstractSummary.size() >= 1 && data.abstractSummary.size() <= 5000 &&
              data.researchQuestion is string && data.researchQuestion.size() >= 1 && data.researchQuestion.size() <= 3000 &&
              data.keyMethodology is string && data.keyMethodology.size() >= 1 && data.keyMethodology.size() <= 4000 &&
@@ -58,48 +63,46 @@ service cloud.firestore {
              data.updatedAt is timestamp && data.updatedAt <= request.time;
     }
 
+    function isValidProvenanceFields(data) {
+      return data.get('methodologyScore', 0) is int && data.get('methodologyScore', 0) >= 0 && data.get('methodologyScore', 0) <= 10 &&
+             data.get('significanceScore', 0) is int && data.get('significanceScore', 0) >= 0 && data.get('significanceScore', 0) <= 10 &&
+             data.get('clarityScore', 0) is int && data.get('clarityScore', 0) >= 0 && data.get('clarityScore', 0) <= 10 &&
+             data.get('originalityScore', 0) is int && data.get('originalityScore', 0) >= 0 && data.get('originalityScore', 0) <= 10 &&
+             data.get('mathRigorScore', 0) is int && data.get('mathRigorScore', 0) >= 0 && data.get('mathRigorScore', 0) <= 10 &&
+             data.get('reproducibilityScore', 0) is int && data.get('reproducibilityScore', 0) >= 0 && data.get('reproducibilityScore', 0) <= 10 &&
+             data.get('methodologyJustification', '') is string && data.get('methodologyJustification', '').size() <= 4000 &&
+             data.get('significanceJustification', '') is string && data.get('significanceJustification', '').size() <= 4000 &&
+             data.get('clarityJustification', '') is string && data.get('clarityJustification', '').size() <= 4000 &&
+             data.get('originalityJustification', '') is string && data.get('originalityJustification', '').size() <= 4000 &&
+             data.get('mathRigorJustification', '') is string && data.get('mathRigorJustification', '').size() <= 4000 &&
+             data.get('reproducibilityJustification', '') is string && data.get('reproducibilityJustification', '').size() <= 4000 &&
+             data.get('refereeConfidence', 3) is int && data.get('refereeConfidence', 3) >= 1 && data.get('refereeConfidence', 3) <= 5 &&
+             data.get('extractionConfidence', 3) is int && data.get('extractionConfidence', 3) >= 1 && data.get('extractionConfidence', 3) <= 5 &&
+             data.get('reviewMode', 'POST_PUBLICATION_APPRAISAL') in ['POST_PUBLICATION_APPRAISAL', 'JOURNAL_REFEREE', 'CLINICAL_EVIDENCE_APPRAISAL'] &&
+             data.get('coverageDisclosure', '') is string && data.get('coverageDisclosure', '').size() <= 2000 &&
+             data.get('validationStatus', 'PARTIALLY_VALIDATED') in ['VERIFIED', 'ADJUDICATED_WITH_CAVEATS', 'PARTIALLY_VALIDATED', 'UNVERIFIED'] &&
+             data.get('structuredFindingsJson', '') is string && data.get('structuredFindingsJson', '').size() <= 60000;
+    }
+
     match /users/{userId}/reviews/{reviewId} {
-      allow get: if isOwner(userId) && isValidId(reviewId) && existing().userId == request.auth.uid;
-      allow list: if isOwner(userId) && existing().userId == request.auth.uid;
+      allow get: if isOwner(userId) && isValidId(reviewId) && resource.data.userId == request.auth.uid;
+      allow list: if isOwner(userId);
 
       allow create: if isOwner(userId) &&
                        isValidId(reviewId) &&
-                       incoming().keys().hasAll([
-                         'userId', 'title', 'authors', 'publicationYear', 'venueOrCitation',
-                         'isEmpirical', 'credibilityScore', 'verdict', 'abstractSummary',
-                         'researchQuestion', 'keyMethodology', 'coreContributions',
-                         'redTeamCritique', 'blueTeamVerification', 'mathAuditReport',
-                         'codeAuditReport', 'editorNote', 'copyeditSuggestions',
-                         'reviewerQuestions', 'formattedDossier', 'bookmarked',
-                         'personalNotes', 'createdAt', 'updatedAt'
-                       ]) &&
-                       incoming().keys().hasOnly([
-                         'userId', 'title', 'authors', 'publicationYear', 'venueOrCitation',
-                         'isEmpirical', 'credibilityScore', 'verdict', 'abstractSummary',
-                         'researchQuestion', 'keyMethodology', 'coreContributions',
-                         'redTeamCritique', 'blueTeamVerification', 'mathAuditReport',
-                         'codeAuditReport', 'editorNote', 'copyeditSuggestions',
-                         'reviewerQuestions', 'formattedDossier', 'bookmarked',
-                         'personalNotes', 'createdAt', 'updatedAt'
-                       ]) &&
-                       isValidPaperReview(incoming());
+                       hasAllowedReviewKeys(request.resource.data) &&
+                       isValidCoreReview(request.resource.data) &&
+                       isValidProvenanceFields(request.resource.data);
 
       allow update: if isOwner(userId) &&
                        isValidId(reviewId) &&
-                       isValidPaperReview(incoming()) &&
-                       incoming().userId == existing().userId &&
-                       incoming().createdAt == existing().createdAt &&
-                       incoming().diff(existing()).affectedKeys().hasOnly([
-                         'title', 'authors', 'publicationYear', 'venueOrCitation',
-                         'isEmpirical', 'credibilityScore', 'verdict', 'abstractSummary',
-                         'researchQuestion', 'keyMethodology', 'coreContributions',
-                         'redTeamCritique', 'blueTeamVerification', 'mathAuditReport',
-                         'codeAuditReport', 'editorNote', 'copyeditSuggestions',
-                         'reviewerQuestions', 'formattedDossier', 'bookmarked',
-                         'personalNotes', 'updatedAt'
-                       ]);
+                       hasAllowedReviewKeys(request.resource.data) &&
+                       isValidCoreReview(request.resource.data) &&
+                       isValidProvenanceFields(request.resource.data) &&
+                       request.resource.data.userId == resource.data.userId &&
+                       request.resource.data.createdAt == resource.data.createdAt;
 
-      allow delete: if isOwner(userId) && isValidId(reviewId) && existing().userId == request.auth.uid;
+      allow delete: if isOwner(userId) && isValidId(reviewId) && resource.data.userId == request.auth.uid;
     }
   }
 }

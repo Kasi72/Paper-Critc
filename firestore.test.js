@@ -16,7 +16,7 @@ const [emulatorHost, emulatorPortStr] = (
 ).split(":");
 const emulatorPort = parseInt(emulatorPortStr, 10);
 
-function buildValidReviewPayload(userId, nowTimestamp) {
+function buildLegacyReviewPayload(userId, nowTimestamp) {
   return {
     userId,
     title: "Yell at It: Prompt Engineering for Automated Peer Review",
@@ -45,6 +45,46 @@ function buildValidReviewPayload(userId, nowTimestamp) {
   };
 }
 
+function buildFullV4ReviewPayload(userId, nowTimestamp, overrides = {}) {
+  return {
+    ...buildLegacyReviewPayload(userId, nowTimestamp),
+    title: "Need Estimates of Psychiatric Beds: A Systematic Review and Meta-Analysis",
+    authors: "Mundt et al.",
+    publicationYear: "2022",
+    venueOrCitation: "World Psychiatry",
+    credibilityScore: 64,
+    verdict: "REQUIRES_CORRECTION",
+    // All 18 v4 provenance, 6-axis rubric, separated confidence & structured evidence ledger fields
+    methodologyScore: 6,
+    significanceScore: 8,
+    clarityScore: 7,
+    originalityScore: 7,
+    mathRigorScore: 5,
+    reproducibilityScore: 4,
+    methodologyJustification: "Random-effects meta-analyses and meta-regression were executed across 65 studies; quality checklist was unvalidated.",
+    significanceJustification: "High policy relevance across HIC and LMIC health systems.",
+    clarityJustification: "Clear PRISMA flow and stratified synthesis tables.",
+    originalityJustification: "Comprehensive global benchmark of normative psychiatric bed estimates.",
+    mathRigorJustification: "Narrative Page 8 long-stay CI (9, 95% CI 1.26 to 2.35) conflicts with Figure 2 Page 9 (95% CI 3-15).",
+    reproducibilityJustification: "Protocol registration and raw extraction sheet links should be archived.",
+    refereeConfidence: 4,
+    extractionConfidence: 5,
+    reviewMode: "POST_PUBLICATION_APPRAISAL",
+    coverageDisclosure: "12/12 page(s) extracted • Engine: PDFBox-Android (Full ToUnicode) • Visual Pages Pass 1: P1,P5,P8,P9 • Pass 2: P8,P9",
+    validationStatus: "VERIFIED",
+    structuredFindingsJson: JSON.stringify([
+      {
+        id: "Q-01",
+        title: "Deterministic Discrepancy Requiring Source Reconciliation: 9, 95% CI 1.26 to 2.35",
+        allegation: "Narrative text reports point estimate 9 outside [1.26, 2.35]; Figure 2 on Page 9 shows 9 (95% CI 3-15).",
+        severity: "CRITICAL",
+        status: "VERIFIED",
+      },
+    ]),
+    ...overrides,
+  };
+}
+
 before(async () => {
   const rules = fs.readFileSync("./firestore.rules", "utf8");
   testEnv = await initializeTestEnvironment({
@@ -69,45 +109,76 @@ beforeEach(async () => {
   }
 });
 
-test("Unauthenticated user cannot read or write reviews", async () => {
+test("Unauthenticated user cannot read, list, or write reviews", async () => {
   const unauthDb = testEnv.unauthenticatedContext().firestore();
   await assertFails(
     unauthDb.collection("users").doc(ALICE_UID).collection("reviews").get()
   );
-});
-
-test("Authenticated owner can create, read, list, update, and delete their own review", async () => {
-  const aliceDb = testEnv.authenticatedContext(ALICE_UID).firestore();
-  const now = new Date(Date.now() - 1000);
-  const reviewRef = aliceDb
-    .collection("users")
-    .doc(ALICE_UID)
-    .collection("reviews")
-    .doc("review_001");
-
-  await assertSucceeds(reviewRef.set(buildValidReviewPayload(ALICE_UID, now)));
-  await assertSucceeds(reviewRef.get());
-  await assertSucceeds(
-    aliceDb
+  await assertFails(
+    unauthDb
       .collection("users")
       .doc(ALICE_UID)
       .collection("reviews")
-      .where("userId", "==", ALICE_UID)
-      .get()
+      .doc("r_unauth")
+      .set(buildFullV4ReviewPayload(ALICE_UID, new Date(Date.now() - 1000)))
   );
+});
 
+test("Authenticated owner can list empty collection and CRUD full v4 payload with all 18 provenance fields", async () => {
+  const aliceDb = testEnv.authenticatedContext(ALICE_UID).firestore();
+  const reviewsCol = aliceDb.collection("users").doc(ALICE_UID).collection("reviews");
+
+  // Empty collection list must succeed (aligns with Kotlin observeReviews / getUserReviews)
+  await assertSucceeds(reviewsCol.where("userId", "==", ALICE_UID).get());
+
+  const now = new Date(Date.now() - 1000);
+  const reviewRef = reviewsCol.doc("review_v4_001");
+  await assertSucceeds(reviewRef.set(buildFullV4ReviewPayload(ALICE_UID, now)));
+  await assertSucceeds(reviewRef.get());
+  await assertSucceeds(reviewsCol.where("userId", "==", ALICE_UID).get());
+
+  // Mode-specific verdicts across all 3 appraisal modes
   await assertSucceeds(
     reviewRef.update({
-      bookmarked: true,
-      personalNotes: "Updated notes after second pass.",
+      reviewMode: "CLINICAL_EVIDENCE_APPRAISAL",
+      verdict: "MODERATE_CERTAINTY",
+      validationStatus: "ADJUDICATED_WITH_CAVEATS",
       updatedAt: new Date(Date.now() - 500),
+    })
+  );
+  await assertSucceeds(
+    reviewRef.update({
+      reviewMode: "JOURNAL_REFEREE",
+      verdict: "ACCEPT",
+      bookmarked: true,
+      personalNotes: "Verified after erratum.",
+      updatedAt: new Date(Date.now() - 250),
     })
   );
 
   await assertSucceeds(reviewRef.delete());
 });
 
-test("Cross-user isolation: Bob cannot read, list, update, or delete Alice's review", async () => {
+test("Backward-compatible cloud migration: legacy doc can be upgraded with v4 provenance fields", async () => {
+  const aliceDb = testEnv.authenticatedContext(ALICE_UID).firestore();
+  const created = new Date(Date.now() - 5000);
+  const reviewRef = aliceDb
+    .collection("users")
+    .doc(ALICE_UID)
+    .collection("reviews")
+    .doc("legacy_doc_001");
+
+  // Seed legacy pre-v4 document (without the 18 new fields)
+  await assertSucceeds(reviewRef.set(buildLegacyReviewPayload(ALICE_UID, created)));
+
+  // Upgrade in-place with full v4 payload while preserving original createdAt
+  const upgraded = buildFullV4ReviewPayload(ALICE_UID, created, {
+    updatedAt: new Date(Date.now() - 500),
+  });
+  await assertSucceeds(reviewRef.set(upgraded));
+});
+
+test("Cross-user isolation: Bob cannot read, list, update, or delete Alice's v4 review", async () => {
   const now = new Date(Date.now() - 1000);
   await testEnv.withSecurityRulesDisabled(async (context) => {
     await context
@@ -116,7 +187,7 @@ test("Cross-user isolation: Bob cannot read, list, update, or delete Alice's rev
       .doc(ALICE_UID)
       .collection("reviews")
       .doc("alice_rev_1")
-      .set(buildValidReviewPayload(ALICE_UID, now));
+      .set(buildFullV4ReviewPayload(ALICE_UID, now));
   });
 
   const bobDb = testEnv.authenticatedContext(BOB_UID).firestore();
@@ -134,18 +205,23 @@ test("Cross-user isolation: Bob cannot read, list, update, or delete Alice's rev
   await assertFails(aliceDocFromBob.delete());
 });
 
-test("Shadow update & value poisoning: rejects ghost fields and invalid score/verdict bounds", async () => {
+test("Validation & poisoning defenses: rejects extra id field, ghost keys, invalid rubric/confidence/mode/verdict, and createdAt tampering", async () => {
   const aliceDb = testEnv.authenticatedContext(ALICE_UID).firestore();
-  const now = new Date(Date.now() - 1000);
-  const reviewRef = aliceDb
-    .collection("users")
-    .doc(ALICE_UID)
-    .collection("reviews")
-    .doc("review_002");
+  const created = new Date(Date.now() - 5000);
+  const reviewsCol = aliceDb.collection("users").doc(ALICE_UID).collection("reviews");
 
-  await assertSucceeds(reviewRef.set(buildValidReviewPayload(ALICE_UID, now)));
+  // Reject payload containing unexpected "id" key (@DocumentId must stay out of map)
+  await assertFails(
+    reviewsCol.doc("review_bad_id").set({
+      ...buildFullV4ReviewPayload(ALICE_UID, created),
+      id: "review_bad_id",
+    })
+  );
 
-  // Ghost field injection
+  const reviewRef = reviewsCol.doc("review_v4_002");
+  await assertSucceeds(reviewRef.set(buildFullV4ReviewPayload(ALICE_UID, created)));
+
+  // Reject ghost field injection
   await assertFails(
     reviewRef.update({
       isAdminApproved: true,
@@ -153,7 +229,47 @@ test("Shadow update & value poisoning: rejects ghost fields and invalid score/ve
     })
   );
 
-  // Invalid credibilityScore (> 100)
+  // Reject out-of-range rubric axis score (> 10)
+  await assertFails(
+    reviewRef.update({
+      methodologyScore: 11,
+      updatedAt: new Date(Date.now() - 500),
+    })
+  );
+
+  // Reject out-of-range confidence (< 1 or > 5)
+  await assertFails(
+    reviewRef.update({
+      extractionConfidence: 0,
+      updatedAt: new Date(Date.now() - 500),
+    })
+  );
+  await assertFails(
+    reviewRef.update({
+      refereeConfidence: 6,
+      updatedAt: new Date(Date.now() - 500),
+    })
+  );
+
+  // Reject invalid reviewMode / validationStatus / verdict / credibilityScore
+  await assertFails(
+    reviewRef.update({
+      reviewMode: "UNKNOWN_MODE",
+      updatedAt: new Date(Date.now() - 500),
+    })
+  );
+  await assertFails(
+    reviewRef.update({
+      validationStatus: "FORCE_PASSED",
+      updatedAt: new Date(Date.now() - 500),
+    })
+  );
+  await assertFails(
+    reviewRef.update({
+      verdict: "INSTANT_PUBLISH",
+      updatedAt: new Date(Date.now() - 500),
+    })
+  );
   await assertFails(
     reviewRef.update({
       credibilityScore: 150,
@@ -161,10 +277,10 @@ test("Shadow update & value poisoning: rejects ghost fields and invalid score/ve
     })
   );
 
-  // Invalid verdict enum
+  // Reject immutable createdAt modification
   await assertFails(
     reviewRef.update({
-      verdict: "INSTANT_PUBLISH",
+      createdAt: new Date(Date.now() - 1000),
       updatedAt: new Date(Date.now() - 500),
     })
   );

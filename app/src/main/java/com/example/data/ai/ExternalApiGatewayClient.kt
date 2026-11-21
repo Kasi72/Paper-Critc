@@ -7,15 +7,26 @@ import java.io.InputStreamReader
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.Socket
 import java.net.URI
 import java.net.URL
 import java.util.Locale
+import javax.net.ssl.HttpsURLConnection
+import javax.net.ssl.SSLSocketFactory
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 
 object ExternalApiGatewayClient {
+
+  internal data class ValidatedEndpoint(
+    val url: URL,
+    val host: String,
+    val port: Int,
+    val pinnedAddress: InetAddress?
+  )
 
   private val BLOCKED_HOST_SUFFIXES = listOf(
     ".local", ".localhost", ".internal", ".home.arpa", ".lan", ".corp", ".localdomain"
@@ -26,17 +37,16 @@ object ExternalApiGatewayClient {
   )
 
   /**
-   * Validates custom AI provider URLs before saving or sending manuscripts/API keys:
-   * - Requires strict HTTPS transport (`https://`) to protect manuscripts and credentials in transit.
-   * - Rejects embedded URL credentials (`user:pass@host`).
-   * - Rejects loopback, link-local, cloud metadata, and private/internal network destinations
-   *   unless explicitly opted in for local diagnostics.
+   * Validates custom AI provider URLs and optionally resolves & pins the verified public
+   * [InetAddress] so the subsequent HTTPS connection cannot be redirected to a private address
+   * via a second DNS lookup.
    */
   @Throws(IllegalArgumentException::class)
-  fun validateEndpointUrl(
+  internal fun validateAndPinEndpoint(
     rawUrl: String,
-    resolveDns: Boolean = false
-  ): URL {
+    resolveDns: Boolean = true,
+    dnsResolver: (String) -> Array<InetAddress> = { InetAddress.getAllByName(it) }
+  ): ValidatedEndpoint {
     val trimmed = rawUrl.trim()
     require(trimmed.isNotBlank()) { "Provider endpoint URL must not be blank." }
 
@@ -66,23 +76,45 @@ object ExternalApiGatewayClient {
       "Provider host '$host' resolves to a private, loopback, or link-local IP address and is blocked."
     }
 
+    var pinnedAddress: InetAddress? = null
     if (resolveDns) {
-      val addresses = runCatching { InetAddress.getAllByName(host) }.getOrNull()
-      if (addresses != null) {
-        for (addr in addresses) {
-          require(!isDisallowedInetAddress(addr)) {
-            "Provider host '$host' resolved to a restricted internal/loopback IP address and is blocked."
-          }
+      val addresses = try {
+        dnsResolver(host)
+      } catch (e: Exception) {
+        throw IllegalArgumentException("Unable to resolve provider host '$host': ${e.message}", e)
+      }
+      require(addresses.isNotEmpty()) {
+        "Provider host '$host' did not resolve to any routable public address."
+      }
+      for (addr in addresses) {
+        require(!isDisallowedInetAddress(addr)) {
+          "Provider host '$host' resolved to a restricted internal/loopback IP address and is blocked."
         }
       }
+      pinnedAddress = addresses.first()
     }
 
-    return URL(trimmed)
+    val url = URL(trimmed)
+    val effectivePort = if (uri.port > 0) uri.port else 443
+    return ValidatedEndpoint(
+      url = url,
+      host = host,
+      port = effectivePort,
+      pinnedAddress = pinnedAddress
+    )
   }
+
+  /**
+   * Validates custom AI provider URLs before saving or sending manuscripts/API keys.
+   */
+  @Throws(IllegalArgumentException::class)
+  fun validateEndpointUrl(
+    rawUrl: String,
+    resolveDns: Boolean = false
+  ): URL = validateAndPinEndpoint(rawUrl = rawUrl, resolveDns = resolveDns).url
 
   private fun isLiteralPrivateOrLoopbackIp(rawHost: String): Boolean {
     val host = rawHost.removePrefix("[").removeSuffix("]")
-    // IPv4 literal check (including single-integer / octal tricks via regex or dotted quad)
     val ipv4Parts = host.split('.')
     if (ipv4Parts.size == 4 && ipv4Parts.all { it.toIntOrNull() in 0..255 }) {
       val a = ipv4Parts[0].toInt()
@@ -95,11 +127,9 @@ object ExternalApiGatewayClient {
       if (a >= 224) return true // Multicast / reserved
       return false
     }
-    // Single-integer IPv4 encoding (e.g., 2130706433 == 127.0.0.1) or hex IP
     if (host.matches(Regex("""^(?:0x[0-9a-f]+|\d+)$""", RegexOption.IGNORE_CASE))) {
       return true
     }
-    // IPv6 literal checks (loopback ::1, unspecified ::, ULA fc00::/7, link-local fe80::/10, IPv4-mapped ::ffff:)
     if (host.contains(':')) {
       val lower = host.lowercase(Locale.US)
       if (lower == "::1" || lower == "::" || lower.startsWith("fc") || lower.startsWith("fd") ||
@@ -112,7 +142,7 @@ object ExternalApiGatewayClient {
     return false
   }
 
-  private fun isDisallowedInetAddress(addr: InetAddress): Boolean {
+  internal fun isDisallowedInetAddress(addr: InetAddress): Boolean {
     return addr.isAnyLocalAddress ||
       addr.isLoopbackAddress ||
       addr.isLinkLocalAddress ||
@@ -121,13 +151,80 @@ object ExternalApiGatewayClient {
       isLiteralPrivateOrLoopbackIp(addr.hostAddress.orEmpty())
   }
 
+  /**
+   * TLS socket factory that connects directly to the already-validated public [pinnedAddress]
+   * without performing a second DNS lookup, while layering TLS with SNI and hostname verification
+   * bound to [expectedHost]. Prevents time-of-check/time-of-use address changes between validation
+   * and connection.
+   */
+  internal class PinnedPublicSSLSocketFactory(
+    private val delegate: SSLSocketFactory,
+    private val expectedHost: String,
+    private val pinnedAddress: InetAddress,
+    private val rawSocketConnector: (InetAddress, Int) -> Socket = { addr, port ->
+      Socket().apply { connect(InetSocketAddress(addr, port), 25_000) }
+    }
+  ) : SSLSocketFactory() {
+
+    init {
+      require(!isDisallowedInetAddress(pinnedAddress)) {
+        "Refusing to pin TLS socket factory to restricted address ${pinnedAddress.hostAddress}."
+      }
+    }
+
+    override fun getDefaultCipherSuites(): Array<String> = delegate.defaultCipherSuites
+    override fun getSupportedCipherSuites(): Array<String> = delegate.supportedCipherSuites
+
+    override fun createSocket(s: Socket, host: String, port: Int, autoClose: Boolean): Socket {
+      val remote = s.inetAddress
+      if (remote != null) {
+        require(!isDisallowedInetAddress(remote)) {
+          "Refusing TLS handshake over restricted remote address ${remote.hostAddress}."
+        }
+      }
+      return delegate.createSocket(s, expectedHost, port, autoClose)
+    }
+
+    override fun createSocket(host: String, port: Int): Socket = createPinnedTlsSocket(port)
+
+    override fun createSocket(host: String, port: Int, localHost: InetAddress, localPort: Int): Socket =
+      createPinnedTlsSocket(port)
+
+    override fun createSocket(host: InetAddress, port: Int): Socket {
+      require(!isDisallowedInetAddress(host)) {
+        "Refusing connection to restricted address ${host.hostAddress}."
+      }
+      return createPinnedTlsSocket(port)
+    }
+
+    override fun createSocket(
+      address: InetAddress,
+      port: Int,
+      localAddress: InetAddress,
+      localPort: Int
+    ): Socket {
+      require(!isDisallowedInetAddress(address)) {
+        "Refusing connection to restricted address ${address.hostAddress}."
+      }
+      return createPinnedTlsSocket(port)
+    }
+
+    internal fun createPinnedTlsSocket(port: Int): Socket {
+      require(!isDisallowedInetAddress(pinnedAddress)) {
+        "Pinned address ${pinnedAddress.hostAddress} failed runtime public-IP verification."
+      }
+      val tcpSocket = rawSocketConnector(pinnedAddress, port)
+      return delegate.createSocket(tcpSocket, expectedHost, port, true)
+    }
+  }
+
   suspend fun testProviderConnection(provider: AiApiProviderEntry): Result<String> =
     withContext(Dispatchers.IO) {
       runCatching {
         if (provider.protocolType == ApiProtocolType.FIREBASE_AI_LOGIC_KEYLESS) {
           return@runCatching "Built-in Firebase AI Logic (App Check Attested) is active and ready. Zero API key needed."
         }
-        validateEndpointUrl(provider.baseUrl, resolveDns = true)
+        validateAndPinEndpoint(provider.baseUrl, resolveDns = true)
         val key = provider.apiKey.trim()
         require(key.isNotEmpty()) {
           "Please enter an API key for '${provider.serviceName}' before testing."
@@ -194,7 +291,7 @@ object ExternalApiGatewayClient {
     } else {
       baseUrl.trimEnd('/') + "/chat/completions"
     }
-    val validatedUrl = validateEndpointUrl(normalizedUrl, resolveDns = true)
+    val validated = validateAndPinEndpoint(normalizedUrl, resolveDns = true)
 
     val payload = JSONObject().apply {
       put("model", modelId.ifBlank { "deepseek/deepseek-r1:free" })
@@ -219,7 +316,7 @@ object ExternalApiGatewayClient {
     }
 
     val rawResponse = postJson(
-      endpointUrl = validatedUrl,
+      endpoint = validated,
       headers = mapOf(
         "Authorization" to "Bearer $apiKey",
         "Content-Type" to "application/json",
@@ -264,7 +361,7 @@ object ExternalApiGatewayClient {
     expectJsonObject: Boolean
   ): String {
     val endpointUrl = buildGeminiDirectRestUrl(baseUrl, modelId)
-    val validatedUrl = validateEndpointUrl(endpointUrl.toString(), resolveDns = true)
+    val validated = validateAndPinEndpoint(endpointUrl.toString(), resolveDns = true)
 
     val combinedPrompt = if (systemPrompt.isNotBlank()) {
       "$systemPrompt\n\n$userPrompt"
@@ -286,19 +383,19 @@ object ExternalApiGatewayClient {
         )
       }
       put("contents", contents)
-      if (expectJsonObject) {
-        put(
-          "generationConfig",
-          JSONObject().apply {
+      put(
+        "generationConfig",
+        JSONObject().apply {
+          put("temperature", if (expectJsonObject) 0.15 else 0.35)
+          if (expectJsonObject) {
             put("responseMimeType", "application/json")
-            put("temperature", 0.15)
           }
-        )
-      }
+        }
+      )
     }
 
     val rawResponse = postJson(
-      endpointUrl = validatedUrl,
+      endpoint = validated,
       headers = mapOf(
         "Content-Type" to "application/json",
         "x-goog-api-key" to apiKey
@@ -310,7 +407,7 @@ object ExternalApiGatewayClient {
     val candidates = root.optJSONArray("candidates")
       ?: throw IllegalStateException("No candidates returned from Gemini REST endpoint.")
     if (candidates.length() == 0) {
-      throw IllegalStateException("Empty candidates returned from Gemini REST endpoint.")
+      throw IllegalStateException("Empty candidates array from Gemini REST endpoint.")
     }
     val parts = candidates.getJSONObject(0)
       .optJSONObject("content")
@@ -323,11 +420,19 @@ object ExternalApiGatewayClient {
   }
 
   private fun postJson(
-    endpointUrl: URL,
+    endpoint: ValidatedEndpoint,
     headers: Map<String, String>,
     bodyJson: String
   ): String {
-    val connection = (endpointUrl.openConnection() as HttpURLConnection).apply {
+    val connection = (endpoint.url.openConnection() as HttpURLConnection).apply {
+      if (this is HttpsURLConnection && endpoint.pinnedAddress != null) {
+        val baseFactory = sslSocketFactory ?: HttpsURLConnection.getDefaultSSLSocketFactory()
+        sslSocketFactory = PinnedPublicSSLSocketFactory(
+          delegate = baseFactory,
+          expectedHost = endpoint.host,
+          pinnedAddress = endpoint.pinnedAddress
+        )
+      }
       requestMethod = "POST"
       instanceFollowRedirects = false // Prevent HTTPS-to-HTTP or internal-host redirect downgrades
       connectTimeout = 25_000

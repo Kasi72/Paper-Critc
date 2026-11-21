@@ -51,31 +51,31 @@
             "LOW_CERTAINTY",
             "VERY_LOW_CERTAINTY"
           ],
-          "description": "Mode-appropriate score-derived appraisal verdict"
+          "description": "Mode-aligned score-derived appraisal verdict (strictly matched to reviewMode)"
         },
         "methodologyScore": {
           "type": "integer",
-          "description": "Methodology rubric score (0-10)"
+          "description": "Methodology rubric score (1-10)"
         },
         "significanceScore": {
           "type": "integer",
-          "description": "Significance rubric score (0-10)"
+          "description": "Significance rubric score (1-10)"
         },
         "clarityScore": {
           "type": "integer",
-          "description": "Clarity rubric score (0-10)"
+          "description": "Clarity rubric score (1-10)"
         },
         "originalityScore": {
           "type": "integer",
-          "description": "Originality rubric score (0-10)"
+          "description": "Originality rubric score (1-10)"
         },
         "mathRigorScore": {
           "type": "integer",
-          "description": "Mathematical and statistical rigor rubric score (0-10)"
+          "description": "Mathematical and statistical rigor rubric score (1-10)"
         },
         "reproducibilityScore": {
           "type": "integer",
-          "description": "Reproducibility rubric score (0-10)"
+          "description": "Reproducibility rubric score (1-10)"
         },
         "methodologyJustification": {
           "type": "string",

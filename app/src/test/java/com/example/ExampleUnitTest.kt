@@ -830,4 +830,228 @@ class ExampleUnitTest {
       34f + metrics.titleMaxWidth + 10f + metrics.tagMaxWidth + 8f <= contentWidth + 0.5f
     )
   }
+
+  @Test
+  fun reviewRepositoryPayload_coercesZeroScoresAndCrossModeVerdictsToMutuallyConsistentV4Record() {
+    // Zero/invalid rubric scores + cross-mode verdict (ACCEPT under CLINICAL_EVIDENCE_APPRAISAL)
+    val inconsistent = PaperReview(
+      id = "inconsistent-1",
+      userId = "uid-bob",
+      title = "Clinical Trial Appraisal",
+      authors = "Smith et al.",
+      publicationYear = "2025",
+      reviewMode = ReviewMode.CLINICAL_EVIDENCE_APPRAISAL.name,
+      verdict = "ACCEPT", // Cross-mode verdict
+      credibilityScore = 72L,
+      methodologyScore = 0, // Invalid zero score triggers legacy fallback in toRubric()
+      significanceScore = 0,
+      clarityScore = 0,
+      originalityScore = 0,
+      mathRigorScore = 0,
+      reproducibilityScore = 0,
+      abstractSummary = "Summary."
+    )
+
+    val payload = com.example.data.repository.ReviewRepository.buildFirestorePayload(
+      review = inconsistent,
+      uid = "uid-bob",
+      createdAtValue = "TS",
+      updatedAtValue = "TS"
+    )
+
+    val m = payload["methodologyScore"] as Int
+    val s = payload["significanceScore"] as Int
+    val c = payload["clarityScore"] as Int
+    val o = payload["originalityScore"] as Int
+    val math = payload["mathRigorScore"] as Int
+    val r = payload["reproducibilityScore"] as Int
+    val composite = payload["credibilityScore"] as Long
+
+    // Every serialized rubric score MUST be in 1..10 (zero never persisted)
+    listOf(m, s, c, o, math, r).forEach { axis ->
+      assertTrue("Axis score $axis must be in 1..10", axis in 1..10)
+    }
+    // Stored composite MUST match the exact 6 persisted dimensions
+    val expectedComposite = PaperReviewRubric.computeWeightedScore(m, s, c, o, math, r).toLong()
+    assertEquals(expectedComposite, composite)
+
+    // Cross-mode verdict ACCEPT under CLINICAL_EVIDENCE_APPRAISAL must map into clinical enum
+    val allowedClinical = com.example.data.repository.ReviewRepository.allowedVerdictsForMode(
+      ReviewMode.CLINICAL_EVIDENCE_APPRAISAL
+    )
+    assertTrue("Verdict ${payload["verdict"]} must belong to clinical enum", payload["verdict"] in allowedClinical)
+    assertEquals("HIGH_CERTAINTY", payload["verdict"])
+  }
+
+  @Test
+  fun dnsRebindingDefense_pinsPublicAddressAndBlocksDualHomedOrReboundPrivateIps() {
+    val publicIp = java.net.InetAddress.getByAddress("api.rebind-test.example", byteArrayOf(93, 184.toByte(), 216.toByte(), 34))
+    val loopbackIp = java.net.InetAddress.getByAddress("api.rebind-test.example", byteArrayOf(127, 0, 0, 1))
+    val metadataIp = java.net.InetAddress.getByAddress("api.rebind-test.example", byteArrayOf(169.toByte(), 254.toByte(), 169.toByte(), 254.toByte()))
+
+    // 1. Dual-homed DNS answer containing a private IP alongside a public IP MUST be rejected
+    val dualHomedFailed = runCatching {
+      com.example.data.ai.ExternalApiGatewayClient.validateAndPinEndpoint(
+        rawUrl = "https://api.rebind-test.example/v1/chat/completions",
+        resolveDns = true,
+        dnsResolver = { arrayOf(publicIp, metadataIp) }
+      )
+    }.isFailure
+    assertTrue("Dual-homed DNS response with metadata IP must be rejected", dualHomedFailed)
+
+    // 2. DNS rebinding simulation: lookup #1 returns publicIp; later lookup would flip to 127.0.0.1
+    var lookupCount = 0
+    val validated = com.example.data.ai.ExternalApiGatewayClient.validateAndPinEndpoint(
+      rawUrl = "https://api.rebind-test.example/v1/chat/completions",
+      resolveDns = true,
+      dnsResolver = {
+        lookupCount++
+        if (lookupCount == 1) arrayOf(publicIp) else arrayOf(loopbackIp)
+      }
+    )
+    assertEquals(publicIp, validated.pinnedAddress)
+    assertEquals(1, lookupCount)
+
+    // 3. PinnedPublicSSLSocketFactory connects strictly to pinned publicIp without performing a second DNS lookup
+    var connectedAddr: java.net.InetAddress? = null
+    var tlsSniHost: String? = null
+    val stubDelegate = object : javax.net.ssl.SSLSocketFactory() {
+      override fun getDefaultCipherSuites(): Array<String> = emptyArray()
+      override fun getSupportedCipherSuites(): Array<String> = emptyArray()
+      override fun createSocket(s: java.net.Socket, host: String, port: Int, autoClose: Boolean): java.net.Socket {
+        tlsSniHost = host
+        return s
+      }
+      override fun createSocket(host: String, port: Int): java.net.Socket = java.net.Socket()
+      override fun createSocket(host: String, port: Int, localHost: java.net.InetAddress, localPort: Int): java.net.Socket = java.net.Socket()
+      override fun createSocket(host: java.net.InetAddress, port: Int): java.net.Socket = java.net.Socket()
+      override fun createSocket(address: java.net.InetAddress, port: Int, localAddress: java.net.InetAddress, localPort: Int): java.net.Socket = java.net.Socket()
+    }
+
+    val pinnedFactory = com.example.data.ai.ExternalApiGatewayClient.PinnedPublicSSLSocketFactory(
+      delegate = stubDelegate,
+      expectedHost = validated.host,
+      pinnedAddress = validated.pinnedAddress!!,
+      rawSocketConnector = { addr, _ ->
+        connectedAddr = addr
+        java.net.Socket()
+      }
+    )
+    pinnedFactory.createSocket("api.rebind-test.example", 443)
+    assertEquals("Socket must connect directly to pinned public IP", publicIp, connectedAddr)
+    assertEquals("TLS SNI must preserve original hostname", "api.rebind-test.example", tlsSniHost)
+    assertEquals("No second DNS lookup may occur during connection", 1, lookupCount)
+
+    // 4. Attempting to construct or connect PinnedPublicSSLSocketFactory to a private IP fails closed
+    val privatePinFailed = runCatching {
+      com.example.data.ai.ExternalApiGatewayClient.PinnedPublicSSLSocketFactory(
+        delegate = stubDelegate,
+        expectedHost = "api.rebind-test.example",
+        pinnedAddress = loopbackIp
+      )
+    }.isFailure
+    assertTrue("Refusing private pinnedAddress must fail closed", privatePinFailed)
+  }
+
+  @Test
+  fun prepareManuscriptForPrompt_recordsPartiallyRetainedPageWhenBudgetSplitsFinalSelectedPage() {
+    val page1 = "Introduction and Title: Systematic study of clinical thresholds. " + "Opening context. ".repeat(12)
+    val page2 = "Results Table 1 Figure 2 pooled estimate 95% CI 3-15 p = 0.004 I² = 99%. " + "Detailed statistical analysis. ".repeat(45)
+    val page3 = "Discussion and Conclusion: Policy implications. " + "Closing synthesis. ".repeat(10)
+    val doc = "[PAGE 1]\n$page1\n\n[PAGE 2]\n$page2\n\n[PAGE 3]\n$page3"
+
+    // Budget fits Page 1 + Page 3 fully, and leaves partial room for high-signal Page 2
+    val prepared = Reviewer2PipelineService.prepareManuscriptForPrompt(doc, maxChars = 1350)
+    assertTrue("Must flag trimmed", prepared.wasTrimmed)
+    assertTrue("Must record Page 2 as partially retained (not silently cut!)", 2 in prepared.partiallyRetainedPages)
+    assertTrue("Prompt text must explicitly mark [PAGE 2 — PARTIAL]", prepared.text.contains("[PAGE 2 — PARTIAL]"))
+    assertTrue("Disclosure note must state partially retained P2", prepared.trimmedNote.contains("partially retained: P2"))
+    assertFalse("Page 2 must not also be listed as fully omitted", 2 in prepared.omittedPages)
+  }
+
+  @Test
+  fun verdictDecisionTable_verifiesEveryModeScoreBandAndFindingStatusCombination() {
+    data class Case(
+      val mode: ReviewMode,
+      val score: Int,
+      val verifiedCrit: Boolean,
+      val partialCrit: Boolean,
+      val expected: String
+    )
+
+    val matrix = listOf(
+      // CLINICAL_EVIDENCE_APPRAISAL (GRADE-aligned: -2 for verified critical, -1 for partially-supported critical on MODERATE/HIGH)
+      Case(ReviewMode.CLINICAL_EVIDENCE_APPRAISAL, 90, false, false, "HIGH_CERTAINTY"),
+      Case(ReviewMode.CLINICAL_EVIDENCE_APPRAISAL, 90, false, true, "MODERATE_CERTAINTY"),
+      Case(ReviewMode.CLINICAL_EVIDENCE_APPRAISAL, 90, true, false, "LOW_CERTAINTY"),
+      Case(ReviewMode.CLINICAL_EVIDENCE_APPRAISAL, 75, false, false, "MODERATE_CERTAINTY"),
+      Case(ReviewMode.CLINICAL_EVIDENCE_APPRAISAL, 75, false, true, "LOW_CERTAINTY"),
+      Case(ReviewMode.CLINICAL_EVIDENCE_APPRAISAL, 75, true, false, "VERY_LOW_CERTAINTY"),
+      Case(ReviewMode.CLINICAL_EVIDENCE_APPRAISAL, 55, false, false, "LOW_CERTAINTY"),
+      Case(ReviewMode.CLINICAL_EVIDENCE_APPRAISAL, 55, true, false, "VERY_LOW_CERTAINTY"),
+      Case(ReviewMode.CLINICAL_EVIDENCE_APPRAISAL, 35, false, false, "VERY_LOW_CERTAINTY"),
+
+      // POST_PUBLICATION_APPRAISAL
+      Case(ReviewMode.POST_PUBLICATION_APPRAISAL, 90, false, false, "HIGH_CREDIBILITY"),
+      Case(ReviewMode.POST_PUBLICATION_APPRAISAL, 90, false, true, "SOUND_WITH_CAVEATS"),
+      Case(ReviewMode.POST_PUBLICATION_APPRAISAL, 90, true, false, "REQUIRES_CORRECTION"),
+      Case(ReviewMode.POST_PUBLICATION_APPRAISAL, 75, false, false, "SOUND_WITH_CAVEATS"),
+      Case(ReviewMode.POST_PUBLICATION_APPRAISAL, 75, true, false, "REQUIRES_CORRECTION"),
+      Case(ReviewMode.POST_PUBLICATION_APPRAISAL, 60, false, false, "REQUIRES_CORRECTION"),
+      Case(ReviewMode.POST_PUBLICATION_APPRAISAL, 45, false, false, "MAJOR_CONCERNS"),
+      Case(ReviewMode.POST_PUBLICATION_APPRAISAL, 45, true, false, "REQUIRES_CORRECTION"),
+      Case(ReviewMode.POST_PUBLICATION_APPRAISAL, 30, false, false, "LOW_CREDIBILITY"),
+      Case(ReviewMode.POST_PUBLICATION_APPRAISAL, 30, true, false, "LOW_CREDIBILITY"),
+
+      // JOURNAL_REFEREE
+      Case(ReviewMode.JOURNAL_REFEREE, 90, false, false, "ACCEPT"),
+      Case(ReviewMode.JOURNAL_REFEREE, 90, false, true, "MINOR_REVISION"),
+      Case(ReviewMode.JOURNAL_REFEREE, 90, true, false, "MAJOR_REVISION"),
+      Case(ReviewMode.JOURNAL_REFEREE, 75, false, false, "MINOR_REVISION"),
+      Case(ReviewMode.JOURNAL_REFEREE, 75, true, false, "MAJOR_REVISION"),
+      Case(ReviewMode.JOURNAL_REFEREE, 60, false, false, "MAJOR_REVISION"),
+      Case(ReviewMode.JOURNAL_REFEREE, 45, false, false, "REJECT_AND_RESUBMIT"),
+      Case(ReviewMode.JOURNAL_REFEREE, 45, true, false, "MAJOR_REVISION"),
+      Case(ReviewMode.JOURNAL_REFEREE, 42, true, false, "REJECT_AND_RESUBMIT"),
+      Case(ReviewMode.JOURNAL_REFEREE, 30, false, false, "REJECT"),
+      Case(ReviewMode.JOURNAL_REFEREE, 30, true, false, "REJECT")
+    )
+
+    matrix.forEach { c ->
+      val actual = Reviewer2PipelineService.resolveVerdictForMode(
+        rawVerdict = "HIGH_CREDIBILITY", // Advisory raw verdict must never override decision table
+        compositeScore = c.score,
+        reviewMode = c.mode,
+        hasVerifiedCriticalError = c.verifiedCrit,
+        hasPartiallySupportedCriticalDiscrepancy = c.partialCrit
+      )
+      assertEquals(
+        "Mismatch for mode=${c.mode} score=${c.score} verifiedCrit=${c.verifiedCrit} partialCrit=${c.partialCrit}",
+        c.expected,
+        actual
+      )
+    }
+  }
+
+  @Test
+  fun pdfStackedCardPagination_handlesExtremelyLongFirstCellAcrossMultiplePagesWithoutFooterOverflow() {
+    val massiveFirstCell = "LONG_TITLE_START " +
+      (1..120).joinToString(" ") { "SectionClause$it evaluating psychiatric bed estimation methodology and sensitivity bounds." } +
+      " LONG_TITLE_END"
+    val plan = com.example.util.PdfReportExporter.planStackedCardPagination(
+      rowIndex = 0,
+      headers = listOf("Audit Dimension", "Manuscript Evidence", "Status"),
+      rowCells = listOf(massiveFirstCell, "Figure 2 Page 9 shows 95% CI 3-15.", "FAIL")
+    )
+
+    assertTrue("Extremely long first cell must paginate cleanly across >= 2 pages", plan.totalPagesUsed >= 2)
+    assertTrue(
+      "Every single placed line bottom (${plan.maxLineBottomY}) must remain strictly <= pageBodyBottomLimit (${plan.pageBodyBottomLimit})",
+      plan.maxLineBottomY <= plan.pageBodyBottomLimit
+    )
+    val reconstructed = plan.placements.joinToString("") { it.text }
+    assertTrue("Must preserve start of long first cell", reconstructed.contains("LONG_TITLE_START"))
+    assertTrue("Must preserve end of long first cell", reconstructed.contains("LONG_TITLE_END"))
+    assertTrue("Must preserve trailing cells after long first cell", reconstructed.contains("Figure 2 Page 9"))
+  }
 }

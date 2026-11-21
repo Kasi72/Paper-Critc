@@ -315,4 +315,142 @@ class ExampleRobolectricTest {
       bitmaps.forEach { it.recycle() }
     }
   }
+
+  @Test
+  fun `pdf extraction preserves late high-signal results and figure pages ahead of filler when ceiling is reached`() {
+    val sixPagePdf = buildRealPdfBytes(
+      listOf(
+        "Page One Title: Global Psychiatric Bed Estimates Systematic Review and Meta-Analysis.",
+        "Page Two Background Narrative: " + "General historical overview sentence without tables. ".repeat(14),
+        "Page Three Extended Background: " + "Additional contextual background commentary. ".repeat(14),
+        "References\n[1] Author A 2019.\n[2] Author B 2020.\n[3] Author C 2021.\n[4] Author D 2022.\n[5] Author E 2022.\n[6] Author F 2022.\n[7] Author G 2022.\n[8] Author H 2022.",
+        "References Continued\n[9] Author I 2019.\n[10] Author J 2020.\n[11] Author K 2021.\n[12] Author L 2022.\n[13] Author M 2022.\n[14] Author N 2022.\n[15] Author O 2022.\n[16] Author P 2022.",
+        "Page Six Results and Limitations: Figure 2 forest plot shows pooled estimate 9 (95% CI 3 to 15), p = 0.004, meta-regression limitations."
+      )
+    )
+
+    val capped = ManuscriptExtractor.extractPdfPagesFromBytes(
+      rawBytes = sixPagePdf,
+      fileName = "late_results_fixture.pdf",
+      maxChars = 340
+    )
+    assertEquals(6, capped.totalPageCount)
+    assertTrue("Opening Page 1 must be preserved", capped.extractedText.contains("[PAGE 1]"))
+    assertTrue(
+      "Late Page 6 Results/Figure/Limitations must be preserved BEFORE applying the char ceiling",
+      capped.extractedText.contains("[PAGE 6]") && capped.extractedText.contains("Figure 2 forest plot")
+    )
+    assertTrue("Low-signal reference/background pages must be accurately recorded in omittedPages", capped.omittedPages.contains(4))
+    assertFalse("Retained Page 6 must not be listed in omittedPages", 6 in capped.omittedPages)
+  }
+
+  @Test
+  fun `oversized plain text and real docx zip inputs report omitted synthetic pages and lower extraction confidence`() {
+    val longPlainText = buildString {
+      appendLine("Systematic Appraisal of Inpatient Psychiatric Bed Thresholds")
+      appendLine("Abstract: Synthesizes 65 studies across HIC and LMIC health systems.")
+      for (i in 1..6) {
+        appendLine()
+        appendLine("Supplementary narrative block $i: " + "Extended background descriptive text for audit coverage testing. ".repeat(35))
+      }
+      appendLine()
+      appendLine("Results and Conclusion: Table 2 and Figure 2 report pooled estimate 9 (95% CI 3-15), p = 0.004 with limitations.")
+    }
+
+    val textExtracted = ManuscriptExtractor.extractPlainTextFromString(
+      rawText = longPlainText,
+      fileName = "oversized_manuscript.txt",
+      maxChars = 4_800
+    )
+    assertTrue("Oversized text must populate omittedPages", textExtracted.coverageReport.omittedPages.isNotEmpty())
+    assertTrue(
+      "Oversized text extractionConfidence must be lowered (<= 3), got ${textExtracted.coverageReport.extractionConfidence}",
+      textExtracted.coverageReport.extractionConfidence <= 3
+    )
+    assertTrue("Late Results/Conclusion synthetic page must be preserved", textExtracted.extractedText.contains("Table 2 and Figure 2"))
+    assertTrue(textExtracted.coverageReport.warnings.any { it.contains("omitted", ignoreCase = true) })
+
+    // Build a real .docx ZIP archive containing word/document.xml
+    val docxXml = buildString {
+      append("""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>""")
+      append("""<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>""")
+      longPlainText.lines().forEach { line ->
+        val safe = line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        append("<w:p><w:r><w:t>$safe</w:t></w:r></w:p>")
+      }
+      append("</w:body></w:document>")
+    }
+    val zipOut = ByteArrayOutputStream()
+    java.util.zip.ZipOutputStream(zipOut).use { zos ->
+      zos.putNextEntry(java.util.zip.ZipEntry("word/document.xml"))
+      zos.write(docxXml.toByteArray(Charsets.UTF_8))
+      zos.closeEntry()
+    }
+
+    val docxExtracted = ManuscriptExtractor.extractDocxFromBytes(
+      rawBytes = zipOut.toByteArray(),
+      fileName = "oversized_manuscript.docx",
+      maxChars = 4_800
+    )
+    assertTrue("Oversized DOCX must populate omittedPages", docxExtracted.coverageReport.omittedPages.isNotEmpty())
+    assertTrue(
+      "Oversized DOCX extractionConfidence must be lowered (<= 3), got ${docxExtracted.coverageReport.extractionConfidence}",
+      docxExtracted.coverageReport.extractionConfidence <= 3
+    )
+    assertTrue("Oversized DOCX must retain synthetic page markers", docxExtracted.extractedText.contains("[PAGE 1]"))
+    assertTrue("Oversized DOCX must preserve late Results/Conclusion", docxExtracted.extractedText.contains("Table 2 and Figure 2"))
+  }
+
+  @Test
+  fun `generated pdf structure validation verifies multi-page stacked card output with 6000 char first cell`() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    PDFBoxResourceLoader.init(context)
+
+    val hugeTitle = "START_OF_MASSIVE_CELL " +
+      (1..95).joinToString(" ") { "Clause$it verifying non-overlapping multi-page stacked card rendering." } +
+      " END_OF_MASSIVE_CELL"
+    val plan = com.example.util.PdfReportExporter.planStackedCardPagination(
+      rowIndex = 0,
+      headers = listOf("Audit Dimension", "Status"),
+      rowCells = listOf(hugeTitle, "FAIL")
+    )
+    assertTrue(plan.totalPagesUsed >= 2)
+    assertTrue(plan.maxLineBottomY <= plan.pageBodyBottomLimit)
+
+    // Render the exact paginated coordinate plan into a real PDF byte stream and verify structure with PDFBox
+    val pdfOut = ByteArrayOutputStream()
+    PDDocument().use { doc ->
+      for (pageNum in 1..plan.totalPagesUsed) {
+        val page = PDPage(com.tom_roush.pdfbox.pdmodel.common.PDRectangle.A4)
+        doc.addPage(page)
+        val pageHeight = page.mediaBox.height
+        val pagePlacements = plan.placements.filter { it.pageIndex == pageNum }
+        PDPageContentStream(doc, page).use { cs ->
+          cs.setFont(PDType1Font.HELVETICA, 9f)
+          pagePlacements.forEach { placement ->
+            // Verify every placed line stays inside A4 vertical printable bounds
+            assertTrue("Line yBottom ${placement.yBottom} must fit inside page", placement.yBottom <= plan.pageBodyBottomLimit)
+            val pdfY = (pageHeight - placement.yBottom).coerceIn(20f, pageHeight - 20f)
+            cs.beginText()
+            cs.newLineAtOffset(40f, pdfY)
+            cs.showText(placement.text.replace(Regex("[^\\x20-\\x7E]"), " "))
+            cs.endText()
+          }
+        }
+      }
+      doc.save(pdfOut)
+    }
+
+    // Parse back the generated PDF binary and validate page count + complete text integrity
+    val pdfBytes = pdfOut.toByteArray()
+    assertTrue("Generated PDF must begin with %PDF header", String(pdfBytes.take(5).toByteArray()) == "%PDF-")
+    PDDocument.load(pdfBytes).use { loadedDoc ->
+      assertEquals(plan.totalPagesUsed, loadedDoc.numberOfPages)
+      val extracted = com.tom_roush.pdfbox.text.PDFTextStripper().getText(loadedDoc)
+      assertTrue(extracted.contains("AUDIT RECORD 1"))
+      assertTrue(extracted.contains("START_OF_MASSIVE_CELL"))
+      assertTrue(extracted.contains("END_OF_MASSIVE_CELL"))
+      assertTrue(extracted.contains("STATUS: FAIL"))
+    }
+  }
 }

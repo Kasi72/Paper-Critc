@@ -787,25 +787,22 @@ object PdfReportExporter {
               }
               val rowH = maxOf(18f, (cellLayouts.maxOfOrNull { it.height } ?: 10).toFloat() + padV * 2)
 
-              // P1 fix: If a table row is taller than a single printable page body, switch it to a
-              // paginated stacked card so long audit findings NEVER clip or overlap the footer.
+              // P1/P2 fix: If a table row is taller than a single printable page body, switch it to a
+              // paginated stacked card with a fixed single-line banner and paginate EVERY cell
+              // (including an arbitrarily long first cell) through drawLayoutPaginated so nothing can overflow.
               if (shouldFallbackTableRowToPaginatedCard(rowH, maxPageBodyHeight)) {
-                ensureSpace(56f)
-                val rowTitle = rowCells.firstOrNull().orEmpty().ifBlank { "Audit Row ${rowIdx + 1}" }
+                ensureSpace(44f)
                 val barTop = cursorY
+                val bannerHeight = 17f
                 canvas.drawRoundRect(
-                  RectF(MARGIN_H, barTop, PAGE_WIDTH - MARGIN_H, barTop + 17f),
+                  RectF(MARGIN_H, barTop, PAGE_WIDTH - MARGIN_H, barTop + bannerHeight),
                   4f,
                   4f,
                   zebraAltPaint
                 )
-                canvas.drawLine(MARGIN_H, barTop + 17f, PAGE_WIDTH - MARGIN_H, barTop + 17f, dividerPaint)
-                val titleLayout = buildLayout(rowTitle, tableCellBoldPaint, CONTENT_WIDTH - 12f, 1.2f)
-                canvas.save()
-                canvas.translate(MARGIN_H + 6f, barTop + 3f)
-                titleLayout.draw(canvas)
-                canvas.restore()
-                cursorY = barTop + maxOf(19f, titleLayout.height + 6f)
+                canvas.drawLine(MARGIN_H, barTop + bannerHeight, PAGE_WIDTH - MARGIN_H, barTop + bannerHeight, dividerPaint)
+                canvas.drawText("AUDIT RECORD ${rowIdx + 1}", MARGIN_H + 6f, barTop + 11.5f, tableCellBoldPaint)
+                cursorY = barTop + bannerHeight + 4f
 
                 rowCells.forEachIndexed { c, cellText ->
                   val headerLabel = block.headers.getOrNull(c).orEmpty().ifBlank { "Column ${c + 1}" }
@@ -820,6 +817,7 @@ object PdfReportExporter {
                     cursorY += 2.5f
                   }
                 }
+                ensureSpace(10f)
                 canvas.drawLine(MARGIN_H, cursorY + 2f, PAGE_WIDTH - MARGIN_H, cursorY + 2f, dividerPaint)
                 cursorY += 7f
               } else {
@@ -1349,4 +1347,86 @@ object PdfReportExporter {
     measuredRowHeight: Float,
     maxPageBodyHeight: Float
   ): Boolean = measuredRowHeight > (maxPageBodyHeight - 40f)
+
+  internal data class PaginatedLinePlacement(
+    val pageIndex: Int,
+    val yTop: Float,
+    val yBottom: Float,
+    val text: String
+  )
+
+  internal data class StackedCardLayoutPlan(
+    val totalPagesUsed: Int,
+    val maxLineBottomY: Float,
+    val pageBodyBottomLimit: Float,
+    val placements: List<PaginatedLinePlacement>
+  )
+
+  /**
+   * Deterministic coordinate-level pagination simulator matching the stacked-card renderer:
+   * fixed 17pt single-line banner followed by line-by-line paginated fields for EVERY cell
+   * (including arbitrarily long first-cell titles). Proves no line ever exceeds [pageBottomLimit].
+   */
+  internal fun planStackedCardPagination(
+    rowIndex: Int,
+    headers: List<String>,
+    rowCells: List<String>,
+    charsPerLine: Int = 78,
+    lineHeightPt: Float = 11.5f,
+    pageTopY: Float = MARGIN_TOP_SUBSEQUENT,
+    pageBottomLimit: Float = PAGE_HEIGHT - MARGIN_BOTTOM,
+    initialCursorY: Float = MARGIN_TOP_SUBSEQUENT
+  ): StackedCardLayoutPlan {
+    var pageIdx = 1
+    var cursorY = initialCursorY
+    val placements = mutableListOf<PaginatedLinePlacement>()
+    val bannerH = 17f
+
+    fun startNextPage() {
+      pageIdx++
+      cursorY = pageTopY
+    }
+
+    if (cursorY + 44f > pageBottomLimit) {
+      startNextPage()
+    }
+    placements.add(
+      PaginatedLinePlacement(
+        pageIndex = pageIdx,
+        yTop = cursorY,
+        yBottom = cursorY + bannerH,
+        text = "AUDIT RECORD ${rowIndex + 1}"
+      )
+    )
+    cursorY += bannerH + 4f
+
+    rowCells.forEachIndexed { c, cellText ->
+      if (cellText.isBlank()) return@forEachIndexed
+      val headerLabel = headers.getOrNull(c).orEmpty().ifBlank { "Column ${c + 1}" }
+      val fullText = "${headerLabel.uppercase(Locale.US)}: $cellText"
+      val wrappedLines = fullText.chunked(charsPerLine.coerceAtLeast(16))
+      for (line in wrappedLines) {
+        if (cursorY + lineHeightPt > pageBottomLimit) {
+          startNextPage()
+        }
+        placements.add(
+          PaginatedLinePlacement(
+            pageIndex = pageIdx,
+            yTop = cursorY,
+            yBottom = cursorY + lineHeightPt,
+            text = line
+          )
+        )
+        cursorY += lineHeightPt
+      }
+      cursorY += 2.5f
+    }
+
+    return StackedCardLayoutPlan(
+      totalPagesUsed = pageIdx,
+      maxLineBottomY = placements.maxOfOrNull { it.yBottom } ?: pageTopY,
+      pageBodyBottomLimit = pageBottomLimit,
+      placements = placements
+    )
+  }
 }

@@ -161,9 +161,13 @@ class ReviewRepository(private val db: FirebaseFirestore) {
   }
 
   companion object {
-    private val ALLOWED_VERDICTS = setOf(
-      "ACCEPT", "MINOR_REVISION", "MAJOR_REVISION", "REJECT_AND_RESUBMIT", "REJECT",
-      "HIGH_CREDIBILITY", "SOUND_WITH_CAVEATS", "REQUIRES_CORRECTION", "MAJOR_CONCERNS", "LOW_CREDIBILITY",
+    private val POST_PUB_VERDICTS = setOf(
+      "HIGH_CREDIBILITY", "SOUND_WITH_CAVEATS", "REQUIRES_CORRECTION", "MAJOR_CONCERNS", "LOW_CREDIBILITY"
+    )
+    private val JOURNAL_VERDICTS = setOf(
+      "ACCEPT", "MINOR_REVISION", "MAJOR_REVISION", "REJECT_AND_RESUBMIT", "REJECT"
+    )
+    private val CLINICAL_VERDICTS = setOf(
       "HIGH_CERTAINTY", "MODERATE_CERTAINTY", "LOW_CERTAINTY", "VERY_LOW_CERTAINTY"
     )
 
@@ -171,28 +175,39 @@ class ReviewRepository(private val db: FirebaseFirestore) {
       "VERIFIED", "ADJUDICATED_WITH_CAVEATS", "PARTIALLY_VALIDATED", "UNVERIFIED"
     )
 
+    internal fun allowedVerdictsForMode(mode: ReviewMode): Set<String> = when (mode) {
+      ReviewMode.POST_PUBLICATION_APPRAISAL -> POST_PUB_VERDICTS
+      ReviewMode.JOURNAL_REFEREE -> JOURNAL_VERDICTS
+      ReviewMode.CLINICAL_EVIDENCE_APPRAISAL -> CLINICAL_VERDICTS
+    }
+
+    /**
+     * Strictly guarantees the returned verdict belongs to [mode]'s allowed enum.
+     * Cross-mode verdicts (e.g., ACCEPT passed under CLINICAL_EVIDENCE_APPRAISAL) are mapped to
+     * the corresponding tier in [mode] so Firestore and local storage never hold cross-mode records.
+     */
     internal fun normalizeVerdict(raw: String, mode: ReviewMode = ReviewMode.POST_PUBLICATION_APPRAISAL): String {
       val upper = raw.trim().uppercase(Locale.US).replace(' ', '_').replace('-', '_')
-      if (upper in ALLOWED_VERDICTS) return upper
+      if (upper in allowedVerdictsForMode(mode)) return upper
       return when (mode) {
         ReviewMode.POST_PUBLICATION_APPRAISAL -> when {
-          upper.contains("LOW_CRED") -> "LOW_CREDIBILITY"
-          upper.contains("MAJOR_CONCERN") -> "MAJOR_CONCERNS"
-          upper.contains("CORRECTION") || upper.contains("ERRAT") -> "REQUIRES_CORRECTION"
-          upper.contains("HIGH_CRED") -> "HIGH_CREDIBILITY"
+          upper.contains("VERY_LOW") || upper == "REJECT" || upper.contains("LOW_CRED") -> "LOW_CREDIBILITY"
+          upper.contains("LOW_CERT") || upper.contains("RESUBMIT") || upper.contains("MAJOR_CONCERN") -> "MAJOR_CONCERNS"
+          upper.contains("CORRECTION") || upper.contains("ERRAT") || upper.contains("MAJOR") -> "REQUIRES_CORRECTION"
+          upper.contains("HIGH") || upper == "ACCEPT" -> "HIGH_CREDIBILITY"
           else -> "SOUND_WITH_CAVEATS"
         }
         ReviewMode.CLINICAL_EVIDENCE_APPRAISAL -> when {
-          upper.contains("VERY_LOW") -> "VERY_LOW_CERTAINTY"
-          upper.contains("LOW") -> "LOW_CERTAINTY"
-          upper.contains("HIGH") -> "HIGH_CERTAINTY"
+          upper.contains("VERY_LOW") || upper == "REJECT" || upper.contains("LOW_CRED") -> "VERY_LOW_CERTAINTY"
+          upper.contains("LOW") || upper.contains("RESUBMIT") || upper.contains("MAJOR") || upper.contains("CORRECTION") -> "LOW_CERTAINTY"
+          upper.contains("HIGH") || upper == "ACCEPT" -> "HIGH_CERTAINTY"
           else -> "MODERATE_CERTAINTY"
         }
         ReviewMode.JOURNAL_REFEREE -> when {
-          upper.contains("RESUBMIT") -> "REJECT_AND_RESUBMIT"
-          upper.contains("REJECT") -> "REJECT"
-          upper.contains("MAJOR") -> "MAJOR_REVISION"
-          upper.contains("ACCEPT") -> "ACCEPT"
+          upper.contains("VERY_LOW") || upper.contains("LOW_CRED") || upper == "REJECT" -> "REJECT"
+          upper.contains("RESUBMIT") || upper.contains("MAJOR_CONCERN") -> "REJECT_AND_RESUBMIT"
+          upper.contains("CORRECTION") || upper.contains("LOW_CERT") || upper.contains("MAJOR") -> "MAJOR_REVISION"
+          upper.contains("HIGH") || upper == "ACCEPT" -> "ACCEPT"
           else -> "MINOR_REVISION"
         }
       }
@@ -204,9 +219,11 @@ class ReviewRepository(private val db: FirebaseFirestore) {
     }
 
     /**
-     * Builds the complete, rule-aligned Firestore document payload preserving ALL 6-axis rubric
-     * scores/justifications, separated confidence metrics, appraisal mode, coverage provenance,
-     * validation status, and structured evidence ledger JSON (without `@DocumentId` "id").
+     * Builds the complete, strictly self-consistent Firestore document payload:
+     * - Derives all 6 rubric dimensions (`1..10`) AND `credibilityScore` from a single reconciled
+     *   [PaperReviewRubric] instance so individual axes and the weighted composite can NEVER disagree.
+     * - Enforces mode-aligned verdict enums matching `firestore.rules`.
+     * - Preserves full justifications, separated confidence metrics, provenance, and evidence ledger JSON.
      */
     internal fun buildFirestorePayload(
       review: PaperReview,
@@ -215,7 +232,8 @@ class ReviewRepository(private val db: FirebaseFirestore) {
       updatedAtValue: Any
     ): Map<String, Any> {
       val resolvedMode = review.resolvedReviewMode()
-      val authoritativeComposite = review.toRubric().overallCredibilityScore.toLong().coerceIn(0L, 100L)
+      val rubric = review.toRubric()
+      val authoritativeComposite = rubric.overallCredibilityScore.toLong().coerceIn(0L, 100L)
       return mapOf(
         "userId" to uid,
         "title" to review.title.trim().take(500).ifEmpty { "Untitled Manuscript" },
@@ -225,13 +243,13 @@ class ReviewRepository(private val db: FirebaseFirestore) {
         "isEmpirical" to review.isEmpirical,
         "credibilityScore" to authoritativeComposite,
         "verdict" to normalizeVerdict(review.verdict, resolvedMode),
-        // Structured 6-axis rubric & full justifications
-        "methodologyScore" to review.methodologyScore.coerceIn(0, 10),
-        "significanceScore" to review.significanceScore.coerceIn(0, 10),
-        "clarityScore" to review.clarityScore.coerceIn(0, 10),
-        "originalityScore" to review.originalityScore.coerceIn(0, 10),
-        "mathRigorScore" to review.mathRigorScore.coerceIn(0, 10),
-        "reproducibilityScore" to review.reproducibilityScore.coerceIn(0, 10),
+        // Structured 6-axis rubric (strictly 1..10, guaranteed consistent with credibilityScore)
+        "methodologyScore" to rubric.methodology.coerceIn(1, 10),
+        "significanceScore" to rubric.significance.coerceIn(1, 10),
+        "clarityScore" to rubric.clarity.coerceIn(1, 10),
+        "originalityScore" to rubric.originality.coerceIn(1, 10),
+        "mathRigorScore" to rubric.mathematicalRigor.coerceIn(1, 10),
+        "reproducibilityScore" to rubric.reproducibility.coerceIn(1, 10),
         "methodologyJustification" to review.methodologyJustification.trim().take(4000),
         "significanceJustification" to review.significanceJustification.trim().take(4000),
         "clarityJustification" to review.clarityJustification.trim().take(4000),

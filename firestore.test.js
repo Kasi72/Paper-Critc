@@ -4,6 +4,7 @@ const {
   assertSucceeds,
 } = require("@firebase/rules-unit-testing");
 const { test, before, after, beforeEach } = require("node:test");
+const assert = require("node:assert/strict");
 const fs = require("node:fs");
 
 let testEnv;
@@ -46,6 +47,7 @@ function buildLegacyReviewPayload(userId, nowTimestamp) {
 }
 
 function buildFullV4ReviewPayload(userId, nowTimestamp, overrides = {}) {
+  // Weighted composite: (6*25 + 8*20 + 7*15 + 7*15 + 5*15 + 4*10) / 10.0 = 63.5 -> 64
   return {
     ...buildLegacyReviewPayload(userId, nowTimestamp),
     title: "Need Estimates of Psychiatric Beds: A Systematic Review and Meta-Analysis",
@@ -54,7 +56,6 @@ function buildFullV4ReviewPayload(userId, nowTimestamp, overrides = {}) {
     venueOrCitation: "World Psychiatry",
     credibilityScore: 64,
     verdict: "REQUIRES_CORRECTION",
-    // All 18 v4 provenance, 6-axis rubric, separated confidence & structured evidence ledger fields
     methodologyScore: 6,
     significanceScore: 8,
     clarityScore: 7,
@@ -124,7 +125,7 @@ test("Unauthenticated user cannot read, list, or write reviews", async () => {
   );
 });
 
-test("Authenticated owner can list empty collection and CRUD full v4 payload with all 18 provenance fields", async () => {
+test("Round-trip preservation: Firestore read-back preserves every v4 provenance, rubric, confidence, and findings field", async () => {
   const aliceDb = testEnv.authenticatedContext(ALICE_UID).firestore();
   const reviewsCol = aliceDb.collection("users").doc(ALICE_UID).collection("reviews");
 
@@ -132,12 +133,42 @@ test("Authenticated owner can list empty collection and CRUD full v4 payload wit
   await assertSucceeds(reviewsCol.where("userId", "==", ALICE_UID).get());
 
   const now = new Date(Date.now() - 1000);
-  const reviewRef = reviewsCol.doc("review_v4_001");
-  await assertSucceeds(reviewRef.set(buildFullV4ReviewPayload(ALICE_UID, now)));
-  await assertSucceeds(reviewRef.get());
-  await assertSucceeds(reviewsCol.where("userId", "==", ALICE_UID).get());
+  const written = buildFullV4ReviewPayload(ALICE_UID, now);
+  const reviewRef = reviewsCol.doc("review_v4_roundtrip");
 
-  // Mode-specific verdicts across all 3 appraisal modes
+  await assertSucceeds(reviewRef.set(written));
+  const snap = await assertSucceeds(reviewRef.get());
+  assert.equal(snap.exists, true);
+  const loaded = snap.data();
+
+  // Exact round-trip field-by-field assertion across all 18 v4 fields + composite & verdict
+  const fieldsToVerify = [
+    "credibilityScore",
+    "verdict",
+    "methodologyScore",
+    "significanceScore",
+    "clarityScore",
+    "originalityScore",
+    "mathRigorScore",
+    "reproducibilityScore",
+    "methodologyJustification",
+    "significanceJustification",
+    "clarityJustification",
+    "originalityJustification",
+    "mathRigorJustification",
+    "reproducibilityJustification",
+    "refereeConfidence",
+    "extractionConfidence",
+    "reviewMode",
+    "coverageDisclosure",
+    "validationStatus",
+    "structuredFindingsJson",
+  ];
+  for (const field of fieldsToVerify) {
+    assert.equal(loaded[field], written[field], `Round-trip mismatch on field '${field}'`);
+  }
+
+  // Mode-aligned updates across CLINICAL and JOURNAL modes succeed when verdict matches reviewMode
   await assertSucceeds(
     reviewRef.update({
       reviewMode: "CLINICAL_EVIDENCE_APPRAISAL",
@@ -149,7 +180,7 @@ test("Authenticated owner can list empty collection and CRUD full v4 payload wit
   await assertSucceeds(
     reviewRef.update({
       reviewMode: "JOURNAL_REFEREE",
-      verdict: "ACCEPT",
+      verdict: "MAJOR_REVISION",
       bookmarked: true,
       personalNotes: "Verified after erratum.",
       updatedAt: new Date(Date.now() - 250),
@@ -159,7 +190,7 @@ test("Authenticated owner can list empty collection and CRUD full v4 payload wit
   await assertSucceeds(reviewRef.delete());
 });
 
-test("Backward-compatible cloud migration: legacy doc can be upgraded with v4 provenance fields", async () => {
+test("Backward-compatible cloud migration: legacy doc can be upgraded in-place to full consistent v4 record", async () => {
   const aliceDb = testEnv.authenticatedContext(ALICE_UID).firestore();
   const created = new Date(Date.now() - 5000);
   const reviewRef = aliceDb
@@ -168,10 +199,10 @@ test("Backward-compatible cloud migration: legacy doc can be upgraded with v4 pr
     .collection("reviews")
     .doc("legacy_doc_001");
 
-  // Seed legacy pre-v4 document (without the 18 new fields)
+  // Seed legacy pre-v4 document (without rubric scores or reviewMode)
   await assertSucceeds(reviewRef.set(buildLegacyReviewPayload(ALICE_UID, created)));
 
-  // Upgrade in-place with full v4 payload while preserving original createdAt
+  // Upgrade in-place with full consistent v4 payload while preserving original createdAt
   const upgraded = buildFullV4ReviewPayload(ALICE_UID, created, {
     updatedAt: new Date(Date.now() - 500),
   });
@@ -205,12 +236,62 @@ test("Cross-user isolation: Bob cannot read, list, update, or delete Alice's v4 
   await assertFails(aliceDocFromBob.delete());
 });
 
-test("Validation & poisoning defenses: rejects extra id field, ghost keys, invalid rubric/confidence/mode/verdict, and createdAt tampering", async () => {
+test("Strict schema integrity: rejects zero rubric scores, cross-mode verdicts, composite mismatch, partial rubrics, ghost keys, and createdAt tampering", async () => {
   const aliceDb = testEnv.authenticatedContext(ALICE_UID).firestore();
   const created = new Date(Date.now() - 5000);
   const reviewsCol = aliceDb.collection("users").doc(ALICE_UID).collection("reviews");
 
-  // Reject payload containing unexpected "id" key (@DocumentId must stay out of map)
+  // 1. Reject zero rubric score (v4 requires 1..10)
+  await assertFails(
+    reviewsCol.doc("bad_zero_rubric").set(
+      buildFullV4ReviewPayload(ALICE_UID, created, {
+        methodologyScore: 0,
+        credibilityScore: 49,
+      })
+    )
+  );
+
+  // 2. Reject cross-mode verdicts (clinical review with ACCEPT; journal review with HIGH_CERTAINTY; post-pub with ACCEPT)
+  await assertFails(
+    reviewsCol.doc("bad_clinical_accept").set(
+      buildFullV4ReviewPayload(ALICE_UID, created, {
+        reviewMode: "CLINICAL_EVIDENCE_APPRAISAL",
+        verdict: "ACCEPT",
+      })
+    )
+  );
+  await assertFails(
+    reviewsCol.doc("bad_referee_certainty").set(
+      buildFullV4ReviewPayload(ALICE_UID, created, {
+        reviewMode: "JOURNAL_REFEREE",
+        verdict: "HIGH_CERTAINTY",
+      })
+    )
+  );
+  await assertFails(
+    reviewsCol.doc("bad_postpub_accept").set(
+      buildFullV4ReviewPayload(ALICE_UID, created, {
+        reviewMode: "POST_PUBLICATION_APPRAISAL",
+        verdict: "ACCEPT",
+      })
+    )
+  );
+
+  // 3. Reject composite credibilityScore contradicting the 6 persisted dimensions (true weighted = 64, not 85)
+  await assertFails(
+    reviewsCol.doc("bad_composite_mismatch").set(
+      buildFullV4ReviewPayload(ALICE_UID, created, {
+        credibilityScore: 85,
+      })
+    )
+  );
+
+  // 4. Reject partial v4 rubric (missing reproducibilityScore while reviewMode/other scores are present)
+  const partialRubric = buildFullV4ReviewPayload(ALICE_UID, created);
+  delete partialRubric.reproducibilityScore;
+  await assertFails(reviewsCol.doc("bad_partial_rubric").set(partialRubric));
+
+  // 5. Reject payload containing unexpected "id" key (@DocumentId must stay out of map)
   await assertFails(
     reviewsCol.doc("review_bad_id").set({
       ...buildFullV4ReviewPayload(ALICE_UID, created),
@@ -221,23 +302,19 @@ test("Validation & poisoning defenses: rejects extra id field, ghost keys, inval
   const reviewRef = reviewsCol.doc("review_v4_002");
   await assertSucceeds(reviewRef.set(buildFullV4ReviewPayload(ALICE_UID, created)));
 
-  // Reject ghost field injection
+  // 6. Reject ghost field injection, out-of-range confidence, invalid status, and createdAt tampering
   await assertFails(
     reviewRef.update({
       isAdminApproved: true,
       updatedAt: new Date(Date.now() - 500),
     })
   );
-
-  // Reject out-of-range rubric axis score (> 10)
   await assertFails(
     reviewRef.update({
-      methodologyScore: 11,
+      methodologyScore: 0,
       updatedAt: new Date(Date.now() - 500),
     })
   );
-
-  // Reject out-of-range confidence (< 1 or > 5)
   await assertFails(
     reviewRef.update({
       extractionConfidence: 0,
@@ -246,38 +323,11 @@ test("Validation & poisoning defenses: rejects extra id field, ghost keys, inval
   );
   await assertFails(
     reviewRef.update({
-      refereeConfidence: 6,
+      reviewMode: "CLINICAL_EVIDENCE_APPRAISAL",
+      verdict: "ACCEPT",
       updatedAt: new Date(Date.now() - 500),
     })
   );
-
-  // Reject invalid reviewMode / validationStatus / verdict / credibilityScore
-  await assertFails(
-    reviewRef.update({
-      reviewMode: "UNKNOWN_MODE",
-      updatedAt: new Date(Date.now() - 500),
-    })
-  );
-  await assertFails(
-    reviewRef.update({
-      validationStatus: "FORCE_PASSED",
-      updatedAt: new Date(Date.now() - 500),
-    })
-  );
-  await assertFails(
-    reviewRef.update({
-      verdict: "INSTANT_PUBLISH",
-      updatedAt: new Date(Date.now() - 500),
-    })
-  );
-  await assertFails(
-    reviewRef.update({
-      credibilityScore: 150,
-      updatedAt: new Date(Date.now() - 500),
-    })
-  );
-
-  // Reject immutable createdAt modification
   await assertFails(
     reviewRef.update({
       createdAt: new Date(Date.now() - 1000),

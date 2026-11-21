@@ -171,37 +171,49 @@ object ManuscriptExtractor {
       BufferedReader(InputStreamReader(stream, Charsets.UTF_8)).readText()
     } ?: throw IllegalStateException("Unable to read selected text file.")
 
-    val cleanText = rawText.trim().take(MAX_EXTRACTED_CHARS)
-    val words = countWords(cleanText)
-    val pages = (words / 350).coerceAtLeast(1)
-    val firstLineTitle = cleanText.lineSequence()
+    return extractPlainTextFromString(
+      rawText = rawText,
+      fileName = fileName,
+      maxChars = MAX_EXTRACTED_CHARS
+    )
+  }
+
+  /**
+   * Pure testable plain-text extractor using synthetic page anchors (`[PAGE N]`), high-signal
+   * page selection when exceeding [maxChars], explicit omitted-page tracking, and calibrated confidence.
+   */
+  internal fun extractPlainTextFromString(
+    rawText: String,
+    fileName: String,
+    maxChars: Int = MAX_EXTRACTED_CHARS
+  ): ExtractedManuscriptFile {
+    val cleanRaw = rawText.trim()
+    val assembled = assemblePaginatedUnstructuredText(
+      rawText = cleanRaw,
+      maxChars = maxChars,
+      baseConfidence = 4, // Unstructured plain text has no native page/figure layout metadata
+      engineLabel = "UTF-8 Text Reader (Synthetic Page-Anchored)",
+      initialWarnings = emptyList()
+    )
+    val firstLineTitle = cleanRaw.lineSequence()
       .map { it.trim().removePrefix("#").trim() }
       .firstOrNull { it.length in 5..180 }
       ?: cleanBaseTitle(fileName)
 
-    val coverage = DocumentCoverageReport(
-      totalPages = pages,
-      extractedPages = pages,
-      totalChars = cleanText.length,
-      totalWords = words,
-      extractionEngine = "UTF-8 Text Reader",
-      extractionConfidence = 5,
-      warnings = if (rawText.length > MAX_EXTRACTED_CHARS) {
-        listOf("Source exceeded $MAX_EXTRACTED_CHARS characters; tail truncated.")
-      } else {
-        emptyList()
-      }
-    )
+    val omissionNote = if (assembled.omittedPages.isNotEmpty()) {
+      " (${assembled.omittedPages.size} synthetic page(s) omitted)"
+    } else ""
 
     return ExtractedManuscriptFile(
       fileName = fileName,
       format = ManuscriptInputFormat.TEXT,
       inferredTitle = firstLineTitle,
-      pageCount = pages,
-      wordCount = words,
-      extractedText = cleanText,
-      coverageReport = coverage,
-      summaryNotice = "Loaded Text ($words words, ~$pages pages) from $fileName"
+      pageCount = assembled.totalPages,
+      wordCount = assembled.totalWords,
+      extractedText = assembled.extractedText,
+      pages = assembled.allPages,
+      coverageReport = assembled.coverageReport,
+      summaryNotice = "Loaded Text (${assembled.totalWords} words, ~${assembled.totalPages} pages$omissionNote) from $fileName"
     )
   }
 
@@ -217,88 +229,106 @@ object ManuscriptExtractor {
       readBytesBounded(it, 20_000_000)
     } ?: throw IllegalStateException("Unable to open Word .docx document.")
 
+    return extractDocxFromBytes(
+      rawBytes = rawBytes,
+      fileName = fileName,
+      maxChars = MAX_EXTRACTED_CHARS
+    )
+  }
+
+  /**
+   * Pure byte-level OOXML (.docx) extractor with synthetic page-anchored retention, explicit
+   * omitted-page accounting when oversized, and calibrated extraction confidence.
+   */
+  internal fun extractDocxFromBytes(
+    rawBytes: ByteArray,
+    fileName: String,
+    maxChars: Int = MAX_EXTRACTED_CHARS
+  ): ExtractedManuscriptFile {
     val sb = StringBuilder()
     var foundDocumentXml = false
 
-    ZipInputStream(ByteArrayInputStream(rawBytes)).use { zis ->
-      var entry = zis.nextEntry
-      while (entry != null) {
-        if (entry.name.equals("word/document.xml", ignoreCase = true)) {
-          foundDocumentXml = true
-          val parser = Xml.newPullParser()
-          parser.setInput(zis, "UTF-8")
-          var eventType = parser.eventType
-          while (eventType != XmlPullParser.END_DOCUMENT) {
-            when (eventType) {
-              XmlPullParser.START_TAG -> {
-                val tag = parser.name.substringAfterLast(':')
-                when (tag) {
-                  "t" -> {
-                    val text = parser.nextText()
-                    if (text.isNotEmpty()) sb.append(text)
+    runCatching {
+      ZipInputStream(ByteArrayInputStream(rawBytes)).use { zis ->
+        var entry = zis.nextEntry
+        while (entry != null) {
+          if (entry.name.equals("word/document.xml", ignoreCase = true)) {
+            foundDocumentXml = true
+            val parser = Xml.newPullParser()
+            parser.setInput(zis, "UTF-8")
+            var eventType = parser.eventType
+            while (eventType != XmlPullParser.END_DOCUMENT) {
+              when (eventType) {
+                XmlPullParser.START_TAG -> {
+                  val tag = parser.name.substringAfterLast(':')
+                  when (tag) {
+                    "t" -> {
+                      val text = parser.nextText()
+                      if (text.isNotEmpty()) sb.append(text)
+                    }
+                    "tab" -> sb.append("\t")
+                    "br", "cr" -> sb.append("\n")
                   }
-                  "tab" -> sb.append("\t")
-                  "br", "cr" -> sb.append("\n")
+                }
+                XmlPullParser.END_TAG -> {
+                  val tag = parser.name.substringAfterLast(':')
+                  if (tag == "p" || tag == "tr") {
+                    sb.append("\n")
+                  } else if (tag == "tc") {
+                    sb.append(" | ")
+                  }
                 }
               }
-              XmlPullParser.END_TAG -> {
-                val tag = parser.name.substringAfterLast(':')
-                if (tag == "p" || tag == "tr") {
-                  sb.append("\n")
-                } else if (tag == "tc") {
-                  sb.append(" | ")
-                }
-              }
+              eventType = parser.next()
             }
-            eventType = parser.next()
+            break
           }
-          break
+          entry = zis.nextEntry
         }
-        entry = zis.nextEntry
       }
     }
 
     val warnings = mutableListOf<String>()
-    val extractedText = if (foundDocumentXml && sb.isNotBlank()) {
+    val rawBody = if (foundDocumentXml && sb.isNotBlank()) {
       sb.toString()
         .replace(Regex("""\n{3,}"""), "\n\n")
         .trim()
-        .take(MAX_EXTRACTED_CHARS)
     } else {
-      warnings.add("word/document.xml not found; fell back to ASCII scan.")
-      extractReadableAsciiRuns(rawBytes).take(MAX_EXTRACTED_CHARS)
+      warnings.add("word/document.xml not found; fell back to ASCII scan (degraded extraction).")
+      extractReadableAsciiRuns(rawBytes)
     }
 
-    val finalBody = extractedText.ifBlank {
+    val nonEmptyBody = rawBody.ifBlank {
       warnings.add("Extracted body was empty.")
       "WORD MANUSCRIPT (.docx): $fileName"
     }
-    val words = countWords(finalBody)
-    val pages = (words / 350).coerceAtLeast(1)
-    val firstLineTitle = finalBody.lineSequence()
+
+    val assembled = assemblePaginatedUnstructuredText(
+      rawText = nonEmptyBody,
+      maxChars = maxChars,
+      baseConfidence = if (warnings.isEmpty()) 4 else 2,
+      engineLabel = "OOXML XML PullParser (Synthetic Page-Anchored)",
+      initialWarnings = warnings
+    )
+    val firstLineTitle = nonEmptyBody.lineSequence()
       .map { it.trim() }
       .firstOrNull { it.length in 6..180 && !it.startsWith("WORD MANUSCRIPT") }
       ?: cleanBaseTitle(fileName)
 
-    val coverage = DocumentCoverageReport(
-      totalPages = pages,
-      extractedPages = pages,
-      totalChars = finalBody.length,
-      totalWords = words,
-      extractionEngine = "OOXML XML PullParser",
-      extractionConfidence = if (warnings.isEmpty()) 5 else 2,
-      warnings = warnings
-    )
+    val omissionNote = if (assembled.omittedPages.isNotEmpty()) {
+      " (${assembled.omittedPages.size} synthetic page(s) omitted)"
+    } else ""
 
     return ExtractedManuscriptFile(
       fileName = fileName,
       format = ManuscriptInputFormat.WORD,
       inferredTitle = firstLineTitle,
-      pageCount = pages,
-      wordCount = words,
-      extractedText = finalBody,
-      coverageReport = coverage,
-      summaryNotice = "Loaded Word Document ($words words, ~$pages pages) from $fileName"
+      pageCount = assembled.totalPages,
+      wordCount = assembled.totalWords,
+      extractedText = assembled.extractedText,
+      pages = assembled.allPages,
+      coverageReport = assembled.coverageReport,
+      summaryNotice = "Loaded Word Document (${assembled.totalWords} words, ~${assembled.totalPages} pages$omissionNote) from $fileName"
     )
   }
 
@@ -321,30 +351,142 @@ object ManuscriptExtractor {
         .trim()
     } else {
       extractReadableAsciiRuns(rawBytes)
-    }.take(MAX_EXTRACTED_CHARS)
+    }
 
     val finalBody = cleaned.ifBlank { "WORD MANUSCRIPT: $fileName" }
-    val words = countWords(finalBody)
-    val pages = (words / 350).coerceAtLeast(1)
-    val coverage = DocumentCoverageReport(
-      totalPages = pages,
-      extractedPages = pages,
-      totalChars = finalBody.length,
-      totalWords = words,
-      extractionEngine = if (isRtf) "RTF Text Stripper" else "Legacy Binary .doc Fallback",
-      extractionConfidence = if (isRtf) 4 else 2,
-      warnings = if (isRtf) emptyList() else listOf("Legacy binary .doc format; convert to .pdf or .docx for exact layout & table fidelity.")
+    val initialWarnings = if (isRtf) {
+      emptyList()
+    } else {
+      listOf("Legacy binary .doc format; convert to .pdf or .docx for exact layout & table fidelity.")
+    }
+    val assembled = assemblePaginatedUnstructuredText(
+      rawText = finalBody,
+      maxChars = MAX_EXTRACTED_CHARS,
+      baseConfidence = if (isRtf) 3 else 2,
+      engineLabel = if (isRtf) "RTF Text Stripper (Synthetic Page-Anchored)" else "Legacy Binary .doc Fallback",
+      initialWarnings = initialWarnings
     )
 
     return ExtractedManuscriptFile(
       fileName = fileName,
       format = ManuscriptInputFormat.WORD,
       inferredTitle = cleanBaseTitle(fileName),
-      pageCount = pages,
-      wordCount = words,
-      extractedText = finalBody,
-      coverageReport = coverage,
-      summaryNotice = "Loaded Word Document ($words words) from $fileName"
+      pageCount = assembled.totalPages,
+      wordCount = assembled.totalWords,
+      extractedText = assembled.extractedText,
+      pages = assembled.allPages,
+      coverageReport = assembled.coverageReport,
+      summaryNotice = "Loaded Word Document (${assembled.totalWords} words, ~${assembled.totalPages} pages) from $fileName"
+    )
+  }
+
+  private data class UnstructuredAssemblyResult(
+    val extractedText: String,
+    val allPages: List<ExtractedPage>,
+    val omittedPages: List<Int>,
+    val totalPages: Int,
+    val totalWords: Int,
+    val coverageReport: DocumentCoverageReport
+  )
+
+  private fun assemblePaginatedUnstructuredText(
+    rawText: String,
+    maxChars: Int,
+    baseConfidence: Int,
+    engineLabel: String,
+    initialWarnings: List<String>
+  ): UnstructuredAssemblyResult {
+    val figureOrTableRegex = Regex(
+      """\b(?:figure|fig\.|table|forest\s+plot|funnel\s+plot|prisma\s+flow)\s*\d*\b""",
+      RegexOption.IGNORE_CASE
+    )
+    // Partition into synthetic ~2,400-char (~350-word) pages on paragraph/line boundaries
+    val syntheticPageTargetChars = 2_400
+    val chunks = mutableListOf<String>()
+    if (rawText.length <= syntheticPageTargetChars) {
+      chunks.add(rawText)
+    } else {
+      var cursor = 0
+      while (cursor < rawText.length) {
+        val idealEnd = (cursor + syntheticPageTargetChars).coerceAtMost(rawText.length)
+        val splitEnd = if (idealEnd >= rawText.length) {
+          rawText.length
+        } else {
+          val paraBreak = rawText.lastIndexOf("\n\n", idealEnd)
+          val lineBreak = rawText.lastIndexOf('\n', idealEnd)
+          val spaceBreak = rawText.lastIndexOf(' ', idealEnd)
+          when {
+            paraBreak > cursor + syntheticPageTargetChars / 2 -> paraBreak + 2
+            lineBreak > cursor + syntheticPageTargetChars / 2 -> lineBreak + 1
+            spaceBreak > cursor + syntheticPageTargetChars / 2 -> spaceBreak + 1
+            else -> idealEnd
+          }
+        }
+        chunks.add(rawText.substring(cursor, splitEnd).trim())
+        cursor = splitEnd
+      }
+    }
+
+    val allPages = chunks.mapIndexed { idx, chunk ->
+      val words = countWords(chunk)
+      ExtractedPage(
+        pageNumber = idx + 1,
+        text = chunk,
+        charCount = chunk.length,
+        wordCount = words,
+        hasLowTextDensity = words < 35,
+        mentionsFiguresOrTables = figureOrTableRegex.containsMatchIn(chunk)
+      )
+    }
+
+    val selection = selectPagesWithinCharBudget(allPages, maxChars)
+    val warnings = initialWarnings.toMutableList()
+    if (selection.omittedPages.isNotEmpty()) {
+      warnings.add(
+        "Source exceeded %,d-character extraction ceiling; synthetic page(s) %s omitted after preserving opening, high-signal Results/Methods/Tables, and closing pages.".format(
+          Locale.US,
+          maxChars,
+          selection.omittedPages.joinToString(",") { "P$it" }
+        )
+      )
+    }
+
+    val replacementChars = rawText.count { it == '\uFFFD' }
+    val alphaNumRatio = rawText.count { it.isLetterOrDigit() }.toDouble() / rawText.length.coerceAtLeast(1).toDouble()
+    var confidence = baseConfidence.coerceIn(1, 5)
+    if (replacementChars > 5 || alphaNumRatio < 0.55) {
+      confidence = minOf(confidence, 2)
+      warnings.add("Detected encoding artifacts or non-alphanumeric noise in extracted text.")
+    }
+    if (selection.omittedPages.isNotEmpty()) {
+      confidence = minOf(confidence, 3)
+    }
+    if (selection.partiallyRetainedPages.isNotEmpty()) {
+      confidence = minOf(confidence, 3)
+      warnings.add(
+        "Synthetic page(s) ${selection.partiallyRetainedPages.joinToString(",") { "P$it" }} partially retained to fit character ceiling."
+      )
+    }
+
+    val totalWords = countWords(selection.assembledText)
+    val extractedCount = (allPages.size - selection.omittedPages.size).coerceAtLeast(0)
+    val coverage = DocumentCoverageReport(
+      totalPages = allPages.size.coerceAtLeast(1),
+      extractedPages = extractedCount,
+      omittedPages = selection.omittedPages,
+      totalChars = selection.assembledText.length,
+      totalWords = totalWords,
+      extractionEngine = engineLabel,
+      extractionConfidence = confidence,
+      warnings = warnings
+    )
+    return UnstructuredAssemblyResult(
+      extractedText = selection.assembledText,
+      allPages = allPages,
+      omittedPages = selection.omittedPages,
+      totalPages = allPages.size.coerceAtLeast(1),
+      totalWords = totalWords,
+      coverageReport = coverage
     )
   }
 
@@ -555,28 +697,24 @@ object ManuscriptExtractor {
       )
     }
 
-    // Page-aware assembly: track exact pages omitted if a massive document exceeds maxChars
-    val assembledBuilder = StringBuilder()
-    var hasReachedCeiling = false
-    for (pg in extractedPages) {
-      if (pg.text.isBlank()) continue
-      val block = "[PAGE ${pg.pageNumber}]\n${pg.text}\n\n"
-      if (!hasReachedCeiling && assembledBuilder.length + block.length <= maxChars) {
-        assembledBuilder.append(block)
-      } else {
-        hasReachedCeiling = true
-        omittedPages.add(pg.pageNumber)
-      }
-    }
-    val assembledPagesText = assembledBuilder.toString().trim()
+    // High-signal page selection BEFORE applying maxChars so late Results, Figures, Tables,
+    // Limitations, Supplements, and Discussion pages are NEVER permanently dropped behind early bloat or references.
+    val selection = selectPagesWithinCharBudget(extractedPages, maxChars)
+    omittedPages.addAll(selection.omittedPages)
+    val assembledPagesText = selection.assembledText
 
     if (omittedPages.isNotEmpty()) {
       warnings.add(
-        "Extraction ceiling (%,d chars) reached; page(s) %s omitted from extracted text.".format(
+        "Extraction ceiling (%,d chars) reached; high-signal opening/results/figure/discussion pages prioritized while page(s) %s were omitted from extracted text.".format(
           Locale.US,
           maxChars,
           omittedPages.joinToString(",") { "P$it" }
         )
+      )
+    }
+    if (selection.partiallyRetainedPages.isNotEmpty()) {
+      warnings.add(
+        "Page(s) ${selection.partiallyRetainedPages.joinToString(",") { "P$it" }} partially retained to fit extraction ceiling."
       )
     }
 
@@ -607,6 +745,111 @@ object ManuscriptExtractor {
       pdfBoxSucceeded = pdfBoxResult.isSuccess,
       isScannedVisionOnly = isScannedVisionOnly,
       warnings = warnings
+    )
+  }
+
+  private data class PageBudgetSelection(
+    val assembledText: String,
+    val omittedPages: List<Int>,
+    val partiallyRetainedPages: List<Int>
+  )
+
+  /**
+   * Selects pages BEFORE applying [maxChars] so late high-signal pages (Results, Tables, Figures,
+   * Limitations, Discussion, Conclusions, Supplements) are retained ahead of bibliography/reference
+   * pages or repetitive narrative filler, then assembles incrementally in ascending page order.
+   */
+  private fun selectPagesWithinCharBudget(
+    pages: List<ExtractedPage>,
+    maxChars: Int
+  ): PageBudgetSelection {
+    val nonBlank = pages.filter { it.text.isNotBlank() }
+    if (nonBlank.isEmpty()) {
+      return PageBudgetSelection(assembledText = "", omittedPages = emptyList(), partiallyRetainedPages = emptyList())
+    }
+
+    val fullBlocks = nonBlank.map { pg -> pg.pageNumber to "[PAGE ${pg.pageNumber}]\n${pg.text}" }
+    val fullTotalLen = fullBlocks.sumOf { it.second.length + 2 }
+    if (fullTotalLen <= maxChars) {
+      return PageBudgetSelection(
+        assembledText = fullBlocks.joinToString("\n\n") { it.second }.trim(),
+        omittedPages = emptyList(),
+        partiallyRetainedPages = emptyList()
+      )
+    }
+
+    val highSignalRegex = Regex(
+      """\b(?:results?|methods?|discussion|conclusion|limitations?|supplement(?:ary)?|appendix|table\s*\d+|figure\s*\d+|fig\.\s*\d+|95%\s*ci|meta-?analysis|meta-?regression|p\s*[=<>≤]|i²|i2|errat(?:um|a))\b""",
+      RegexOption.IGNORE_CASE
+    )
+    val refHeaderRegex = Regex("""(?im)^\s*(?:references|bibliography|works\s+cited)\s*$""")
+    val citationLineRegex = Regex("""(?m)^\s*(?:\[\d+\]|\d+\.\s+[A-Z][a-z]+,?\s+[A-Z])""")
+    val inlineBracketCitationRegex = Regex("""\[\d{1,3}\]\s+[A-Z]""")
+
+    var referencesStarted = false
+    val scored = nonBlank.mapIndexed { idx, pg ->
+      if (idx >= nonBlank.size / 3 && refHeaderRegex.containsMatchIn(pg.text)) {
+        referencesStarted = true
+      }
+      val signalHits = highSignalRegex.findAll(pg.text).count()
+      val citationHits = maxOf(
+        citationLineRegex.findAll(pg.text).count(),
+        inlineBracketCitationRegex.findAll(pg.text).count()
+      )
+      val looksLikeRefOnly = (referencesStarted && signalHits == 0) || (citationHits >= 6 && signalHits <= 1)
+
+      val priority = when {
+        idx == 0 -> 100_000
+        looksLikeRefOnly -> -5_000 - idx
+        idx == nonBlank.lastIndex && !referencesStarted -> 20_000 + signalHits * 200
+        pg.mentionsFiguresOrTables -> 12_000 + signalHits * 250
+        else -> (if (idx == 1) 8_000 else 0) + signalHits * 300
+      }
+      Triple(pg.pageNumber, "[PAGE ${pg.pageNumber}]\n${pg.text}", priority)
+    }
+
+    val selectedPageNums = linkedSetOf<Int>()
+    var used = 0
+    for ((pageNum, block, _) in scored.sortedByDescending { it.third }) {
+      val needed = block.length + 2
+      if (used + needed <= maxChars) {
+        selectedPageNums.add(pageNum)
+        used += needed
+      }
+    }
+
+    // Incrementally assemble in ascending page order; if even the highest-priority single page
+    // exceeds maxChars, explicitly retain a marked partial slice rather than dropping everything.
+    val assembled = StringBuilder()
+    val retainedFull = linkedSetOf<Int>()
+    val partiallyRetained = mutableListOf<Int>()
+
+    if (selectedPageNums.isNotEmpty()) {
+      for ((pageNum, block) in fullBlocks) {
+        if (pageNum !in selectedPageNums) continue
+        val sep = if (assembled.isEmpty()) "" else "\n\n"
+        if (assembled.length + sep.length + block.length <= maxChars) {
+          assembled.append(sep).append(block)
+          retainedFull.add(pageNum)
+        }
+      }
+    } else {
+      val topPage = scored.maxByOrNull { it.third }!!
+      val header = "[PAGE ${topPage.first} — PARTIAL]\n"
+      val remaining = (maxChars - header.length - 4).coerceAtLeast(40)
+      val rawBody = topPage.second.substringAfter('\n')
+      assembled.append(header).append(rawBody.take(remaining)).append("...")
+      partiallyRetained.add(topPage.first)
+    }
+
+    val omitted = nonBlank.map { it.pageNumber }
+      .filter { it !in retainedFull && it !in partiallyRetained }
+      .sorted()
+
+    return PageBudgetSelection(
+      assembledText = assembled.toString().trim(),
+      omittedPages = omitted,
+      partiallyRetainedPages = partiallyRetained
     )
   }
 

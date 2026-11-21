@@ -32,6 +32,35 @@ service cloud.firestore {
       ]);
     }
 
+    function isModeAlignedVerdict(mode, verdict) {
+      return (mode == 'POST_PUBLICATION_APPRAISAL' && verdict in ['HIGH_CREDIBILITY', 'SOUND_WITH_CAVEATS', 'REQUIRES_CORRECTION', 'MAJOR_CONCERNS', 'LOW_CREDIBILITY']) ||
+             (mode == 'JOURNAL_REFEREE' && verdict in ['ACCEPT', 'MINOR_REVISION', 'MAJOR_REVISION', 'REJECT_AND_RESUBMIT', 'REJECT']) ||
+             (mode == 'CLINICAL_EVIDENCE_APPRAISAL' && verdict in ['HIGH_CERTAINTY', 'MODERATE_CERTAINTY', 'LOW_CERTAINTY', 'VERY_LOW_CERTAINTY']);
+    }
+
+    function isLegacyReviewSchema(data) {
+      return !('reviewMode' in data) &&
+             !('methodologyScore' in data) &&
+             !('significanceScore' in data) &&
+             !('clarityScore' in data) &&
+             !('originalityScore' in data) &&
+             !('mathRigorScore' in data) &&
+             !('reproducibilityScore' in data) &&
+             data.verdict in ['ACCEPT', 'MINOR_REVISION', 'MAJOR_REVISION', 'REJECT_AND_RESUBMIT', 'REJECT'];
+    }
+
+    function isV4ConsistentReviewSchema(data) {
+      return 'reviewMode' in data &&
+             isModeAlignedVerdict(data.reviewMode, data.verdict) &&
+             data.methodologyScore is int && data.methodologyScore >= 1 && data.methodologyScore <= 10 &&
+             data.significanceScore is int && data.significanceScore >= 1 && data.significanceScore <= 10 &&
+             data.clarityScore is int && data.clarityScore >= 1 && data.clarityScore <= 10 &&
+             data.originalityScore is int && data.originalityScore >= 1 && data.originalityScore <= 10 &&
+             data.mathRigorScore is int && data.mathRigorScore >= 1 && data.mathRigorScore <= 10 &&
+             data.reproducibilityScore is int && data.reproducibilityScore >= 1 && data.reproducibilityScore <= 10 &&
+             data.credibilityScore == int((data.methodologyScore * 25 + data.significanceScore * 20 + data.clarityScore * 15 + data.originalityScore * 15 + data.mathRigorScore * 15 + data.reproducibilityScore * 10 + 5) / 10);
+    }
+
     function isValidCoreReview(data) {
       return data.userId == request.auth.uid &&
              data.title is string && data.title.size() >= 1 && data.title.size() <= 500 &&
@@ -40,11 +69,7 @@ service cloud.firestore {
              data.venueOrCitation is string && data.venueOrCitation.size() <= 500 &&
              data.isEmpirical is bool &&
              data.credibilityScore is int && data.credibilityScore >= 0 && data.credibilityScore <= 100 &&
-             data.verdict in [
-               'ACCEPT', 'MINOR_REVISION', 'MAJOR_REVISION', 'REJECT_AND_RESUBMIT', 'REJECT',
-               'HIGH_CREDIBILITY', 'SOUND_WITH_CAVEATS', 'REQUIRES_CORRECTION', 'MAJOR_CONCERNS', 'LOW_CREDIBILITY',
-               'HIGH_CERTAINTY', 'MODERATE_CERTAINTY', 'LOW_CERTAINTY', 'VERY_LOW_CERTAINTY'
-             ] &&
+             (isV4ConsistentReviewSchema(data) || isLegacyReviewSchema(data)) &&
              data.abstractSummary is string && data.abstractSummary.size() >= 1 && data.abstractSummary.size() <= 5000 &&
              data.researchQuestion is string && data.researchQuestion.size() >= 1 && data.researchQuestion.size() <= 3000 &&
              data.keyMethodology is string && data.keyMethodology.size() >= 1 && data.keyMethodology.size() <= 4000 &&
@@ -63,14 +88,8 @@ service cloud.firestore {
              data.updatedAt is timestamp && data.updatedAt <= request.time;
     }
 
-    function isValidProvenanceFields(data) {
-      return data.get('methodologyScore', 0) is int && data.get('methodologyScore', 0) >= 0 && data.get('methodologyScore', 0) <= 10 &&
-             data.get('significanceScore', 0) is int && data.get('significanceScore', 0) >= 0 && data.get('significanceScore', 0) <= 10 &&
-             data.get('clarityScore', 0) is int && data.get('clarityScore', 0) >= 0 && data.get('clarityScore', 0) <= 10 &&
-             data.get('originalityScore', 0) is int && data.get('originalityScore', 0) >= 0 && data.get('originalityScore', 0) <= 10 &&
-             data.get('mathRigorScore', 0) is int && data.get('mathRigorScore', 0) >= 0 && data.get('mathRigorScore', 0) <= 10 &&
-             data.get('reproducibilityScore', 0) is int && data.get('reproducibilityScore', 0) >= 0 && data.get('reproducibilityScore', 0) <= 10 &&
-             data.get('methodologyJustification', '') is string && data.get('methodologyJustification', '').size() <= 4000 &&
+    function isValidProvenanceMeta(data) {
+      return data.get('methodologyJustification', '') is string && data.get('methodologyJustification', '').size() <= 4000 &&
              data.get('significanceJustification', '') is string && data.get('significanceJustification', '').size() <= 4000 &&
              data.get('clarityJustification', '') is string && data.get('clarityJustification', '').size() <= 4000 &&
              data.get('originalityJustification', '') is string && data.get('originalityJustification', '').size() <= 4000 &&
@@ -78,7 +97,6 @@ service cloud.firestore {
              data.get('reproducibilityJustification', '') is string && data.get('reproducibilityJustification', '').size() <= 4000 &&
              data.get('refereeConfidence', 3) is int && data.get('refereeConfidence', 3) >= 1 && data.get('refereeConfidence', 3) <= 5 &&
              data.get('extractionConfidence', 3) is int && data.get('extractionConfidence', 3) >= 1 && data.get('extractionConfidence', 3) <= 5 &&
-             data.get('reviewMode', 'POST_PUBLICATION_APPRAISAL') in ['POST_PUBLICATION_APPRAISAL', 'JOURNAL_REFEREE', 'CLINICAL_EVIDENCE_APPRAISAL'] &&
              data.get('coverageDisclosure', '') is string && data.get('coverageDisclosure', '').size() <= 2000 &&
              data.get('validationStatus', 'PARTIALLY_VALIDATED') in ['VERIFIED', 'ADJUDICATED_WITH_CAVEATS', 'PARTIALLY_VALIDATED', 'UNVERIFIED'] &&
              data.get('structuredFindingsJson', '') is string && data.get('structuredFindingsJson', '').size() <= 60000;
@@ -92,13 +110,13 @@ service cloud.firestore {
                        isValidId(reviewId) &&
                        hasAllowedReviewKeys(request.resource.data) &&
                        isValidCoreReview(request.resource.data) &&
-                       isValidProvenanceFields(request.resource.data);
+                       isValidProvenanceMeta(request.resource.data);
 
       allow update: if isOwner(userId) &&
                        isValidId(reviewId) &&
                        hasAllowedReviewKeys(request.resource.data) &&
                        isValidCoreReview(request.resource.data) &&
-                       isValidProvenanceFields(request.resource.data) &&
+                       isValidProvenanceMeta(request.resource.data) &&
                        request.resource.data.userId == resource.data.userId &&
                        request.resource.data.createdAt == resource.data.createdAt;
 

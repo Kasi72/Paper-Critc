@@ -1056,10 +1056,11 @@ class Reviewer2PipelineService {
 
     // Parse LLM structuredFindings and run deterministic cross-pass adjudication + strict source-quote verification
     val rawStructuredFindings = parseStructuredFindingsFromJson(pass2Json.optJSONArray("structuredFindings"))
+    val allImpactedPromptPages = (primaryPrepared.omittedPages + primaryPrepared.partiallyRetainedPages).distinct()
     val preliminaryExtractionConfidence = computeCalibratedExtractionConfidence(
       manuscriptText = manuscriptText,
       coverageReport = coverageReport,
-      omittedPromptPages = primaryPrepared.omittedPages,
+      omittedPromptPages = allImpactedPromptPages,
       wasPromptTrimmed = primaryPrepared.wasTrimmed,
       adjudicatedFindings = emptyList()
     )
@@ -1082,11 +1083,11 @@ class Reviewer2PipelineService {
     val verdict = adjudicated.resolvedVerdict
     val structuredFindingsJson = ReviewFindingCodec.encode(adjudicated.adjudicatedFindings)
 
-    // Calibrated extraction confidence incorporating parser status, omissions, text quality & quote verifiability
+    // Calibrated extraction confidence incorporating parser status, omissions, partial cuts, text quality & quote verifiability
     val extractionConfidence = computeCalibratedExtractionConfidence(
       manuscriptText = manuscriptText,
       coverageReport = coverageReport,
-      omittedPromptPages = primaryPrepared.omittedPages,
+      omittedPromptPages = allImpactedPromptPages,
       wasPromptTrimmed = primaryPrepared.wasTrimmed,
       adjudicatedFindings = adjudicated.adjudicatedFindings
     )
@@ -1097,7 +1098,7 @@ class Reviewer2PipelineService {
         it.status == FindingStatus.PARTIALLY_SUPPORTED
     }
     val validationStatus = when {
-      anyJsonRepaired || primaryPrepared.omittedPages.isNotEmpty() || extractionConfidence <= 2 -> "PARTIALLY_VALIDATED"
+      anyJsonRepaired || allImpactedPromptPages.isNotEmpty() || extractionConfidence <= 2 -> "PARTIALLY_VALIDATED"
       primaryPrepared.wasTrimmed || hasPartialOrUnverified -> "ADJUDICATED_WITH_CAVEATS"
       else -> "VERIFIED"
     }
@@ -1976,7 +1977,8 @@ class Reviewer2PipelineService {
     val text: String,
     val wasTrimmed: Boolean,
     val trimmedNote: String,
-    val omittedPages: List<Int> = emptyList()
+    val omittedPages: List<Int> = emptyList(),
+    val partiallyRetainedPages: List<Int> = emptyList()
   )
 
   internal enum class QuoteMatchKind {
@@ -2126,53 +2128,90 @@ class Reviewer2PipelineService {
         }
       }
 
-      // 2. Page-aware stratified retention when page markers exist (never silently drop Results/Discussion tail!)
+      // 2. Page-aware stratified retention when page markers exist (never silently chop the final page!)
       val pageBlocks = extractPageBlocks(clean)
-      if (pageBlocks.size >= 3) {
+      if (pageBlocks.size >= 2) {
         val highSignalRegex = Regex(
-          """\b(?:results?|methods?|discussion|conclusion|table\s*\d+|figure\s*\d+|fig\.\s*\d+|95%\s*ci|meta-?analysis|meta-?regression|p\s*[=<>≤]|i²|i2)\b""",
+          """\b(?:results?|methods?|discussion|conclusion|limitations?|supplement(?:ary)?|appendix|table\s*\d+|figure\s*\d+|fig\.\s*\d+|95%\s*ci|meta-?analysis|meta-?regression|p\s*[=<>≤]|i²|i2)\b""",
           RegexOption.IGNORE_CASE
         )
-        // Prioritize Page 1, last body page, and high-signal Results/Tables/Figures pages
+        // Prioritize Page 1, closing page, and high-signal Results/Tables/Figures/Limitations pages
         val scored = pageBlocks.mapIndexed { idx, (pageNum, body) ->
           val signalHits = highSignalRegex.findAll(body).count()
           val priority = when {
             idx == 0 -> 10_000
-            idx == pageBlocks.lastIndex -> 5_000
-            idx == 1 -> 4_000
+            idx == pageBlocks.lastIndex -> 5_000 + signalHits * 50
+            idx == 1 -> 4_000 + signalHits * 50
             else -> signalHits * 100
           }
           Triple(pageNum, "[PAGE $pageNum]\n$body", priority)
         }
 
+        val budget = (maxChars - 260).coerceAtLeast(320)
         val selectedPageNums = linkedSetOf<Int>()
-        var usedChars = 0
-        val budget = (maxChars - 240).coerceAtLeast(400)
+        var plannedChars = 0
         for ((pageNum, formatted, _) in scored.sortedByDescending { it.third }) {
-          val len = formatted.length + 2
-          if (usedChars + len <= budget) {
+          val sepCost = if (selectedPageNums.isEmpty()) 0 else 2
+          if (plannedChars + sepCost + formatted.length <= budget) {
             selectedPageNums.add(pageNum)
-            usedChars += len
+            plannedChars += sepCost + formatted.length
           }
         }
-        // Always include at least Page 1 truncated if even Page 1 alone exceeds budget
-        if (selectedPageNums.isEmpty()) {
-          val first = pageBlocks.first()
-          selectedPageNums.add(first.first)
+
+        // Incrementally construct output strictly within [budget] — NEVER call `.take(budget)` post-hoc.
+        val bodyBuilder = StringBuilder()
+        val fullyRetained = linkedSetOf<Int>()
+        val partiallyRetained = mutableListOf<Int>()
+
+        for ((pageNum, body) in pageBlocks) {
+          if (pageNum !in selectedPageNums) continue
+          val sep = if (bodyBuilder.isEmpty()) "" else "\n\n"
+          val block = "[PAGE $pageNum]\n$body"
+          if (bodyBuilder.length + sep.length + block.length <= budget) {
+            bodyBuilder.append(sep).append(block)
+            fullyRetained.add(pageNum)
+          }
         }
 
-        val omitted = pageBlocks.map { it.first }.filter { it !in selectedPageNums }.sorted()
-        val orderedBody = pageBlocks
-          .filter { it.first in selectedPageNums }
-          .joinToString("\n\n") { (p, b) -> "[PAGE $p]\n$b" }
-          .take(budget)
-        val omittedSummary = omitted.joinToString(",") { "P$it" }
-        val assembled = "$orderedBody\n\n[... Partial coverage: page(s) $omittedSummary omitted to fit prompt window ...]"
+        // If any high-priority page couldn't fit completely (including when Page 1 itself > budget,
+        // or when remaining budget allows a meaningful partial slice of the next highest-priority page),
+        // include an explicitly tagged partial slice and record it in partiallyRetainedPages.
+        val remainingCandidates = scored
+          .filter { it.first !in fullyRetained }
+          .sortedByDescending { it.third }
+        val topRemaining = remainingCandidates.firstOrNull()
+        if (topRemaining != null) {
+          val pageNum = topRemaining.first
+          val rawBody = pageBlocks.first { it.first == pageNum }.second
+          val sep = if (bodyBuilder.isEmpty()) "" else "\n\n"
+          val header = "[PAGE $pageNum — PARTIAL]\n"
+          val availableForBody = budget - bodyBuilder.length - sep.length - header.length - 64
+          if (fullyRetained.isEmpty() || availableForBody >= 180) {
+            val sliceLen = availableForBody.coerceAtLeast(120).coerceAtMost(rawBody.length)
+            bodyBuilder.append(sep)
+              .append(header)
+              .append(rawBody.take(sliceLen))
+              .append("\n[... Page $pageNum truncated: $sliceLen/${rawBody.length} chars retained ...]")
+            partiallyRetained.add(pageNum)
+          }
+        }
+
+        val omitted = pageBlocks.map { it.first }
+          .filter { it !in fullyRetained && it !in partiallyRetained }
+          .sorted()
+        val partialSorted = partiallyRetained.sorted()
+        val parts = buildList {
+          if (omitted.isNotEmpty()) add("omitted: ${omitted.joinToString(",") { "P$it" }}")
+          if (partialSorted.isNotEmpty()) add("partially retained: ${partialSorted.joinToString(",") { "P$it" }}")
+        }
+        val disclosureSummary = parts.joinToString("; ")
+        val assembled = "${bodyBuilder}\n\n[... Partial prompt coverage ($disclosureSummary) to fit prompt window ...]"
         return PromptPreparedManuscript(
           text = assembled,
           wasTrimmed = true,
-          trimmedNote = "Partial prompt coverage: page(s) $omittedSummary omitted (retained ${selectedPageNums.size}/${pageBlocks.size} pages across opening, results/figures, and closing sections).",
-          omittedPages = omitted
+          trimmedNote = "Partial prompt coverage ($disclosureSummary; fully retained ${fullyRetained.size}/${pageBlocks.size} pages).",
+          omittedPages = omitted,
+          partiallyRetainedPages = partialSorted
         )
       }
 
@@ -2721,11 +2760,15 @@ class Reviewer2PipelineService {
       val hasVerifiedCriticalError = verifiedFindings.any {
         it.status == FindingStatus.VERIFIED && it.severity == "CRITICAL"
       }
+      val hasPartiallySupportedCriticalDiscrepancy = verifiedFindings.any {
+        it.status == FindingStatus.PARTIALLY_SUPPORTED && it.severity == "CRITICAL"
+      }
       val resolvedVerdict = resolveVerdictForMode(
         rawVerdict = rawVerdict,
         compositeScore = exactComposite,
         reviewMode = reviewMode,
-        hasVerifiedCriticalError = hasVerifiedCriticalError
+        hasVerifiedCriticalError = hasVerifiedCriticalError,
+        hasPartiallySupportedCriticalDiscrepancy = hasPartiallySupportedCriticalDiscrepancy
       )
 
       return AdjudicationResult(
@@ -2742,38 +2785,67 @@ class Reviewer2PipelineService {
     }
 
     /**
-     * Derives the final appraisal verdict strictly from authoritative score bands, verified
-     * critical findings, and [reviewMode] rules. Any model-supplied [rawVerdict] is strictly
-     * advisory and can NEVER override score-band consistency (e.g., a score of 45 can never
-     * receive HIGH_CREDIBILITY, ACCEPT, or HIGH_CERTAINTY).
+     * Explicit, deterministic decision-table verdict resolver strictly derived from weighted
+     * score bands, verified critical errors, partially-supported critical discrepancies, and
+     * [reviewMode] rules (any model-emitted [rawVerdict] is advisory only and ignored):
+     *
+     * - **POST_PUBLICATION_APPRAISAL**:
+     *   - Verified CRITICAL error -> `REQUIRES_CORRECTION` (if score >= 40) else `LOW_CREDIBILITY`
+     *   - Partially-supported CRITICAL discrepancy -> caps top tier (`>= 85`) at `SOUND_WITH_CAVEATS`
+     *   - Clean bands: `>=85 HIGH_CREDIBILITY`, `70..84 SOUND_WITH_CAVEATS`, `55..69 REQUIRES_CORRECTION`, `40..54 MAJOR_CONCERNS`, `<40 LOW_CREDIBILITY`
+     * - **CLINICAL_EVIDENCE_APPRAISAL (GRADE-aligned)**:
+     *   - Base tier: `>=85 HIGH_CERTAINTY`, `68..84 MODERATE_CERTAINTY`, `48..67 LOW_CERTAINTY`, `<48 VERY_LOW_CERTAINTY`
+     *   - Verified CRITICAL error applies a -2 GRADE downgrade (`HIGH -> LOW`, `MODERATE -> VERY_LOW`, `LOW -> VERY_LOW`)
+     *   - Partially-supported CRITICAL discrepancy applies a -1 GRADE caveat downgrade (`HIGH -> MODERATE`, `MODERATE -> LOW`)
+     * - **JOURNAL_REFEREE**:
+     *   - Verified CRITICAL error -> `MAJOR_REVISION` (if score >= 45), `REJECT_AND_RESUBMIT` (40..44), `REJECT` (<40)
+     *   - Partially-supported CRITICAL discrepancy -> caps `ACCEPT` (`>=85`) at `MINOR_REVISION`
+     *   - Clean bands: `>=85 ACCEPT`, `72..84 MINOR_REVISION`, `55..71 MAJOR_REVISION`, `40..54 REJECT_AND_RESUBMIT`, `<40 REJECT`
      */
     internal fun resolveVerdictForMode(
       rawVerdict: String,
       compositeScore: Int,
       reviewMode: ReviewMode,
-      hasVerifiedCriticalError: Boolean = false
+      hasVerifiedCriticalError: Boolean = false,
+      hasPartiallySupportedCriticalDiscrepancy: Boolean = false
     ): String {
       val clamped = compositeScore.coerceIn(0, 100)
       return when (reviewMode) {
         ReviewMode.POST_PUBLICATION_APPRAISAL -> when {
-          clamped >= 85 && !hasVerifiedCriticalError -> "HIGH_CREDIBILITY"
-          clamped >= 70 && !hasVerifiedCriticalError -> "SOUND_WITH_CAVEATS"
-          clamped >= 55 || (clamped >= 40 && hasVerifiedCriticalError) -> "REQUIRES_CORRECTION"
-          clamped >= 40 -> "MAJOR_CONCERNS"
-          else -> "LOW_CREDIBILITY"
+          clamped < 40 -> "LOW_CREDIBILITY"
+          hasVerifiedCriticalError -> "REQUIRES_CORRECTION"
+          clamped >= 85 && !hasPartiallySupportedCriticalDiscrepancy -> "HIGH_CREDIBILITY"
+          clamped >= 70 -> "SOUND_WITH_CAVEATS"
+          clamped >= 55 -> "REQUIRES_CORRECTION"
+          else -> "MAJOR_CONCERNS"
         }
-        ReviewMode.CLINICAL_EVIDENCE_APPRAISAL -> when {
-          clamped >= 85 && !hasVerifiedCriticalError -> "HIGH_CERTAINTY"
-          clamped >= 68 && !hasVerifiedCriticalError -> "MODERATE_CERTAINTY"
-          clamped >= 48 -> "LOW_CERTAINTY"
-          else -> "VERY_LOW_CERTAINTY"
+        ReviewMode.CLINICAL_EVIDENCE_APPRAISAL -> {
+          // GRADE levels: 3 = HIGH, 2 = MODERATE, 1 = LOW, 0 = VERY_LOW
+          val baseGrade = when {
+            clamped >= 85 -> 3
+            clamped >= 68 -> 2
+            clamped >= 48 -> 1
+            else -> 0
+          }
+          val downgrade = when {
+            hasVerifiedCriticalError -> 2
+            hasPartiallySupportedCriticalDiscrepancy && baseGrade >= 2 -> 1
+            else -> 0
+          }
+          when ((baseGrade - downgrade).coerceIn(0, 3)) {
+            3 -> "HIGH_CERTAINTY"
+            2 -> "MODERATE_CERTAINTY"
+            1 -> "LOW_CERTAINTY"
+            else -> "VERY_LOW_CERTAINTY"
+          }
         }
         ReviewMode.JOURNAL_REFEREE -> when {
-          clamped >= 85 && !hasVerifiedCriticalError -> "ACCEPT"
-          clamped >= 72 && !hasVerifiedCriticalError -> "MINOR_REVISION"
-          clamped >= 55 || (clamped >= 45 && hasVerifiedCriticalError) -> "MAJOR_REVISION"
-          clamped >= 40 -> "REJECT_AND_RESUBMIT"
-          else -> "REJECT"
+          clamped < 40 -> "REJECT"
+          hasVerifiedCriticalError -> if (clamped >= 45) "MAJOR_REVISION" else "REJECT_AND_RESUBMIT"
+          clamped >= 85 && !hasPartiallySupportedCriticalDiscrepancy -> "ACCEPT"
+          clamped >= 72 -> "MINOR_REVISION"
+          clamped >= 55 -> "MAJOR_REVISION"
+          else -> "REJECT_AND_RESUBMIT"
         }
       }
     }

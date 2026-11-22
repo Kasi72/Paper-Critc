@@ -1,5 +1,7 @@
 package com.example.data.ai
 
+import com.example.data.ai.stats.StatisticalAuditOrchestrator
+import com.example.data.ai.stats.StatisticalAuditReport
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.exp
@@ -67,7 +69,8 @@ data class QuantitativeForensicReport(
   val powerAndMultiplicityAlerts: List<String>,
   val algebraicAndMetricAlerts: List<String>,
   val diagnosticTable: List<QuantDiagnosticFinding>,
-  val extractedPrecisionMetrics: List<String>
+  val extractedPrecisionMetrics: List<String>,
+  val statisticalAudit: StatisticalAuditReport? = null
 ) {
   val totalChecksExecuted: Int
     get() = statcheckResults.size + confidenceIntervalChecks.size + medianIqrChecks.size +
@@ -152,6 +155,11 @@ data class QuantitativeForensicReport(
       appendLine("  Algebraic, Range & Metric Plausibility Alerts:")
       algebraicAndMetricAlerts.forEach { appendLine("  * $it") }
     }
+
+    if (statisticalAudit != null) {
+      appendLine()
+      appendLine(statisticalAudit.toPromptBlock())
+    }
   }
 
   /**
@@ -159,16 +167,24 @@ data class QuantitativeForensicReport(
    * and severity bullets that render cleanly in both the PDF and Compose UI.
    */
   fun toDeterministicAuditSummary(): String = buildString {
-    if (diagnosticTable.isEmpty()) return@buildString
-    appendLine("[PRE-FLIGHT DETERMINISTIC STATISTICAL FORENSICS (${diagnosticTable.size} Automated Checks)]")
-    appendLine("| Check Domain | Reported Evidence | Status | Exact Mathematical Finding |")
-    appendLine("|---|---|---|---|")
-    diagnosticTable.take(12).forEach { row ->
-      val pg = if (row.pageNumber > 0) " (P${row.pageNumber})" else ""
-      val safeCat = (row.category + pg).replace("|", "/")
-      val safeEv = row.reportedEvidence.replace("|", "/").take(76)
-      val safeDetail = row.diagnosticDetail.replace("|", "/").take(220)
-      appendLine("| $safeCat | $safeEv | ${row.status.name} | $safeDetail |")
+    if (diagnosticTable.isNotEmpty()) {
+      appendLine("[PRE-FLIGHT DETERMINISTIC STATISTICAL FORENSICS (${diagnosticTable.size} Automated Checks)]")
+      appendLine("| Check Domain | Reported Evidence | Status | Exact Mathematical Finding |")
+      appendLine("|---|---|---|---|")
+      diagnosticTable.take(12).forEach { row ->
+        val pg = if (row.pageNumber > 0) " (P${row.pageNumber})" else ""
+        val safeCat = (row.category + pg).replace("|", "/")
+        val safeEv = row.reportedEvidence.replace("|", "/").take(76)
+        val safeDetail = row.diagnosticDetail.replace("|", "/").take(220)
+        appendLine("| $safeCat | $safeEv | ${row.status.name} | $safeDetail |")
+      }
+    }
+    if (statisticalAudit != null) {
+      val trail = statisticalAudit.toAuditTrailMarkdown()
+      if (trail.isNotBlank()) {
+        if (isNotEmpty()) appendLine()
+        appendLine(trail)
+      }
     }
   }.trim()
 }
@@ -370,6 +386,8 @@ object QuantitativeForensicAnalyzer {
       iqrChecks.take(4).forEach { add(it.rawClaim) }
     }
 
+    val statisticalAudit = StatisticalAuditOrchestrator.audit(clean, studyDesign)
+
     return QuantitativeForensicReport(
       statcheckResults = statchecks,
       confidenceIntervalChecks = ciChecks,
@@ -387,7 +405,8 @@ object QuantitativeForensicAnalyzer {
           else -> 5
         }
       },
-      extractedPrecisionMetrics = precisionMetrics
+      extractedPrecisionMetrics = precisionMetrics,
+      statisticalAudit = statisticalAudit
     )
   }
 
@@ -834,7 +853,7 @@ object QuantitativeForensicAnalyzer {
 
     val borderlinePs = allPValues.count { it in 0.040..0.050 }
     if (borderlinePs >= 2) {
-      alerts.add("[P-CURVE FRAGILITY WARN] $borderlinePs p-values cluster narrowly in [0.040, 0.050]; elevated evidential fragility to minor covariate changes, outlier removal, or multiplicity control.")
+      alerts.add("[SCREENING SIGNAL • P-CURVE FRAGILITY WARN] $borderlinePs p-values cluster narrowly in [0.040, 0.050]; screening signal for evidential fragility (not proof of p-hacking — verify robustness & pre-registration).")
     }
 
     if (allPValues.size >= 4) {
@@ -844,7 +863,7 @@ object QuantitativeForensicAnalyzer {
       if (!hasAdjustment) {
         val m = allPValues.size.coerceAtMost(25)
         val fwerPct = ((1.0 - (0.95).pow(m.toDouble())) * 100.0).roundToInt()
-        alerts.add("[FWER INFLATION WARN] $m unadjusted significance tests detected without FWER/FDR correction (nominal family-wise Type I error rate inflates to ~$fwerPct% under independence).")
+        alerts.add("[SCREENING SIGNAL • FWER INFLATION WARN] $m unadjusted significance tests detected without FWER/FDR correction (illustrative nominal family-wise Type I error rate ~$fwerPct% under independence; verify distinct testing families).")
       }
     }
 

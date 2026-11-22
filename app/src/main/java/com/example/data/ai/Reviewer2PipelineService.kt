@@ -2,6 +2,10 @@ package com.example.data.ai
 
 import android.graphics.Bitmap
 import android.util.Log
+import com.example.data.ai.stats.EvidenceDerivedScoreGate
+import com.example.data.ai.stats.ScoreCalculationBreakdown
+import com.example.data.ai.stats.StatisticalAuditReport
+import com.example.data.ai.stats.StatisticalFindingType
 import com.example.data.model.EvidenceAnchor
 import com.example.data.model.FindingStatus
 import com.example.data.model.PaperReview
@@ -1062,7 +1066,8 @@ class Reviewer2PipelineService {
       coverageReport = coverageReport,
       omittedPromptPages = allImpactedPromptPages,
       wasPromptTrimmed = primaryPrepared.wasTrimmed,
-      adjudicatedFindings = emptyList()
+      adjudicatedFindings = emptyList(),
+      statisticalAudit = forensicReport.quantForensics.statisticalAudit
     )
     val adjudicated = adjudicateFindingsAndScores(
       rawFindings = rawStructuredFindings,
@@ -1076,20 +1081,22 @@ class Reviewer2PipelineService {
       reproducibilityScore = rawReproducibilityScore,
       rawVerdict = pass2Json.optString("verdict", ""),
       reviewMode = options.reviewMode,
-      extractionConfidence = preliminaryExtractionConfidence
+      extractionConfidence = preliminaryExtractionConfidence,
+      applyStatisticalScoreGate = true
     )
 
     val credibilityScore = adjudicated.weightedCredibilityScore.toLong()
     val verdict = adjudicated.resolvedVerdict
     val structuredFindingsJson = ReviewFindingCodec.encode(adjudicated.adjudicatedFindings)
 
-    // Calibrated extraction confidence incorporating parser status, omissions, partial cuts, text quality & quote verifiability
+    // Calibrated extraction confidence incorporating parser status, omissions, partial cuts, text quality, unsupported inputs & quote verifiability
     val extractionConfidence = computeCalibratedExtractionConfidence(
       manuscriptText = manuscriptText,
       coverageReport = coverageReport,
       omittedPromptPages = allImpactedPromptPages,
       wasPromptTrimmed = primaryPrepared.wasTrimmed,
-      adjudicatedFindings = adjudicated.adjudicatedFindings
+      adjudicatedFindings = adjudicated.adjudicatedFindings,
+      statisticalAudit = forensicReport.quantForensics.statisticalAudit
     )
     val anyJsonRepaired = pass1Result.wasRepaired || pass2Result.wasRepaired || (quantResultOrNull?.wasRepaired == true)
     val hasPartialOrUnverified = adjudicated.adjudicatedFindings.any {
@@ -1211,7 +1218,8 @@ class Reviewer2PipelineService {
         quantJson = quantJsonOrNull,
         fallbackMathAudit = stage01eTo01fdMathAudit,
         fallbackNumbersCheck = stage02aNumbersCheck,
-        calibratedQuantScore = adjudicated.mathRigorScore
+        calibratedQuantScore = adjudicated.mathRigorScore,
+        scoreBreakdown = adjudicated.scoreBreakdown
       )
     } else {
       "Quantitative, Statistical & Mathematical Audit (Stages 01e–01fd) skipped by user configuration."
@@ -1884,14 +1892,21 @@ class Reviewer2PipelineService {
     quantJson: JSONObject?,
     fallbackMathAudit: String,
     fallbackNumbersCheck: String,
-    calibratedQuantScore: Int
+    calibratedQuantScore: Int,
+    scoreBreakdown: ScoreCalculationBreakdown? = null
   ): String = buildString {
     val clean = { s: String -> com.example.util.DossierFormattingEngine.cleanAcademicProse(s) }
 
-    // 1. Deterministic Pre-Flight Quantitative Forensics Table (Exact Kotlin Math Engine)
+    // 1. Deterministic Pre-Flight Quantitative Forensics Table & Design-Aware Audit Trail
     val deterministicSummary = forensicReport.quantForensics.toDeterministicAuditSummary()
     if (deterministicSummary.isNotBlank()) {
       appendLine(deterministicSummary)
+      appendLine()
+    }
+
+    // 1b. Transparent Evidence-Derived Score Calculation Breakdown
+    if (scoreBreakdown != null) {
+      appendLine(scoreBreakdown.toMarkdownSummary())
       appendLine()
     }
 
@@ -2005,7 +2020,8 @@ class Reviewer2PipelineService {
     val mathRigorScore: Int,
     val reproducibilityScore: Int,
     val weightedCredibilityScore: Int,
-    val resolvedVerdict: String
+    val resolvedVerdict: String,
+    val scoreBreakdown: ScoreCalculationBreakdown? = null
   )
 
   companion object {
@@ -2235,7 +2251,8 @@ class Reviewer2PipelineService {
       coverageReport: DocumentCoverageReport?,
       omittedPromptPages: List<Int>,
       wasPromptTrimmed: Boolean,
-      adjudicatedFindings: List<ReviewFinding>
+      adjudicatedFindings: List<ReviewFinding>,
+      statisticalAudit: StatisticalAuditReport? = null
     ): Int {
       var score = if (coverageReport != null) {
         var c = coverageReport.extractionConfidence.coerceIn(1, 5)
@@ -2274,8 +2291,14 @@ class Reviewer2PipelineService {
         score = 4
       }
 
+      // Unsupported statistical inputs (missing raw tables/SEs/figure-only numbers) lower extraction confidence, NOT scientific validity
+      if (statisticalAudit != null && statisticalAudit.unsupportedDisclosures.isNotEmpty()) {
+        val adj = if (statisticalAudit.unsupportedDisclosures.size >= 3) -2 else -1
+        score = (score + adj).coerceAtLeast(1)
+      }
+
       // If more than half of model-generated findings failed quote verification, cap extraction confidence at 3
-      val quoteChecked = adjudicatedFindings.filter { !it.id.startsWith("Q-") }
+      val quoteChecked = adjudicatedFindings.filter { !it.id.startsWith("Q-") && !it.id.startsWith("S-") }
       if (quoteChecked.size >= 3) {
         val unverifiedOrMismatch = quoteChecked.count {
           it.status == FindingStatus.UNVERIFIED || it.verificationNotes.contains("Page mismatch", ignoreCase = true)
@@ -2529,7 +2552,8 @@ class Reviewer2PipelineService {
       reproducibilityScore: Int,
       rawVerdict: String,
       reviewMode: ReviewMode,
-      extractionConfidence: Int = 5
+      extractionConfidence: Int = 5,
+      applyStatisticalScoreGate: Boolean = false
     ): AdjudicationResult {
       val absenceCounterChecks = listOf(
         Triple(
@@ -2741,13 +2765,122 @@ class Reviewer2PipelineService {
           }
       }
 
-      // 4. Authoritative 6-axis weighted rubric computation (ZERO arithmetic mismatch allowed)
-      val m = methodologyScore.coerceIn(1, 10)
+      // 3b. Inject verified Phase 1-5 Statistical Audit Subsystem FAIL findings when score gating is enabled
+      val statAudit = forensicReport?.quantForensics?.statisticalAudit
+      if (applyStatisticalScoreGate && statAudit != null) {
+        var nextStatIdx = 1
+        statAudit.reconstructions
+          .filter { it.status == QuantFindingStatus.FAIL && it.findingType.isConfirmedError && !it.isScreeningSignal }
+          .take(3)
+          .forEach { rec ->
+            val alreadyCovered = verifiedFindings.any {
+              it.allegation.contains(rec.sourceEvidence.take(18), ignoreCase = true) ||
+                it.title.contains(rec.calculatorName, ignoreCase = true)
+            }
+            if (!alreadyCovered) {
+              val quoteCheck = verifyQuoteInManuscript(rec.sourceEvidence, manuscriptText, rec.pageNumber)
+              val verifiedStatus = if (quoteCheck.matchKind == QuoteMatchKind.EXACT && extractionConfidence >= 3) {
+                FindingStatus.VERIFIED
+              } else {
+                FindingStatus.PARTIALLY_SUPPORTED
+              }
+              verifiedFindings.add(
+                0,
+                ReviewFinding(
+                  id = "S-0${nextStatIdx++}",
+                  title = "[${rec.findingType.label}] ${rec.calculatorName}",
+                  allegation = "${rec.detail} Reported=${rec.reportedValue} vs Recomputed=${rec.recomputedValue} (tol=${rec.tolerance}).",
+                  severity = "CRITICAL",
+                  status = verifiedStatus,
+                  supportingEvidence = listOf(
+                    EvidenceAnchor(
+                      pageNumber = rec.pageNumber,
+                      section = rec.section,
+                      exactQuote = rec.sourceEvidence,
+                      startOffset = quoteCheck.startOffset,
+                      endOffset = quoteCheck.endOffset
+                    )
+                  ),
+                  methodologicalJustification = "${rec.scientificConsequence} Assumptions: ${rec.assumptions.joinToString("; ")}.",
+                  recommendedCorrection = "Verify raw input counts/SEs against primary tables and statistical output and correct reported values.",
+                  verificationNotes = "Executable numerical reconstruction (${rec.checkId}) flagged ${rec.findingType.name}."
+                )
+              )
+            }
+          }
+
+        statAudit.crossLinks
+          .filter { it.status == QuantFindingStatus.FAIL && it.findingType == StatisticalFindingType.INTERNAL_CONTRADICTION }
+          .take(2)
+          .forEach { link ->
+            verifiedFindings.add(
+              0,
+              ReviewFinding(
+                id = "S-0${nextStatIdx++}",
+                title = "[${link.findingType.label}] ${link.linkType}",
+                allegation = link.description,
+                severity = "CRITICAL",
+                status = if (extractionConfidence >= 3) FindingStatus.VERIFIED else FindingStatus.PARTIALLY_SUPPORTED,
+                supportingEvidence = listOf(
+                  EvidenceAnchor(
+                    pageNumber = link.pageNumbers.firstOrNull() ?: 0,
+                    section = link.sectionsInvolved.joinToString(" / "),
+                    exactQuote = link.sourceQuotes.firstOrNull().orEmpty()
+                  )
+                ),
+                methodologicalJustification = "Sample denominators, subgroup sums, and cross-section estimates must reconcile arithmetically.",
+                recommendedCorrection = "Reconcile participant flow, exclusions, and denominators across Abstract, Methods, Results, and Tables.",
+                verificationNotes = "Cross-section evidence link (${link.linkId}) detected internal contradiction."
+              )
+            )
+          }
+
+        statAudit.domainFindings
+          .filter { it.status == QuantFindingStatus.FAIL && it.findingType == StatisticalFindingType.MODEL_MISMATCH }
+          .take(2)
+          .forEach { df ->
+            verifiedFindings.add(
+              0,
+              ReviewFinding(
+                id = "S-0${nextStatIdx++}",
+                title = "[${df.findingType.label}] ${df.criterion}",
+                allegation = df.detail,
+                severity = "CRITICAL",
+                status = if (extractionConfidence >= 3) FindingStatus.VERIFIED else FindingStatus.PARTIALLY_SUPPORTED,
+                supportingEvidence = listOf(
+                  EvidenceAnchor(
+                    pageNumber = df.pageNumber,
+                    section = df.domainModule,
+                    exactQuote = df.evidenceQuote.ifBlank { df.criterion }
+                  )
+                ),
+                methodologicalJustification = df.consequence,
+                recommendedCorrection = df.recommendedAction,
+                verificationNotes = "Domain statistical audit (${df.findingId}, ${statAudit.subDesign.displayName}) confirmed model/design mismatch."
+              )
+            )
+          }
+      }
+
+      // 4. Authoritative 6-axis weighted rubric computation + Phase 6 Evidence-Derived Score Gate
+      val rawM = methodologyScore.coerceIn(1, 10)
       val s = significanceScore.coerceIn(1, 10)
       val c = clarityScore.coerceIn(1, 10)
       val o = originalityScore.coerceIn(1, 10)
-      val math = mathRigorScore.coerceIn(1, 10)
+      val rawMath = mathRigorScore.coerceIn(1, 10)
       val r = reproducibilityScore.coerceIn(1, 10)
+
+      val breakdown = statAudit?.let {
+        EvidenceDerivedScoreGate.evaluate(
+          report = it,
+          baseMathScore = rawMath,
+          baseMethodologyScore = rawM,
+          manuscriptText = manuscriptText
+        )
+      }
+      val m = if (applyStatisticalScoreGate && breakdown != null) breakdown.finalMethodologyScore else rawM
+      val math = if (applyStatisticalScoreGate && breakdown != null) breakdown.finalMathScore else rawMath
+
       val exactComposite = PaperReviewRubric.computeWeightedScore(
         methodology = m,
         significance = s,
@@ -2759,10 +2892,10 @@ class Reviewer2PipelineService {
 
       val hasVerifiedCriticalError = verifiedFindings.any {
         it.status == FindingStatus.VERIFIED && it.severity == "CRITICAL"
-      }
+      } || (applyStatisticalScoreGate && breakdown?.verdictCapReason != null && extractionConfidence >= 3)
       val hasPartiallySupportedCriticalDiscrepancy = verifiedFindings.any {
         it.status == FindingStatus.PARTIALLY_SUPPORTED && it.severity == "CRITICAL"
-      }
+      } || (applyStatisticalScoreGate && breakdown?.verdictCapReason != null && extractionConfidence < 3)
       val resolvedVerdict = resolveVerdictForMode(
         rawVerdict = rawVerdict,
         compositeScore = exactComposite,
@@ -2780,7 +2913,8 @@ class Reviewer2PipelineService {
         mathRigorScore = math,
         reproducibilityScore = r,
         weightedCredibilityScore = exactComposite,
-        resolvedVerdict = resolvedVerdict
+        resolvedVerdict = resolvedVerdict,
+        scoreBreakdown = breakdown
       )
     }
 

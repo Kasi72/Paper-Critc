@@ -2,6 +2,10 @@ package com.example.data.ai.stats
 
 import com.example.data.ai.QuantFindingStatus
 import com.example.data.ai.StudyDesignArchetype
+import com.example.data.ai.semantic.CalculatorAssumptionContract
+import com.example.data.ai.semantic.CompoundClaimKey
+import com.example.data.ai.semantic.DesignClassificationResult
+import com.example.data.ai.semantic.SemanticValidityReport
 import java.util.Locale
 
 /**
@@ -109,7 +113,8 @@ data class QuantitativeClaim(
   val endOffset: Int = 0,
   val isFromReferenceOrCitation: Boolean = false,
   val parseStatus: ClaimParseStatus = ClaimParseStatus.EXACT,
-  val parseNote: String = ""
+  val parseNote: String = "",
+  val compoundKey: CompoundClaimKey? = null
 )
 
 /**
@@ -198,7 +203,8 @@ data class NumericalReconstructionResult(
   val findingType: StatisticalFindingType,
   val isScreeningSignal: Boolean = false,
   val scientificConsequence: String,
-  val detail: String
+  val detail: String,
+  val assumptionContract: CalculatorAssumptionContract? = null
 )
 
 /**
@@ -291,7 +297,9 @@ data class StatisticalAuditReport(
   val reconstructions: List<NumericalReconstructionResult>,
   val domainFindings: List<DomainAuditFinding>,
   val unsupportedDisclosures: List<String>,
-  val scoreBreakdown: ScoreCalculationBreakdown? = null
+  val scoreBreakdown: ScoreCalculationBreakdown? = null,
+  val designClassification: DesignClassificationResult? = null,
+  val semanticValidity: SemanticValidityReport? = null
 ) {
   val exactClaimCount: Int get() = claims.count { !it.isFromReferenceOrCitation && it.parseStatus == ClaimParseStatus.EXACT }
   val partialClaimCount: Int get() = claims.count { !it.isFromReferenceOrCitation && it.parseStatus == ClaimParseStatus.PARTIAL }
@@ -380,6 +388,11 @@ data class StatisticalAuditReport(
       appendLine("  Unsupported / Unextractable Statistical Input Disclosures:")
       unsupportedDisclosures.take(6).forEach { appendLine("  * [UNSUPPORTED_TO_ASSESS] $it") }
     }
+
+    if (semanticValidity != null) {
+      appendLine()
+      appendLine(semanticValidity.toPromptBlock())
+    }
   }.trim()
 
   fun toAuditTrailMarkdown(): String = buildString {
@@ -411,7 +424,8 @@ data class StatisticalAuditReport(
         val tax = (if (r.isScreeningSignal) "${r.findingType.name} (Signal)" else r.findingType.name).replace("|", "/")
         val rep = r.reportedValue.replace("|", "/").take(42)
         val rec = r.recomputedValue.replace("|", "/").take(48)
-        val cons = "${r.detail} ${r.scientificConsequence}".replace("|", "/").take(180)
+        val contractNote = r.assumptionContract?.toCompactString()?.takeIf { it.isNotBlank() }?.let { " [$it]" }.orEmpty()
+        val cons = "${r.detail} ${r.scientificConsequence}$contractNote".replace("|", "/").take(220)
         appendLine("| $calc | $tax | $rep | $rec | ${r.status.name} | $cons |")
       }
     }
@@ -444,6 +458,11 @@ data class StatisticalAuditReport(
       unsupportedDisclosures.distinct().take(8).forEach { d ->
         appendLine("• [UNSUPPORTED_TO_ASSESS] $d")
       }
+    }
+
+    if (semanticValidity != null) {
+      appendLine()
+      appendLine(semanticValidity.toAuditMarkdown())
     }
 
     if (scoreBreakdown != null) {

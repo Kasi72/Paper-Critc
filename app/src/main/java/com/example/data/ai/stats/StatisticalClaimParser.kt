@@ -2,6 +2,7 @@ package com.example.data.ai.stats
 
 import com.example.data.ai.QuantFindingStatus
 import com.example.data.ai.QuantitativeForensicAnalyzer
+import com.example.data.ai.semantic.SemanticValidityEngine
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.ln
@@ -26,7 +27,8 @@ object StatisticalClaimParser {
     val crossLinks: List<EvidenceCrossLink>,
     val unsupportedDisclosures: List<String>,
     val globalTailSpec: TailSpecification,
-    val globalAlpha: Double
+    val globalAlpha: Double,
+    val sanitizedResult: SemanticValidityEngine.SanitizedTextResult? = null
   )
 
   private val sectionHeaderRegex = Regex(
@@ -145,7 +147,8 @@ object StatisticalClaimParser {
   private val tabTableRowRegex = Regex("""(?m)^[^\t\n]+\t[^\t\n]+(?:\t[^\t\n]+)+$""")
 
   fun parse(text: String): ParsedManuscriptLedger {
-    val clean = text.replace("\r\n", "\n")
+    val sanitized = SemanticValidityEngine.sanitizePdfExtractionNoise(text.replace("\r\n", "\n"))
+    val clean = sanitized.text
     val lower = clean.lowercase(Locale.US)
     val refStartOffset = findReferenceSectionOffset(clean)
 
@@ -176,6 +179,12 @@ object StatisticalClaimParser {
       val windowStart = (offset - 180).coerceAtLeast(0)
       val windowEnd = (offset + 180).coerceAtMost(clean.length)
       val window = clean.substring(windowStart, windowEnd)
+      val lineStart = clean.lastIndexOf('\n', (offset - 1).coerceAtLeast(0)).let { if (it < 0) 0 else it + 1 }
+      val lineEnd = clean.indexOf('\n', offset).let { if (it < 0) clean.length else it }
+      val localLine = clean.substring(
+        max(lineStart, (offset - 160).coerceAtLeast(0)),
+        kotlin.math.min(lineEnd, (offset + 120).coerceAtMost(clean.length))
+      )
       val precedingText = clean.substring((offset - 120).coerceAtLeast(0), offset)
       val tableFig = tableFigureAnchorRegex.findAll(precedingText).lastOrNull()?.groupValues?.getOrNull(1)
         ?: tableFigureAnchorRegex.find(clean.substring(offset, (offset + 60).coerceAtMost(clean.length)))?.groupValues?.getOrNull(1)
@@ -183,11 +192,11 @@ object StatisticalClaimParser {
       val inRefs = (refStartOffset >= 0 && offset >= refStartOffset) || section.equals("References", ignoreCase = true)
       val isCitedPrior = inRefs || isPriorStudyCitationWindow(clean, offset)
       val hierarchy = inferHierarchy(window)
-      val adj = inferAdjustment(window)
+      val adj = inferAdjustment(localLine)
       val tail = inferLocalTail(window, globalTailSpec)
       val alpha = customAlphaRegex.find(window)?.groupValues?.getOrNull(1)?.toDoubleOrNull()?.takeIf { it in 1e-6..0.20 } ?: globalAlpha
       val family = inferTestingFamily(section, tableFig, hierarchy, window)
-      return ContextInfo(page, section, tableFig, isCitedPrior, hierarchy, adj, tail, alpha, family, window)
+      return ContextInfo(page, section, tableFig, isCitedPrior, hierarchy, adj, tail, alpha, family, window, localLine)
     }
 
     // 1. Flexible Test-Statistic Claims (t, z, chi2, F, r)
@@ -220,7 +229,9 @@ object StatisticalClaimParser {
           startOffset = m.range.first,
           endOffset = m.range.last + 1,
           isFromReferenceOrCitation = ctx.isReferenceOrCitation,
-          parseStatus = status
+          parseStatus = status,
+          parseNote = if (isAdjustedPWindow(ctx.window)) "Multiplicity-adjusted p-value context detected." else "",
+          compoundKey = SemanticValidityEngine.extractCompoundKey(ctx.localLine, ctx.section, "t", ctx.adjustment, ctx.hierarchy)
         )
       )
     }
@@ -250,7 +261,9 @@ object StatisticalClaimParser {
           startOffset = m.range.first,
           endOffset = m.range.last + 1,
           isFromReferenceOrCitation = ctx.isReferenceOrCitation,
-          parseStatus = if (statVal != null && pVal != null) ClaimParseStatus.EXACT else ClaimParseStatus.PARTIAL
+          parseStatus = if (statVal != null && pVal != null) ClaimParseStatus.EXACT else ClaimParseStatus.PARTIAL,
+          parseNote = if (isAdjustedPWindow(ctx.window)) "Multiplicity-adjusted p-value context detected." else "",
+          compoundKey = SemanticValidityEngine.extractCompoundKey(ctx.localLine, ctx.section, "z", ctx.adjustment, ctx.hierarchy)
         )
       )
     }
@@ -282,7 +295,9 @@ object StatisticalClaimParser {
           startOffset = m.range.first,
           endOffset = m.range.last + 1,
           isFromReferenceOrCitation = ctx.isReferenceOrCitation,
-          parseStatus = if (df != null && statVal != null && pVal != null) ClaimParseStatus.EXACT else ClaimParseStatus.PARTIAL
+          parseStatus = if (df != null && statVal != null && pVal != null) ClaimParseStatus.EXACT else ClaimParseStatus.PARTIAL,
+          parseNote = if (isAdjustedPWindow(ctx.window)) "Multiplicity-adjusted p-value context detected." else "",
+          compoundKey = SemanticValidityEngine.extractCompoundKey(ctx.localLine, ctx.section, "chi2", ctx.adjustment, ctx.hierarchy)
         )
       )
     }
@@ -316,7 +331,8 @@ object StatisticalClaimParser {
           startOffset = m.range.first,
           endOffset = m.range.last + 1,
           isFromReferenceOrCitation = ctx.isReferenceOrCitation,
-          parseStatus = if (df1 != null && df2 != null && statVal != null && pVal != null) ClaimParseStatus.EXACT else ClaimParseStatus.PARTIAL
+          parseStatus = if (df1 != null && df2 != null && statVal != null && pVal != null) ClaimParseStatus.EXACT else ClaimParseStatus.PARTIAL,
+          compoundKey = SemanticValidityEngine.extractCompoundKey(ctx.localLine, ctx.section, "F", ctx.adjustment, ctx.hierarchy)
         )
       )
     }
@@ -350,7 +366,8 @@ object StatisticalClaimParser {
           startOffset = m.range.first,
           endOffset = m.range.last + 1,
           isFromReferenceOrCitation = ctx.isReferenceOrCitation,
-          parseStatus = if (df != null && rVal != null && pVal != null) ClaimParseStatus.EXACT else ClaimParseStatus.PARTIAL
+          parseStatus = if (df != null && rVal != null && pVal != null) ClaimParseStatus.EXACT else ClaimParseStatus.PARTIAL,
+          compoundKey = SemanticValidityEngine.extractCompoundKey(ctx.localLine, ctx.section, "r", ctx.adjustment, ctx.hierarchy)
         )
       )
     }
@@ -389,7 +406,8 @@ object StatisticalClaimParser {
           startOffset = m.range.first,
           endOffset = m.range.last + 1,
           isFromReferenceOrCitation = ctx.isReferenceOrCitation,
-          parseStatus = if (beta != null && se != null && se > 0.0) ClaimParseStatus.EXACT else ClaimParseStatus.PARTIAL
+          parseStatus = if (beta != null && se != null && se > 0.0) ClaimParseStatus.EXACT else ClaimParseStatus.PARTIAL,
+          compoundKey = SemanticValidityEngine.extractCompoundKey(ctx.localLine, ctx.section, "beta", ctx.adjustment, ctx.hierarchy)
         )
       )
     }
@@ -443,7 +461,8 @@ object StatisticalClaimParser {
           endOffset = m.range.last + 1,
           isFromReferenceOrCitation = ctx.isReferenceOrCitation,
           parseStatus = parseStatus,
-          parseNote = if (isAmbiguousInterval) "Parenthesized range lacks explicit CI/IQR/SD label; classified AMBIGUOUS." else ""
+          parseNote = if (isAmbiguousInterval) "Parenthesized range lacks explicit CI/IQR/SD label; classified AMBIGUOUS." else "",
+          compoundKey = SemanticValidityEngine.extractCompoundKey(ctx.localLine, ctx.section, label, adj, ctx.hierarchy)
         )
       )
     }
@@ -473,7 +492,8 @@ object StatisticalClaimParser {
             startOffset = m.range.first,
             endOffset = m.range.last + 1,
             isFromReferenceOrCitation = ctx.isReferenceOrCitation,
-            parseStatus = ClaimParseStatus.EXACT
+            parseStatus = ClaimParseStatus.EXACT,
+            compoundKey = SemanticValidityEngine.extractCompoundKey(ctx.localLine, ctx.section, "proportion", AdjustmentStatus.UNADJUSTED, ctx.hierarchy)
           )
         )
       }
@@ -500,7 +520,8 @@ object StatisticalClaimParser {
           startOffset = m.range.first,
           endOffset = m.range.last + 1,
           isFromReferenceOrCitation = ctx.isReferenceOrCitation,
-          parseStatus = if (mean != null && sd != null) ClaimParseStatus.EXACT else ClaimParseStatus.PARTIAL
+          parseStatus = if (mean != null && sd != null) ClaimParseStatus.EXACT else ClaimParseStatus.PARTIAL,
+          compoundKey = SemanticValidityEngine.extractCompoundKey(ctx.localLine, ctx.section, "mean", ctx.adjustment, ctx.hierarchy)
         )
       )
     }
@@ -604,7 +625,8 @@ object StatisticalClaimParser {
           endOffset = m.range.last + 1,
           isFromReferenceOrCitation = ctx.isReferenceOrCitation,
           parseStatus = if (op == "=") ClaimParseStatus.EXACT else ClaimParseStatus.PARTIAL,
-          parseNote = if (op != "=") "Inequality p-value ($op); exact test statistic not adjacent." else ""
+          parseNote = if (op != "=") "Inequality p-value ($op); exact test statistic not adjacent." else "",
+          compoundKey = SemanticValidityEngine.extractCompoundKey(ctx.localLine, ctx.section, "p_value", ctx.adjustment, ctx.hierarchy)
         )
       )
     }
@@ -626,7 +648,8 @@ object StatisticalClaimParser {
       crossLinks = crossLinks,
       unsupportedDisclosures = unsupportedDisclosures.distinct(),
       globalTailSpec = globalTailSpec,
-      globalAlpha = globalAlpha
+      globalAlpha = globalAlpha,
+      sanitizedResult = sanitized
     )
   }
 
@@ -728,7 +751,8 @@ object StatisticalClaimParser {
               startOffset = m.range.first,
               endOffset = m.range.last + 1,
               isFromReferenceOrCitation = false,
-              parseStatus = if (measure == "Estimate") ClaimParseStatus.PARTIAL else ClaimParseStatus.EXACT
+              parseStatus = if (measure == "Estimate") ClaimParseStatus.PARTIAL else ClaimParseStatus.EXACT,
+              compoundKey = SemanticValidityEngine.extractCompoundKey("$rowLabel $rowText ${ctx.window}", if (ctx.section == "Body") "Tables" else ctx.section, measure, ctx.adjustment, ctx.hierarchy)
             )
           )
         }
@@ -775,7 +799,8 @@ object StatisticalClaimParser {
                 startOffset = m.range.first,
                 endOffset = m.range.last + 1,
                 isFromReferenceOrCitation = false,
-                parseStatus = ClaimParseStatus.EXACT
+                parseStatus = ClaimParseStatus.EXACT,
+                compoundKey = SemanticValidityEngine.extractCompoundKey("$rowLabel $rowText ${ctx.window}", if (ctx.section == "Body") "Tables" else ctx.section, "beta", ctx.adjustment, ctx.hierarchy)
               )
             )
           }
@@ -1059,11 +1084,16 @@ object StatisticalClaimParser {
     }
 
     // 6. Abstract vs. Results/Tables point-estimate contradiction for the same effect measure
+    // Guarded by Phase 8 CompoundClaimKey so identically named outcomes in DIFFERENT populations,
+    // subgroups, time points, estimators, or adjustment states NEVER trigger a false contradiction!
     val abstractEffects = activeEffects.filter { it.section.equals("Abstract", true) && it.ciLower != null && it.ciUpper != null }
     val resultsEffects = activeEffects.filter { it.section in setOf("Results", "Tables") && it.ciLower != null && it.ciUpper != null }
     for (absClaim in abstractEffects.take(4)) {
       val matchingRes = resultsEffects.firstOrNull { r ->
-        r.effectMeasure.equals(absClaim.effectMeasure, ignoreCase = true) &&
+        val keysCompatible = absClaim.compoundKey == null || r.compoundKey == null ||
+          absClaim.compoundKey.isCompatibleForComparison(r.compoundKey)
+        keysCompatible &&
+          r.effectMeasure.equals(absClaim.effectMeasure, ignoreCase = true) &&
           r.adjustedOrUnadjusted == absClaim.adjustedOrUnadjusted &&
           absClaim.pointEstimate != null && r.pointEstimate != null &&
           absClaim.ciLower != null && r.ciLower != null &&
@@ -1079,7 +1109,7 @@ object StatisticalClaimParser {
             status = QuantFindingStatus.FAIL,
             pageNumbers = listOf(absClaim.page, matchingRes.page).filter { it > 0 }.distinct(),
             sectionsInvolved = listOf(absClaim.section, matchingRes.section),
-            description = "Abstract (${absClaim.sourceQuote}) and ${matchingRes.section} (${matchingRes.sourceQuote}) share identical CI bounds but report conflicting point estimates.",
+            description = "Abstract (${absClaim.sourceQuote}) and ${matchingRes.section} (${matchingRes.sourceQuote}) share identical CI bounds and compatible compound claim key (${absClaim.compoundKey?.toKeyLabel() ?: "matched"}) but report conflicting point estimates.",
             sourceQuotes = listOf(absClaim.sourceQuote, matchingRes.sourceQuote)
           )
         )
@@ -1146,7 +1176,8 @@ object StatisticalClaimParser {
     val tail: TailSpecification,
     val alpha: Double,
     val family: String,
-    val window: String
+    val window: String,
+    val localLine: String = window
   )
 
   private fun findReferenceSectionOffset(text: String): Int {
@@ -1215,6 +1246,14 @@ object StatisticalClaimParser {
       w.contains("adjusted") || w.contains("multivariable") || w.contains("multivariate") || w.contains("controlling for") -> AdjustmentStatus.ADJUSTED
       else -> AdjustmentStatus.UNSPECIFIED
     }
+  }
+
+  private fun isAdjustedPWindow(window: String): Boolean {
+    val w = window.lowercase(Locale.US)
+    return w.contains("adjusted p") || w.contains("p_adj") || w.contains("padj") ||
+      w.contains("bonferroni-adjusted") || w.contains("holm-adjusted") ||
+      w.contains("fdr-adjusted") || w.contains("benjamini-hochberg") ||
+      w.contains("corrected p") || w.contains("q-value")
   }
 
   private fun inferLocalTail(window: String, fallback: TailSpecification): TailSpecification {

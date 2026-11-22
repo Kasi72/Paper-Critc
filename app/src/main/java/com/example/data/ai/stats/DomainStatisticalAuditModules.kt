@@ -2,6 +2,8 @@ package com.example.data.ai.stats
 
 import com.example.data.ai.QuantFindingStatus
 import com.example.data.ai.StudyDesignArchetype
+import com.example.data.ai.semantic.SemanticValidityEngine
+import com.example.util.DocumentCoverageReport
 import java.util.Locale
 import kotlin.math.min
 
@@ -40,7 +42,7 @@ object DomainStatisticalAuditModules {
     val hasRct = l.contains("randomized controlled") || l.contains("randomised controlled") || l.contains("randomly assigned") ||
       l.contains("consort") || l.contains("double-blind") || l.contains("placebo-controlled") || l.contains("intention-to-treat")
     val hasCohort = l.contains("cohort") || l.contains("case-control") || l.contains("strobe") || l.contains("propensity score") ||
-      l.contains("retrospective") || l.contains("prospective observational")
+      l.contains("retrospective") || l.contains("prospective observational") || l.contains("cross-sectional") || l.contains("observational")
 
     return when {
       hasMetaPooling -> AuditSubDesign.META_ANALYSIS
@@ -183,7 +185,8 @@ object DomainStatisticalAuditModules {
       val mentionsCompetingEvent = l.contains("competing risk") || l.contains("all-cause mortality") || l.contains("non-cancer death") ||
         l.contains("death from other causes") || l.contains("disease-specific mortality") || l.contains("cardiovascular death") || l.contains("transplant")
       val usesCompetingRiskModel = l.contains("fine-gray") || l.contains("fine and gray") || l.contains("aalen-johansen") ||
-        l.contains("subdistribution hazard") || l.contains("cumulative incidence function") || l.contains("cause-specific hazard")
+        l.contains("subdistribution hazard") || l.contains("cumulative incidence function") || l.contains("cause-specific hazard") ||
+        l.contains("etiologic") || l.contains("restricted mean survival") || l.contains("rmst")
       val censorsCompetingDeaths = Regex("""censor(?:ed|ing)\s+(?:at|for)\s+(?:death|non-[a-z]+\s+death|competing)""", RegexOption.IGNORE_CASE).containsMatchIn(text)
       if (censorsCompetingDeaths && !usesCompetingRiskModel) {
         out.add(
@@ -254,7 +257,8 @@ object DomainStatisticalAuditModules {
     val hasClusteredOrRepeatedData = l.contains("multicenter") || l.contains("multi-center") || l.contains("repeated measures") ||
       l.contains("multiple visits") || l.contains("multiple eyes") || l.contains("cluster-randomized") || l.contains("hospitals") && l.contains("patients")
     val modelsDependence = l.contains("mixed-effect") || l.contains("mixed effect") || l.contains("random intercept") ||
-      l.contains("gee") || l.contains("generalized estimating") || l.contains("cluster-robust") || l.contains("clustered standard") || l.contains("frailty")
+      l.contains("gee") || l.contains("generalized estimating") || l.contains("cluster-robust") || l.contains("clustered standard") ||
+      l.contains("frailty") || l.contains("sandwich") || l.contains("resampling across") || l.contains("hierarchical") || l.contains("multilevel")
     if (hasClusteredOrRepeatedData && !modelsDependence && (l.contains("naive") || l.contains("ordinary logistic") || l.contains("independent observations") || l.contains("chi-square"))) {
       out.add(
         DomainAuditFinding(
@@ -296,7 +300,8 @@ object DomainStatisticalAuditModules {
     // 6. Missing-data mechanism (complete-case vs MI/MAR/MNAR)
     val hasSubstantialMissing = Regex("""(1[5-9]|[2-9]\d)(?:\.\d+)?%\s+(?:missing|lost\s+to\s+follow|attrition|incomplete)""", RegexOption.IGNORE_CASE).containsMatchIn(text)
     val usesCompleteCaseOnly = (l.contains("complete-case") || l.contains("complete case") || l.contains("listwise")) &&
-      !l.contains("multiple imputation") && !l.contains("mice") && !l.contains("ipw") && !l.contains("sensitivity")
+      !l.contains("multiple imputation") && !l.contains("mice") && !l.contains("ipw") && !l.contains("sensitivity") &&
+      !l.contains("non-ignorable") && !l.contains("inverse probability")
     if (hasSubstantialMissing && usesCompleteCaseOnly) {
       out.add(
         DomainAuditFinding(
@@ -405,20 +410,20 @@ object DomainStatisticalAuditModules {
       )
     }
 
-    if (isMeta && (l.contains("dersimonian") || l.contains("dl estimator")) && !l.contains("reml") && !l.contains("paule-mandel") && !l.contains("hartung-knapp") && !l.contains("knapp-hartung")) {
+    if (isMeta && (l.contains("dersimonian") || l.contains("dl estimator")) && !l.contains("reml") && !l.contains("paule-mandel") && !l.contains("hartung-knapp") && !l.contains("knapp-hartung") && !l.contains("bayesian hierarchical")) {
       val smallK = kStudies != null && kStudies < 10
       out.add(
         DomainAuditFinding(
           findingId = id(),
           domainModule = "Meta-Analysis",
-          criterion = "τ² Estimator & Hartung-Knapp Small-k Adjustment",
+          criterion = "τ² Estimator & Hartung-Knapp Small-k Sensitivity",
           findingType = StatisticalFindingType.ASSUMPTION_UNCHECKED,
           status = QuantFindingStatus.WARN,
           isScreeningSignal = true,
-          detail = "DerSimonian-Laird (DL) estimator used without REML/Paule-Mandel sensitivity or Hartung-Knapp t-CI" +
-            if (smallK) " (especially fragile with k = $kStudies < 10 studies)." else ".",
-          consequence = "DL Wald CIs can have elevated Type I error when k is small or τ² is substantial.",
-          recommendedAction = "Verify robustness using REML or Paule-Mandel τ² with Hartung-Knapp confidence intervals."
+          detail = "DerSimonian-Laird (DL) estimator used without REML/Paule-Mandel sensitivity comparison" +
+            if (smallK) " (with small k = $kStudies, τ² uncertainty is high and even REML/Hartung-Knapp carry small-sample trade-offs)." else ".",
+          consequence = "DL Wald CIs can have elevated Type I error when τ² is substantial; compare sensitivity estimators rather than assuming a single universal default.",
+          recommendedAction = "Report sensitivity comparison across REML, Paule-Mandel, and (where appropriate for k) Hartung-Knapp or Bayesian hierarchical pooling."
         )
       )
     }
@@ -734,7 +739,8 @@ object DomainStatisticalAuditModules {
     val repeatedPatientRandomSplit = (l.contains("multiple images per patient") || l.contains("multiple visits per patient") ||
       l.contains("repeated measurements") || l.contains("slices per patient") || l.contains("records per subject") || l.contains("multiple scans per patient")) &&
       (l.contains("randomly split") || l.contains("random split") || l.contains("random 80/20") || l.contains("image-level split") || l.contains("slice-level")) &&
-      !l.contains("patient-level split") && !l.contains("subject-level split") && !l.contains("grouped") && !l.contains("groupkfold")
+      !l.contains("patient-level split") && !l.contains("subject-level split") && !l.contains("grouped") && !l.contains("groupkfold") &&
+      !l.contains("split subjects") && !l.contains("split patients") && !l.contains("patient-disjoint") && !l.contains("subject-disjoint")
     if (repeatedPatientRandomSplit) {
       out.add(
         DomainAuditFinding(
@@ -1002,12 +1008,46 @@ object StatisticalAuditOrchestrator {
 
   fun audit(
     text: String,
-    parentArchetype: StudyDesignArchetype
+    parentArchetype: StudyDesignArchetype,
+    coverageReport: DocumentCoverageReport? = null,
+    extractionConfidence: Int = 5
   ): StatisticalAuditReport {
-    val subDesign = DomainStatisticalAuditModules.classifySubDesign(text, parentArchetype)
     val ledger = StatisticalClaimParser.parse(text)
-    val reconstructions = NumericalReconstructionEngine.runAllReconstructions(ledger, text)
-    val domainFindings = DomainStatisticalAuditModules.runDomainAudit(text, subDesign, ledger, reconstructions)
+    val sanitized = ledger.sanitizedResult ?: SemanticValidityEngine.sanitizePdfExtractionNoise(text)
+    val cleanText = sanitized.text
+
+    val subDesign = DomainStatisticalAuditModules.classifySubDesign(cleanText, parentArchetype)
+    val designClassification = SemanticValidityEngine.classifyDesignWithConfidence(cleanText, parentArchetype)
+    val reconstructions = NumericalReconstructionEngine.runAllReconstructions(ledger, cleanText)
+    val rawDomainFindings = DomainStatisticalAuditModules.runDomainAudit(cleanText, subDesign, ledger, reconstructions)
+
+    // Phase 8 #2 Classifier-Confidence Gate: when design classification abstains due to low confidence
+    // or ambiguous competing designs, never escalate design-sensitive MODEL_MISMATCH to hard FAIL!
+    val gatedDomainFindings = if (designClassification.abstained) {
+      rawDomainFindings.map { finding ->
+        if (finding.status == QuantFindingStatus.FAIL && finding.findingType == StatisticalFindingType.MODEL_MISMATCH) {
+          finding.copy(
+            status = QuantFindingStatus.WARN,
+            isScreeningSignal = true,
+            detail = "[Classifier-Confidence Gate: design confidence ${String.format(Locale.US, "%.2f", designClassification.primaryConfidence)} — downgraded from FAIL to screening prompt] ${finding.detail}"
+          )
+        } else {
+          finding
+        }
+      }
+    } else {
+      rawDomainFindings
+    }
+
+    val semanticValidity = SemanticValidityEngine.evaluate(
+      rawText = text,
+      sanitized = sanitized,
+      designClassification = designClassification,
+      ledger = ledger,
+      reconstructions = reconstructions,
+      coverageReport = coverageReport,
+      extractionConfidence = extractionConfidence
+    )
 
     return StatisticalAuditReport(
       subDesign = subDesign,
@@ -1017,8 +1057,10 @@ object StatisticalAuditOrchestrator {
       sampleFlowRecords = ledger.sampleFlowRecords,
       crossLinks = ledger.crossLinks,
       reconstructions = reconstructions,
-      domainFindings = domainFindings,
-      unsupportedDisclosures = ledger.unsupportedDisclosures
+      domainFindings = gatedDomainFindings,
+      unsupportedDisclosures = ledger.unsupportedDisclosures,
+      designClassification = designClassification,
+      semanticValidity = semanticValidity
     )
   }
 }

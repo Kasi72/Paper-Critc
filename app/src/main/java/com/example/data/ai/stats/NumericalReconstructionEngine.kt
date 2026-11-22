@@ -2,6 +2,7 @@ package com.example.data.ai.stats
 
 import com.example.data.ai.QuantFindingStatus
 import com.example.data.ai.QuantitativeForensicAnalyzer
+import com.example.data.ai.semantic.CalculatorAssumptionContract
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.exp
@@ -42,7 +43,12 @@ object NumericalReconstructionEngine {
     val nnt: Double?,
     val chiSquare: Double,
     val chiSquareP: Double,
-    val fisherExactTwoSidedP: Double
+    val fisherExactTwoSidedP: Double,
+    val arrCiLower: Double = arr,
+    val arrCiUpper: Double = arr,
+    val nntCrossesZero: Boolean = false,
+    val hasZeroCell: Boolean = false,
+    val isDoubleZeroEvents: Boolean = false
   )
 
   data class MetaAnalysisExactSummary(
@@ -152,6 +158,39 @@ object NumericalReconstructionEngine {
     for ((family, famClaims) in pClaimsByFamily) {
       if (famClaims.size >= 4) {
         val alpha = famClaims.firstOrNull()?.alphaThreshold ?: ledger.globalAlpha
+        val isAmbiguousUnstructuredFamily = (family in setOf("Body", "Results", "Exploratory")) &&
+          famClaims.all { it.hierarchy == AnalysisHierarchy.UNSPECIFIED || it.hierarchy == AnalysisHierarchy.EXPLORATORY } &&
+          !lower.contains("primary endpoint") && !lower.contains("primary outcome") &&
+          !lower.contains("family-wise") && !lower.contains("multiplicity") && !lower.contains("table ")
+        if (isAmbiguousUnstructuredFamily && !hasExplicitMultiplicityCorrection) {
+          results.add(
+            NumericalReconstructionResult(
+              checkId = nextId(),
+              calculatorName = "Multiple-Testing Family (Uncertain Boundaries)",
+              reportedValue = "${famClaims.size} ungrouped p-values in '$family'",
+              recomputedValue = "Corrected p-values: not computable (family boundary unknown)",
+              tolerance = "Multiplicity-family non-fabrication guard",
+              sourceEvidence = famClaims.take(4).joinToString("; ") { it.sourceQuote },
+              pageNumber = famClaims.first().page,
+              section = family,
+              assumptions = listOf(
+                "Active p-values lack explicit outcome/time-point/primary-vs-exploratory family specification."
+              ),
+              status = QuantFindingStatus.INFO,
+              findingType = StatisticalFindingType.UNSUPPORTED_TO_ASSESS,
+              isScreeningSignal = true,
+              scientificConsequence = "Potential Type I error inflation risk exists, but exact Bonferroni/FDR thresholds cannot be fabricated without knowing the true prespecified family.",
+              detail = "Multiplicity family cannot be reconstructed from the manuscript (${famClaims.size} ungrouped p-values). Potential inflation risk: yes. Corrected p-values: not computable.",
+              assumptionContract = CalculatorAssumptionContract(
+                calculatorScope = "Multiple-testing family reconstruction",
+                assumptionsSatisfied = listOf("Reference/citation p-values excluded."),
+                assumptionsUnknown = listOf("True family size m across prespecified vs exploratory outcomes, time points, and subgroups."),
+                alternativeValidInterpretations = listOf("Hierarchical gatekeeping or closed testing may control FWER without raw Bonferroni/FDR.")
+              )
+            )
+          )
+          continue
+        }
         val mt = computeMultipleTestingAdjustments(
           familyName = family,
           namedPValues = famClaims.map { it.claimId to (it.pValue ?: 1.0) },
@@ -176,7 +215,13 @@ object NumericalReconstructionEngine {
               findingType = StatisticalFindingType.POSSIBLE_BIAS,
               isScreeningSignal = true,
               scientificConsequence = "${mt.rawSignificantCount - mt.bhFdrSignificantCount} nominal finding(s) in the $family family do not survive Benjamini-Hochberg FDR control.",
-              detail = "Unadjusted testing in family '$family' (m=${mt.m}): ${mt.rawSignificantCount} raw p < ${formatNum(alpha)}, dropping to ${mt.bhFdrSignificantCount} under BH-FDR and ${mt.holmSignificantCount} under Holm-Bonferroni."
+              detail = "Unadjusted testing in family '$family' (m=${mt.m}): ${mt.rawSignificantCount} raw p < ${formatNum(alpha)}, dropping to ${mt.bhFdrSignificantCount} under BH-FDR and ${mt.holmSignificantCount} under Holm-Bonferroni.",
+              assumptionContract = CalculatorAssumptionContract(
+                calculatorScope = "Family-scoped FWER/FDR check ($family)",
+                assumptionsSatisfied = listOf("Reference/citation p-values isolated", "Uniform α=${formatNum(alpha)}"),
+                assumptionsUnknown = listOf("Unreported tests omitted from manuscript", "Between-endpoint correlation structure"),
+                alternativeValidInterpretations = listOf("Correlated endpoints may permit less conservative Westfall-Young/maxT adjustments", "Pre-specified sequential gatekeeping.")
+              )
             )
           )
         }
@@ -215,7 +260,12 @@ object NumericalReconstructionEngine {
     val rrHi = exp(ln(rr) + z * seLogRr)
 
     val arr = r2 - r1
+    val seArr = sqrt(max(0.0, (r1 * (1.0 - r1) / n1.toDouble()) + (r2 * (1.0 - r2) / n2.toDouble())))
+    val arrLo = arr - z * seArr
+    val arrHi = arr + z * seArr
+    val nntCrossesZero = (arrLo < 0.0 && arrHi > 0.0)
     val nnt = if (abs(arr) > 1e-6) 1.0 / abs(arr) else null
+    val isDoubleZero = (a == 0 && c == 0)
 
     val total = (n1 + n2).toDouble()
     val eA = n1 * (a + c) / total
@@ -229,7 +279,24 @@ object NumericalReconstructionEngine {
     val chiP = QuantitativeForensicAnalyzer.chiSquareUpperTailP(chiSq, 1.0)
     val fisherP = exactFisherTwoSidedP(a, b, c, d)
 
-    return TwoByTwoExactMetrics(or, orLo, orUpper = orHi, rr = rr, rrLower = rrLo, rrUpper = rrHi, arr = arr, nnt = nnt, chiSquare = chiSq, chiSquareP = chiP, fisherExactTwoSidedP = fisherP)
+    return TwoByTwoExactMetrics(
+      or = or,
+      orLower = orLo,
+      orUpper = orHi,
+      rr = rr,
+      rrLower = rrLo,
+      rrUpper = rrHi,
+      arr = arr,
+      nnt = nnt,
+      chiSquare = chiSq,
+      chiSquareP = chiP,
+      fisherExactTwoSidedP = fisherP,
+      arrCiLower = arrLo,
+      arrCiUpper = arrHi,
+      nntCrossesZero = nntCrossesZero,
+      hasZeroCell = hasZero,
+      isDoubleZeroEvents = isDoubleZero
+    )
   }
 
   /**
@@ -270,9 +337,62 @@ object NumericalReconstructionEngine {
     val calc = computeTwoByTwo(tbl.a, tbl.b, tbl.c, tbl.d) ?: return emptyList()
     val out = mutableListOf<NumericalReconstructionResult>()
     val cellSummary = "${tbl.a}/${tbl.a + tbl.b} vs ${tbl.c}/${tbl.c + tbl.d}"
-    val assumptions = listOf(
-      "Reconstructed from unadjusted 2x2 cell counts ($cellSummary).",
-      if (tbl.a == 0 || tbl.b == 0 || tbl.c == 0 || tbl.d == 0) "Haldane-Anscombe 0.5 continuity adjustment applied for zero cell." else "Standard Woolf log-OR / Katz log-RR variance."
+
+    // Adversarial Case #8: Double-zero events (0/n1 vs 0/n2) — OR & RR are unidentifiable without external prior!
+    if (calc.isDoubleZeroEvents) {
+      out.add(
+        NumericalReconstructionResult(
+          checkId = nextId(),
+          calculatorName = "2x2 Contingency (Double-Zero Events)",
+          reportedValue = cellSummary,
+          recomputedValue = "OR/RR undefined (0 events in both arms); ARR = 0.0% (95% CI ${formatNum(calc.arrCiLower * 100)}% to ${formatNum(calc.arrCiUpper * 100)}%)",
+          tolerance = "Zero-event identifiability guard",
+          sourceEvidence = tbl.sourceQuote,
+          pageNumber = tbl.page,
+          section = tbl.section,
+          assumptions = listOf("Zero events observed in both arms ($cellSummary)."),
+          status = QuantFindingStatus.INFO,
+          findingType = StatisticalFindingType.UNSUPPORTED_TO_ASSESS,
+          isScreeningSignal = true,
+          scientificConsequence = "Relative ratios (OR/RR) are mathematically unidentifiable from double-zero tables without Bayesian priors or risk-difference modeling.",
+          detail = "Both arms contain zero events ($cellSummary); do not apply Haldane 0.5 to manufacture an artificial OR=1.0 — evaluate absolute risk difference (ARR) or exact upper risk bounds.",
+          assumptionContract = CalculatorAssumptionContract(
+            calculatorScope = "2x2 double-zero event table",
+            assumptionsSatisfied = listOf("Exact cell counts extracted ($cellSummary)"),
+            assumptionsUnknown = listOf("Follow-up duration / exposure time", "Background event rate"),
+            alternativeValidInterpretations = listOf("Risk difference with exact/Wilson/Newcombe CI", "Bayesian beta-binomial sensitivity")
+          )
+        )
+      )
+      return out
+    }
+
+    val assumptions = buildList {
+      add("Reconstructed from unadjusted 2x2 cell counts ($cellSummary).")
+      if (calc.hasZeroCell) add("Single zero-cell detected: Haldane-Anscombe 0.5 continuity adjustment applied for finite OR/RR approximation.")
+      else add("Standard Woolf log-OR / Katz log-RR variance.")
+      if (calc.nntCrossesZero) add("95% CI for ARR (${formatNum(calc.arrCiLower * 100)}% to ${formatNum(calc.arrCiUpper * 100)}%) spans zero -> NNT crosses infinity (NNTB to ∞ to NNTH).")
+    }
+
+    val orContract = CalculatorAssumptionContract(
+      calculatorScope = "2x2 Odds Ratio & Exact Fisher",
+      assumptionsSatisfied = listOf("Complete 2x2 counts ($cellSummary)", "Two-sided hypergeometric Fisher p-value"),
+      assumptionsUnknown = listOf("Whether study is cohort/RCT vs case-control", "Whether reported OR was covariate-adjusted or Firth-penalized", "Whether observations are clustered"),
+      alternativeValidInterpretations = buildList {
+        add("Reversed reference arm yields reciprocal 1/OR=${formatNum(1.0 / calc.or)}")
+        if (calc.hasZeroCell) add("Exact conditional MLE / Peto OR / Firth penalized logistic regression differ from Haldane +0.5")
+        add("Fisher's exact test conditions on both margins; mid-p or Barnard/Boschloo exact tests are valid alternatives")
+      }
+    )
+
+    val rrContract = CalculatorAssumptionContract(
+      calculatorScope = "2x2 Risk Ratio / ARR / NNT",
+      assumptionsSatisfied = listOf("Complete arm numerators and denominators ($cellSummary)"),
+      assumptionsUnknown = listOf("Fixed follow-up horizon vs unequal person-time at risk", "Competing risks / loss to follow-up"),
+      alternativeValidInterpretations = buildList {
+        add("RR is valid for cumulative incidence over fixed follow-up; inappropriate if sampling is case-control")
+        if (calc.nntCrossesZero) add("ARR 95% CI spans zero: NNT spans NNTB through ∞ to NNTH (Altman 1998)")
+      }
     )
 
     // Compare reported OR if present (allow for adjusted OR only if explicitly labeled; unadjusted mismatch = ARITHMETIC_ERROR)
@@ -294,6 +414,11 @@ object NumericalReconstructionEngine {
           StatisticalFindingType.PASS,
           "Reported adjusted OR=${formatNum(tbl.reportedOr)} differs from crude 2x2 OR=${formatNum(calc.or)} (expected under covariate adjustment)."
         )
+        calc.hasZeroCell -> Triple(
+          QuantFindingStatus.WARN,
+          StatisticalFindingType.ASSUMPTION_UNCHECKED,
+          "Single zero-cell 2x2 ($cellSummary): Haldane +0.5 gives OR=${formatNum(calc.or)}, whereas reported OR=${formatNum(tbl.reportedOr)} may reflect exact conditional MLE, Peto OR, or Firth penalization."
+        )
         else -> Triple(
           QuantFindingStatus.FAIL,
           StatisticalFindingType.ARITHMETIC_ERROR,
@@ -313,8 +438,10 @@ object NumericalReconstructionEngine {
           assumptions = assumptions,
           status = status,
           findingType = type,
+          isScreeningSignal = calc.hasZeroCell && status == QuantFindingStatus.WARN,
           scientificConsequence = if (status == QuantFindingStatus.FAIL) "Effect magnitude cannot be reproduced from reported arm counts." else "Effect size verified against raw arm counts.",
-          detail = detail
+          detail = detail,
+          assumptionContract = orContract
         )
       )
     }
@@ -327,6 +454,7 @@ object NumericalReconstructionEngine {
       val (status, type, detail) = when {
         bestRel <= 0.06 -> Triple(QuantFindingStatus.PASS, StatisticalFindingType.PASS, "Reported RR=${formatNum(tbl.reportedRr)} matches exact 2x2 RR=${formatNum(calc.rr)} (95% CI ${formatNum(calc.rrLower)}–${formatNum(calc.rrUpper)}).")
         isLikelyAdjusted -> Triple(QuantFindingStatus.INFO, StatisticalFindingType.PASS, "Reported adjusted RR=${formatNum(tbl.reportedRr)} differs from crude 2x2 RR=${formatNum(calc.rr)}.")
+        calc.hasZeroCell -> Triple(QuantFindingStatus.WARN, StatisticalFindingType.ASSUMPTION_UNCHECKED, "Single zero-cell 2x2 ($cellSummary): Haldane +0.5 gives RR=${formatNum(calc.rr)} vs reported RR=${formatNum(tbl.reportedRr)} (continuity-correction sensitive).")
         else -> Triple(QuantFindingStatus.FAIL, StatisticalFindingType.ARITHMETIC_ERROR, "Crude 2x2 counts ($cellSummary) yield RR=${formatNum(calc.rr)} (95% CI ${formatNum(calc.rrLower)}–${formatNum(calc.rrUpper)}), conflicting with reported RR=${formatNum(tbl.reportedRr)}.")
       }
       out.add(
@@ -342,31 +470,57 @@ object NumericalReconstructionEngine {
           assumptions = assumptions,
           status = status,
           findingType = type,
+          isScreeningSignal = calc.hasZeroCell && status == QuantFindingStatus.WARN,
           scientificConsequence = if (status == QuantFindingStatus.FAIL) "Reported risk ratio disagrees with raw arm counts." else "Risk ratio verified.",
-          detail = detail
+          detail = detail,
+          assumptionContract = rrContract
         )
       )
     }
 
     if (tbl.reportedNnt != null && calc.nnt != null) {
       val relErr = abs(tbl.reportedNnt - calc.nnt) / max(calc.nnt, 1.0)
-      val fail = relErr > 0.12
+      val fail = relErr > 0.12 && !calc.nntCrossesZero
+      val status = when {
+        fail -> QuantFindingStatus.FAIL
+        calc.nntCrossesZero -> QuantFindingStatus.WARN
+        else -> QuantFindingStatus.PASS
+      }
+      val fType = when {
+        fail -> StatisticalFindingType.ARITHMETIC_ERROR
+        calc.nntCrossesZero -> StatisticalFindingType.ASSUMPTION_UNCHECKED
+        else -> StatisticalFindingType.PASS
+      }
+      val nntStr = if (calc.nntCrossesZero) {
+        "ARR=${formatNum(calc.arr * 100)}% (95% CI ${formatNum(calc.arrCiLower * 100)}% to ${formatNum(calc.arrCiUpper * 100)}%), NNT crosses ∞ (NNTB to ∞ to NNTH)"
+      } else {
+        "ARR=${formatNum(abs(calc.arr) * 100)}%, NNT=${formatNum(calc.nnt)}"
+      }
       out.add(
         NumericalReconstructionResult(
           checkId = nextId(),
           calculatorName = "2x2 Clinical Magnitude (ARR/NNT)",
           reportedValue = "NNT=${formatNum(tbl.reportedNnt)}",
-          recomputedValue = "ARR=${formatNum(abs(calc.arr) * 100)}%, NNT=${formatNum(calc.nnt)}",
+          recomputedValue = nntStr,
           tolerance = "±12% (rounding of ARR)",
           sourceEvidence = tbl.sourceQuote,
           pageNumber = tbl.page,
           section = tbl.section,
           assumptions = assumptions,
-          status = if (fail) QuantFindingStatus.FAIL else QuantFindingStatus.PASS,
-          findingType = if (fail) StatisticalFindingType.ARITHMETIC_ERROR else StatisticalFindingType.PASS,
-          scientificConsequence = if (fail) "Clinical benefit magnitude (NNT) is miscalculated from reported arm risks." else "NNT matches 1/|ARR|.",
-          detail = if (fail) "1/|ARR| = 1/${formatNum(abs(calc.arr))} = ${formatNum(calc.nnt)}, conflicting with reported NNT=${formatNum(tbl.reportedNnt)}."
-          else "Reported NNT=${formatNum(tbl.reportedNnt)} aligns with exact 1/|ARR|=${formatNum(calc.nnt)}."
+          status = status,
+          findingType = fType,
+          isScreeningSignal = calc.nntCrossesZero,
+          scientificConsequence = when {
+            fail -> "Clinical benefit magnitude (NNT) is miscalculated from reported arm risks."
+            calc.nntCrossesZero -> "ARR 95% CI spans zero, so NNT CI is discontinuous across infinity (NNTB to ∞ to NNTH) and should be reported alongside ARR CI."
+            else -> "NNT matches 1/|ARR|."
+          },
+          detail = when {
+            fail -> "1/|ARR| = 1/${formatNum(abs(calc.arr))} = ${formatNum(calc.nnt)}, conflicting with reported NNT=${formatNum(tbl.reportedNnt)}."
+            calc.nntCrossesZero -> "Point NNT≈${formatNum(calc.nnt)}, but ARR 95% CI (${formatNum(calc.arrCiLower * 100)}% to ${formatNum(calc.arrCiUpper * 100)}%) crosses zero (NNTB to ∞ to NNTH)."
+            else -> "Reported NNT=${formatNum(tbl.reportedNnt)} aligns with exact 1/|ARR|=${formatNum(calc.nnt)}."
+          },
+          assumptionContract = rrContract
         )
       )
     }
@@ -376,12 +530,13 @@ object NumericalReconstructionEngine {
       val pConflict = tbl.reportedP != null &&
         ((tbl.reportedP < 0.05 && calc.chiSquareP > 0.08 && calc.fisherExactTwoSidedP > 0.08) ||
           (tbl.reportedP >= 0.05 && calc.chiSquareP < 0.025 && calc.fisherExactTwoSidedP < 0.025))
+      val nntSuffix = if (calc.nntCrossesZero) ", NNT crosses ∞ (NNTB..∞..NNTH)" else calc.nnt?.let { ", NNT=${formatNum(it)}" }.orEmpty()
       out.add(
         NumericalReconstructionResult(
           checkId = nextId(),
           calculatorName = "2x2 Exact Reconstruction",
           reportedValue = tbl.reportedP?.let { "$cellSummary (p=${formatP(it)})" } ?: cellSummary,
-          recomputedValue = "OR=${formatNum(calc.or)}, RR=${formatNum(calc.rr)}, ARR=${formatNum(calc.arr * 100)}%, Fisher p=${formatP(calc.fisherExactTwoSidedP)}",
+          recomputedValue = "OR=${formatNum(calc.or)}, RR=${formatNum(calc.rr)}, ARR=${formatNum(calc.arr * 100)}%$nntSuffix, Fisher p=${formatP(calc.fisherExactTwoSidedP)}",
           tolerance = "Exact Fisher & χ²(1)",
           sourceEvidence = tbl.sourceQuote,
           pageNumber = tbl.page,
@@ -391,7 +546,8 @@ object NumericalReconstructionEngine {
           findingType = if (pConflict) StatisticalFindingType.ARITHMETIC_ERROR else StatisticalFindingType.PASS,
           scientificConsequence = if (pConflict) "2x2 significance decision disagrees with both exact Fisher and Pearson χ² tests." else "Independent 2x2 OR/RR/ARR/NNT and Fisher exact p reconstructed.",
           detail = if (pConflict) "Reported p=${formatP(tbl.reportedP ?: 1.0)} conflicts with exact Fisher p=${formatP(calc.fisherExactTwoSidedP)} and Pearson χ² p=${formatP(calc.chiSquareP)}."
-          else "Reconstructed from $cellSummary: OR=${formatNum(calc.or)} (${formatNum(calc.orLower)}–${formatNum(calc.orUpper)}), RR=${formatNum(calc.rr)}, Fisher p=${formatP(calc.fisherExactTwoSidedP)}."
+          else "Reconstructed from $cellSummary: OR=${formatNum(calc.or)} (${formatNum(calc.orLower)}–${formatNum(calc.orUpper)}), RR=${formatNum(calc.rr)}, Fisher p=${formatP(calc.fisherExactTwoSidedP)}$nntSuffix.",
+          assumptionContract = orContract
         )
       )
     }
@@ -449,7 +605,13 @@ object NumericalReconstructionEngine {
       findingType = StatisticalFindingType.ARITHMETIC_ERROR,
       scientificConsequence = if (impossible) "Numerator exceeds denominator." else "Reported percentage disagrees with exact numerator/denominator ratio.",
       detail = if (impossible) "Impossible proportion: numerator ($num) exceeds denominator ($den)."
-      else "Exact ratio $num/$den = ${formatNum(exactPct)}%, differing from reported ${formatNum(repPct)}% by ${formatNum(diff)} percentage points."
+      else "Exact ratio $num/$den = ${formatNum(exactPct)}%, differing from reported ${formatNum(repPct)}% by ${formatNum(diff)} percentage points.",
+      assumptionContract = CalculatorAssumptionContract(
+        calculatorScope = "Binomial proportion & Wilson score CI",
+        assumptionsSatisfied = listOf("Exact integer numerator and denominator extracted"),
+        assumptionsUnknown = listOf("Whether percentage was survey-weighted or missing-excluded"),
+        alternativeValidInterpretations = listOf("Weighted survey proportions can differ from unweighted raw x/n counts")
+      )
     )
   }
 
@@ -533,8 +695,10 @@ object NumericalReconstructionEngine {
       }
       else -> {
         val diff = abs(effectiveP - repP)
+        val isMultiplicityAdjusted = claim.parseNote.contains("Multiplicity-adjusted", ignoreCase = true)
         when {
           diff <= 0.005 || (effectiveP < 0.001 && repP < 0.001) -> Triple(QuantFindingStatus.PASS, StatisticalFindingType.PASS, "Exact $tailLabel p = ${formatP(effectiveP)} matches reported p = ${formatP(repP)}.")
+          isMultiplicityAdjusted && repP >= effectiveP - 0.002 -> Triple(QuantFindingStatus.PASS, StatisticalFindingType.PASS, "Reported multiplicity-adjusted p = ${formatP(repP)} is validly >= raw $tailLabel p = ${formatP(effectiveP)}.")
           // Check if unexplained two-sided mismatch would match one-sided!
           supportsOneSided && claim.tailSpec == TailSpecification.UNSPECIFIED && abs((twoTailedP / 2.0) - repP) <= 0.005 ->
             Triple(QuantFindingStatus.WARN, StatisticalFindingType.REPORTING_OMISSION, "Reported p=${formatP(repP)} matches ONE-SIDED p=${formatP(twoTailedP / 2.0)} (two-sided p=${formatP(twoTailedP)}) without declaring a one-sided test.")
@@ -558,7 +722,13 @@ object NumericalReconstructionEngine {
       findingType = findingType,
       isScreeningSignal = status == QuantFindingStatus.WARN && findingType == StatisticalFindingType.REPORTING_OMISSION,
       scientificConsequence = if (status == QuantFindingStatus.FAIL) "Reported statistical significance conclusion reverses upon exact recomputation." else "Test statistic consistency evaluated.",
-      detail = detail
+      detail = detail,
+      assumptionContract = CalculatorAssumptionContract(
+        calculatorScope = "Test-statistic p-value recomputation (${claim.testStatisticName})",
+        assumptionsSatisfied = listOf("Tail specification: $tailLabel", "Threshold α=${formatNum(alpha)}"),
+        assumptionsUnknown = listOf("Whether reported p-value was multiplicity-adjusted (Bonferroni/Holm/FDR) or permutation-based"),
+        alternativeValidInterpretations = listOf("Reported p > exact p may reflect multiplicity adjustment or exact/permutation p-values")
+      )
     )
   }
 
@@ -609,7 +779,13 @@ object NumericalReconstructionEngine {
       findingType = if (isFail) StatisticalFindingType.ARITHMETIC_ERROR else StatisticalFindingType.PASS,
       scientificConsequence = if (isFail) "Regression CI or p-value is inconsistent with reported β and SE." else "Regression β, SE, CI, and p-value are internally consistent.",
       detail = if (isFail) "From β=${formatNum(beta)} and SE=${formatNum(se)}, expected 95% CI is [${formatNum(expLo)}, ${formatNum(expHi)}] and p=${formatP(pCalc)}, conflicting with reported values."
-      else "β=${formatNum(beta)} ± ${formatNum(crit)}×SE(${formatNum(se)}) matches reported interval/p-value."
+      else "β=${formatNum(beta)} ± ${formatNum(crit)}×SE(${formatNum(se)}) matches reported interval/p-value.",
+      assumptionContract = CalculatorAssumptionContract(
+        calculatorScope = "Regression β/SE/CI/p Wald reconstruction",
+        assumptionsSatisfied = listOf("Linear-scale β and positive SE extracted"),
+        assumptionsUnknown = listOf("Finite-sample degrees of freedom (Satterthwaite/Kenward-Roger)", "Profile-likelihood or bootstrap CI vs Wald CI"),
+        alternativeValidInterpretations = listOf("Profile-likelihood or BCa bootstrap CIs may legitimately deviate from symmetric Wald β ± z·SE")
+      )
     )
   }
 
@@ -622,21 +798,27 @@ object NumericalReconstructionEngine {
     val hi = claim.ciUpper ?: return null
     val label = claim.effectMeasure.uppercase(Locale.US)
 
-    if (est <= 0.0 || lo <= 0.0 || hi <= 0.0) {
+    if (!est.isFinite() || !lo.isFinite() || !hi.isFinite() || est <= 0.0 || lo <= 0.0 || hi <= 0.0) {
       return NumericalReconstructionResult(
         checkId = checkId,
         calculatorName = "Ratio / Survival CI Domain ($label)",
         reportedValue = claim.sourceQuote,
-        recomputedValue = "Positive ratio required (> 0)",
-        tolerance = "Strict positivity",
+        recomputedValue = "Positive finite ratio required (> 0)",
+        tolerance = "Strict positivity & finiteness",
         sourceEvidence = claim.sourceQuote,
         pageNumber = claim.page,
         section = claim.section,
-        assumptions = listOf("$label is strictly positive on the multiplicative scale."),
+        assumptions = listOf("$label is strictly positive and finite on the multiplicative scale."),
         status = QuantFindingStatus.FAIL,
         findingType = StatisticalFindingType.ARITHMETIC_ERROR,
-        scientificConsequence = "Impossible non-positive ratio or confidence bound.",
-        detail = "$label = $est with bounds [$lo, $hi] violates strict positivity."
+        scientificConsequence = "Impossible non-positive or non-finite ratio/bound.",
+        detail = "$label = $est with bounds [$lo, $hi] violates strict positivity on the multiplicative scale (possible sign error, separation, or log-scale confusion).",
+        assumptionContract = CalculatorAssumptionContract(
+          calculatorScope = "Ratio / Survival CI positivity check ($label)",
+          assumptionsSatisfied = listOf("Multiplicative scale requires strictly positive finite values (> 0)"),
+          assumptionsUnknown = listOf("Whether value was mistakenly reported on log-scale (ln OR / ln HR)"),
+          alternativeValidInterpretations = listOf("Complete separation can produce infinite/zero MLE unless penalized (Firth)")
+        )
       )
     }
 
@@ -654,7 +836,13 @@ object NumericalReconstructionEngine {
         status = QuantFindingStatus.FAIL,
         findingType = StatisticalFindingType.ARITHMETIC_ERROR,
         scientificConsequence = "Impossible CI geometry (point estimate outside bounds or inverted limits).",
-        detail = "Reported $label=$est lies outside reported bounds [$lo, $hi]."
+        detail = "Reported $label=$est lies outside reported bounds [$lo, $hi].",
+        assumptionContract = CalculatorAssumptionContract(
+          calculatorScope = "CI bound ordering ($label)",
+          assumptionsSatisfied = listOf("Standard frequentist/Bayesian interval contains point estimate"),
+          assumptionsUnknown = listOf("None — inverted or non-covering bounds indicate transcription or computation error"),
+          alternativeValidInterpretations = emptyList()
+        )
       )
     }
 
@@ -667,6 +855,20 @@ object NumericalReconstructionEngine {
     val impliedZ = if (impliedSe > 1e-6) abs(lnEst) / impliedSe else 0.0
     val impliedP = QuantitativeForensicAnalyzer.normalTwoTailedP(impliedZ)
     val relAsym = if (logHalf > 1e-4) abs(lnEst - logMid) / logHalf else 0.0
+
+    val ratioContract = CalculatorAssumptionContract(
+      calculatorScope = "Ratio / Survival log-scale CI reconstruction ($label)",
+      assumptionsSatisfied = listOf("Positive finite ratio and ordered bounds"),
+      assumptionsUnknown = buildList {
+        add("Wald vs profile-likelihood vs bootstrap CI construction")
+        if (label in setOf("HR", "AHR")) add("Proportional hazards assumption over follow-up")
+        add("Adjusted vs unadjusted covariate set")
+      },
+      alternativeValidInterpretations = listOf(
+        "Profile-likelihood, exact, or bootstrap intervals are legitimately asymmetric on the log scale",
+        "Adjusted p-values (Bonferroni/FDR) can be larger than unadjusted Wald p implied by a 95% CI"
+      )
+    )
 
     // Check p-value vs CI null-crossing contradiction
     val ciExcludesNull = lo > 1.005 || hi < 0.995
@@ -689,7 +891,8 @@ object NumericalReconstructionEngine {
         status = QuantFindingStatus.FAIL,
         findingType = StatisticalFindingType.INTERNAL_CONTRADICTION,
         scientificConsequence = "Confidence interval and p-value give contradictory statistical significance conclusions.",
-        detail = "$label=$est ($lo–$hi) ${if (ciExcludesNull) "excludes" else "crosses"} 1.0, contradicting reported p=${formatP(repP)} (implied Wald p≈${formatP(impliedP)})."
+        detail = "$label=$est ($lo–$hi) ${if (ciExcludesNull) "excludes" else "crosses"} 1.0, contradicting reported p=${formatP(repP)} (implied Wald p≈${formatP(impliedP)}).",
+        assumptionContract = ratioContract
       )
       relAsym > 0.30 && logHalf > 0.08 -> NumericalReconstructionResult(
         checkId = checkId,
@@ -705,7 +908,8 @@ object NumericalReconstructionEngine {
         findingType = StatisticalFindingType.POSSIBLE_BIAS,
         isScreeningSignal = true,
         scientificConsequence = "Screening signal only: may reflect exact/bootstrap/profile-likelihood CI or a transcription typo.",
-        detail = "Log-scale midpoint (${formatNum(exp(logMid))}) deviates from reported $label=$est by ${(relAsym * 100).toInt()}% of log half-width; verify CI method (Wald vs profile/bootstrap) or transcription."
+        detail = "Log-scale midpoint (${formatNum(exp(logMid))}) deviates from reported $label=$est by ${(relAsym * 100).toInt()}% of log half-width; verify CI method (Wald vs profile/bootstrap) or transcription.",
+        assumptionContract = ratioContract
       )
       else -> NumericalReconstructionResult(
         checkId = checkId,
@@ -720,7 +924,8 @@ object NumericalReconstructionEngine {
         status = QuantFindingStatus.PASS,
         findingType = StatisticalFindingType.PASS,
         scientificConsequence = "Log-scale CI geometry and implied precision verified.",
-        detail = "$label=$est ($lo–$hi) is log-symmetric (implied SE=${formatNum(impliedSe)})."
+        detail = "$label=$est ($lo–$hi) is log-symmetric (implied SE=${formatNum(impliedSe)}).",
+        assumptionContract = ratioContract
       )
     }
   }
@@ -889,6 +1094,28 @@ object NumericalReconstructionEngine {
     val lower = rawText.lowercase(Locale.US)
     val usesFixedOnly = (lower.contains("fixed-effect") || lower.contains("fixed effect")) && !lower.contains("random-effect") && !lower.contains("random effect")
     val modelMismatch = usesFixedOnly && summary.iSquaredPct >= 50.0
+    val hasNonIndependentCues = lower.contains("multiple effect sizes per study") ||
+      lower.contains("multiple effects per study") ||
+      lower.contains("correlated outcomes") ||
+      lower.contains("non-independent") ||
+      lower.contains("nested within studies") ||
+      lower.contains("shared control")
+    val modelsDependence = lower.contains("robust variance") || lower.contains("rve") ||
+      lower.contains("three-level") || lower.contains("multilevel") || lower.contains("sandwich variance")
+
+    val metaContract = CalculatorAssumptionContract(
+      calculatorScope = "Random-effects meta-analysis (IVW / DL / PM / HKSJ / PI)",
+      assumptionsSatisfied = listOf("k=${summary.k} study effects with positive sampling variances on ${if (isLog) "log-ratio" else "additive"} scale"),
+      assumptionsUnknown = buildList {
+        add("Strict independence across extracted study effect sizes")
+        add("Between-study effect normality for 95% prediction interval")
+        if (summary.k <= 5) add("Small-k (k=${summary.k}) HKSJ/REML variance stability")
+      },
+      alternativeValidInterpretations = listOf(
+        "Correlated / nested study effects require three-level meta-analysis or robust variance estimation (RVE)",
+        "Bayesian hierarchical pooling is a valid alternative when k is small"
+      )
+    )
 
     out.add(
       NumericalReconstructionResult(
@@ -908,9 +1135,32 @@ object NumericalReconstructionEngine {
         findingType = if (modelMismatch) StatisticalFindingType.MODEL_MISMATCH else StatisticalFindingType.PASS,
         scientificConsequence = if (modelMismatch) "Fixed-effect pooling under substantial heterogeneity (I²=${formatNum(summary.iSquaredPct)}%) severely understates uncertainty."
         else "Independent random-effects pooling, τ², HKSJ CI, and 95% prediction interval verified.",
-        detail = "Reconstructed across k=${summary.k} studies: Q=${formatNum(summary.cochranQ)} (p=${formatP(summary.qPValue)}), I²=${formatNum(summary.iSquaredPct)}%, τ²_DL=${formatNum(summary.tauSquaredDL)}, τ²_PM=${formatNum(summary.tauSquaredPM)}, 95% PI=$piStr."
+        detail = "Reconstructed across k=${summary.k} studies: Q=${formatNum(summary.cochranQ)} (p=${formatP(summary.qPValue)}), I²=${formatNum(summary.iSquaredPct)}%, τ²_DL=${formatNum(summary.tauSquaredDL)}, τ²_PM=${formatNum(summary.tauSquaredPM)}, 95% PI=$piStr.",
+        assumptionContract = metaContract
       )
     )
+
+    if (hasNonIndependentCues && !modelsDependence) {
+      out.add(
+        NumericalReconstructionResult(
+          checkId = nextId(),
+          calculatorName = "Meta-Analysis Effect-Size Independence Guard",
+          reportedValue = "k=${summary.k} extracted effects with non-independence cues",
+          recomputedValue = "Standard IVW/DL/PM assumes independent effects; requires RVE or three-level model",
+          tolerance = "Within-study covariance assumption",
+          sourceEvidence = studies.take(3).joinToString("; ") { it.studyLabel },
+          pageNumber = studies.first().page,
+          section = "Results",
+          assumptions = listOf("Standard two-level meta-analysis assumes Cov(e_i, e_j) = 0 across all rows."),
+          status = QuantFindingStatus.WARN,
+          findingType = StatisticalFindingType.ASSUMPTION_UNCHECKED,
+          isScreeningSignal = true,
+          scientificConsequence = "Treating multiple correlated effects from the same study/shared control as independent understates pooled SE.",
+          detail = "Non-independent effect sizes (multiple effects per study / correlated outcomes / shared control) detected without RVE or three-level nesting; standard IVW/PM SE is only an approximation.",
+          assumptionContract = metaContract
+        )
+      )
+    }
 
     if (summary.looCrossesNull && summary.mostInfluentialStudy != null) {
       out.add(
@@ -928,7 +1178,8 @@ object NumericalReconstructionEngine {
           findingType = StatisticalFindingType.POSSIBLE_BIAS,
           isScreeningSignal = true,
           scientificConsequence = "Pooled significance depends on a single influential study ('${summary.mostInfluentialStudy}').",
-          detail = "Leave-one-out sensitivity shows omitting '${summary.mostInfluentialStudy}' renders the pooled effect non-significant."
+          detail = "Leave-one-out sensitivity shows omitting '${summary.mostInfluentialStudy}' renders the pooled effect non-significant.",
+          assumptionContract = metaContract
         )
       )
     }

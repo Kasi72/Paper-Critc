@@ -3,6 +3,7 @@ package com.example.data.ai.epistemic
 import com.example.data.ai.ManuscriptForensicEngine
 import com.example.data.ai.QuantFindingStatus
 import com.example.data.ai.Reviewer2PipelineService
+import com.example.data.ai.stats.AuditSubDesign
 import com.example.data.ai.stats.EvidenceDerivedScoreGate
 import com.example.data.model.FindingStatus
 import com.example.data.model.ReviewFinding
@@ -32,7 +33,8 @@ object ReviewerCalibrationBenchmark {
     val expertReferenceVerdict: String,
     val reviewMode: ReviewMode = ReviewMode.JOURNAL_REFEREE,
     val simulatedCoverage: DocumentCoverageReport? = null,
-    val expertNotes: String
+    val expertNotes: String,
+    val expectedSubDesign: AuditSubDesign? = null
   )
 
   data class CalibrationCaseResult(
@@ -51,7 +53,12 @@ object ReviewerCalibrationBenchmark {
     val resolvedVerdict: String,
     val expertReferenceVerdict: String,
     val verdictMatched: Boolean,
-    val severityCalibrated: Boolean
+    val severityCalibrated: Boolean,
+    val designMatched: Boolean = true,
+    val anchorAccuracy: Double = 1.0,
+    val unsupportedClaimCount: Int = 0,
+    val totalClaimCount: Int = 0,
+    val stableUnderNoise: Boolean = true
   )
 
   data class CalibrationSummaryReport(
@@ -63,25 +70,34 @@ object ReviewerCalibrationBenchmark {
     val recall: Double,
     val verdictAgreementRate: Double,
     val severityCalibrationRate: Double,
-    val caseResults: List<CalibrationCaseResult>
+    val caseResults: List<CalibrationCaseResult>,
+    val falsePositiveRate: Double = 0.0,
+    val falseNegativeRate: Double = 0.0,
+    val unsupportedClaimRate: Double = 0.0,
+    val designClassificationAccuracy: Double = 1.0,
+    val evidenceAnchorAccuracy: Double = 1.0,
+    val scoreStabilityUnderNoiseRate: Double = 1.0
   ) {
     fun toSummaryText(): String = buildString {
       appendLine(
         String.format(
           Locale.US,
-          "Calibration Instrument Score (%d Benchmarks): Precision=%.0f%% | Recall=%.0f%% | False Positives=%d | False Negatives=%d | Severity Calibration=%.0f%% | Verdict Match=%.0f%%",
+          "Calibration Instrument Score (%d Benchmarks): Precision=%.0f%% | Recall=%.0f%% | FPR=%.0f%% | FNR=%.0f%% | Design Acc=%.0f%% | Anchor Acc=%.0f%% | Noise Stability=%.0f%% | Severity Calibration=%.0f%% | Verdict Match=%.0f%%",
           totalCases,
           precision * 100.0,
           recall * 100.0,
-          totalFalsePositives,
-          totalFalseNegatives,
+          falsePositiveRate * 100.0,
+          falseNegativeRate * 100.0,
+          designClassificationAccuracy * 100.0,
+          evidenceAnchorAccuracy * 100.0,
+          scoreStabilityUnderNoiseRate * 100.0,
           severityCalibrationRate * 100.0,
           verdictAgreementRate * 100.0
         )
       )
       caseResults.forEach { c ->
         val badge = if (c.falsePositives == 0 && c.falseNegatives == 0 && c.severityCalibrated && c.verdictMatched) "PASS" else "DRIFT"
-        appendLine("• [$badge] ${c.title} (${c.category}): Verdict=${c.resolvedVerdict} (Expert=${c.expertReferenceVerdict}) | TP=${c.truePositives} FP=${c.falsePositives} FN=${c.falseNegatives}")
+        appendLine("• [$badge] ${c.title} (${c.category}): Verdict=${c.resolvedVerdict} (Expert=${c.expertReferenceVerdict}) | TP=${c.truePositives} FP=${c.falsePositives} FN=${c.falseNegatives} | Design=${if (c.designMatched) "OK" else "MISS"} | NoiseStable=${if (c.stableUnderNoise) "OK" else "DRIFT"}")
       }
     }.trim()
   }
@@ -106,7 +122,8 @@ object ReviewerCalibrationBenchmark {
       expectedFatalFlaw = true,
       expectedStopAndAsk = false,
       expertReferenceVerdict = "MAJOR_REVISION",
-      expertNotes = "Must catch both corrupted OR=2.15 (true OR=0.41) and unexplained Table 1->Table 2 denominator drop (420->355) and block ACCEPT."
+      expertNotes = "Must catch both corrupted OR=2.15 (true OR=0.41) and unexplained Table 1->Table 2 denominator drop (420->355) and block ACCEPT.",
+      expectedSubDesign = AuditSubDesign.RCT
     ),
     CalibrationBenchmarkCase(
       caseId = "CAL-02",
@@ -127,7 +144,8 @@ object ReviewerCalibrationBenchmark {
       expectedFatalFlaw = false,
       expectedStopAndAsk = false,
       expertReferenceVerdict = "ACCEPT",
-      expertNotes = "Zero false positives allowed on a clean, preregistered, arithmetically exact RCT."
+      expertNotes = "Zero false positives allowed on a clean, preregistered, arithmetically exact RCT.",
+      expectedSubDesign = AuditSubDesign.RCT
     ),
     CalibrationBenchmarkCase(
       caseId = "CAL-03",
@@ -151,7 +169,8 @@ object ReviewerCalibrationBenchmark {
       expectedFatalFlaw = true,
       expectedStopAndAsk = false,
       expertReferenceVerdict = "MAJOR_REVISION",
-      expertNotes = "Must catch cross-sectional causal/policy overclaiming AND tiny-but-significant large-N effect without firing false arithmetic errors."
+      expertNotes = "Must catch cross-sectional causal/policy overclaiming AND tiny-but-significant large-N effect without firing false arithmetic errors.",
+      expectedSubDesign = AuditSubDesign.OBSERVATIONAL_COHORT
     ),
     CalibrationBenchmarkCase(
       caseId = "CAL-04",
@@ -172,7 +191,8 @@ object ReviewerCalibrationBenchmark {
       expectedFatalFlaw = true,
       expectedStopAndAsk = false,
       expertReferenceVerdict = "MAJOR_REVISION",
-      expertNotes = "Must catch preprocessing and subject-level leakage as fatal model mismatches."
+      expertNotes = "Must catch preprocessing and subject-level leakage as fatal model mismatches.",
+      expectedSubDesign = AuditSubDesign.ML_BENCHMARK
     ),
     CalibrationBenchmarkCase(
       caseId = "CAL-05",
@@ -208,10 +228,20 @@ object ReviewerCalibrationBenchmark {
     val tp = results.sumOf { it.truePositives }
     val fp = results.sumOf { it.falsePositives }
     val fn = results.sumOf { it.falseNegatives }
+    val totalFlagSlots = results.size * 6 // 6 tracked diagnostic flag channels per case
+    val tn = (totalFlagSlots - tp - fp - fn).coerceAtLeast(0)
     val precision = if (tp + fp > 0) tp.toDouble() / (tp + fp).toDouble() else 1.0
     val recall = if (tp + fn > 0) tp.toDouble() / (tp + fn).toDouble() else 1.0
+    val fpr = if (fp + tn > 0) fp.toDouble() / (fp + tn).toDouble() else 0.0
+    val fnr = if (fn + tp > 0) fn.toDouble() / (fn + tp).toDouble() else 0.0
     val verdictRate = results.count { it.verdictMatched }.toDouble() / results.size.coerceAtLeast(1)
     val sevRate = results.count { it.severityCalibrated }.toDouble() / results.size.coerceAtLeast(1)
+    val designAcc = results.count { it.designMatched }.toDouble() / results.size.coerceAtLeast(1)
+    val anchorAcc = results.map { it.anchorAccuracy }.average().takeIf { !it.isNaN() } ?: 1.0
+    val totalClaims = results.sumOf { it.totalClaimCount }
+    val unsupportedClaims = results.sumOf { it.unsupportedClaimCount }
+    val unsupportedRate = if (totalClaims > 0) unsupportedClaims.toDouble() / totalClaims.toDouble() else 0.0
+    val noiseStability = results.count { it.stableUnderNoise }.toDouble() / results.size.coerceAtLeast(1)
 
     return CalibrationSummaryReport(
       totalCases = results.size,
@@ -222,7 +252,13 @@ object ReviewerCalibrationBenchmark {
       recall = recall,
       verdictAgreementRate = verdictRate,
       severityCalibrationRate = sevRate,
-      caseResults = results
+      caseResults = results,
+      falsePositiveRate = fpr,
+      falseNegativeRate = fnr,
+      unsupportedClaimRate = unsupportedRate,
+      designClassificationAccuracy = designAcc,
+      evidenceAnchorAccuracy = anchorAcc,
+      scoreStabilityUnderNoiseRate = noiseStability
     )
   }
 
@@ -283,6 +319,41 @@ object ReviewerCalibrationBenchmark {
       epistemicReport = epistemic
     )
 
+    val designMatched = case.expectedSubDesign == null || statAudit.subDesign == case.expectedSubDesign
+    val activeClaims = statAudit.claims.filter { !it.isFromReferenceOrCitation }
+    val anchoredCount = activeClaims.count { it.page > 0 && it.sourceQuote.isNotBlank() }
+    val anchorAcc = if (activeClaims.isNotEmpty()) anchoredCount.toDouble() / activeClaims.size.toDouble() else 1.0
+
+    // Score & verdict stability under paraphrasing + duplicated PDF-column noise
+    val noisyVariant = perturbTextWithParaphraseAndPdfNoise(case.manuscriptText)
+    val noisyForensic = ManuscriptForensicEngine.analyzeManuscript(noisyVariant, isEmpiricalTrack = true)
+    val noisyStatAudit = noisyForensic.quantForensics.statisticalAudit!!
+    val noisyEpistemic = EpistemicSafeguardEngine.evaluate(
+      text = noisyVariant,
+      statAudit = noisyStatAudit,
+      coverageReport = case.simulatedCoverage,
+      extractionConfidence = extConf
+    )
+    val noisyAdjudicated = Reviewer2PipelineService.adjudicateFindingsAndScores(
+      rawFindings = emptyList(),
+      manuscriptText = noisyVariant,
+      forensicReport = noisyForensic,
+      methodologyScore = 9,
+      significanceScore = 9,
+      clarityScore = 9,
+      originalityScore = 9,
+      mathRigorScore = 9,
+      reproducibilityScore = 9,
+      rawVerdict = "ACCEPT",
+      reviewMode = case.reviewMode,
+      extractionConfidence = extConf,
+      applyStatisticalScoreGate = true,
+      epistemicReport = noisyEpistemic
+    )
+    val stableUnderNoise = noisyAdjudicated.resolvedVerdict == adjudicated.resolvedVerdict &&
+      abs(noisyAdjudicated.mathRigorScore - adjudicated.mathRigorScore) <= 1 &&
+      abs(noisyAdjudicated.methodologyScore - adjudicated.methodologyScore) <= 1
+
     return CalibrationCaseResult(
       caseId = case.caseId,
       title = case.title,
@@ -299,7 +370,26 @@ object ReviewerCalibrationBenchmark {
       resolvedVerdict = adjudicated.resolvedVerdict,
       expertReferenceVerdict = case.expertReferenceVerdict,
       verdictMatched = adjudicated.resolvedVerdict == case.expertReferenceVerdict,
-      severityCalibrated = detectedFatal == case.expectedFatalFlaw && epistemic.stopAndAsk.shouldStopAndAsk == case.expectedStopAndAsk
+      severityCalibrated = detectedFatal == case.expectedFatalFlaw && epistemic.stopAndAsk.shouldStopAndAsk == case.expectedStopAndAsk,
+      designMatched = designMatched,
+      anchorAccuracy = anchorAcc,
+      unsupportedClaimCount = statAudit.unsupportedClaimCount,
+      totalClaimCount = activeClaims.size,
+      stableUnderNoise = stableUnderNoise
     )
+  }
+
+  private fun perturbTextWithParaphraseAndPdfNoise(text: String): String {
+    val paraphrased = text
+      .replace("versus", "vs.")
+      .replace("compared daily", "evaluated daily")
+      .replace("occurred in", "was observed in")
+    val lines = paraphrased.lines().toMutableList()
+    val firstLongIdx = lines.indexOfFirst { it.trim().length >= 50 && !it.trim().startsWith("[PAGE") }
+    if (firstLongIdx >= 0) {
+      // Simulate a duplicated 2-column PDF extraction line
+      lines.add(firstLongIdx + 1, lines[firstLongIdx])
+    }
+    return lines.joinToString("\n")
   }
 }

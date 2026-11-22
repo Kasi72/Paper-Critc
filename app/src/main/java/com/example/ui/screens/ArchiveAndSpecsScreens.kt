@@ -1421,6 +1421,29 @@ private fun ReviewerCalibrationInstrumentCard() {
             modifier = Modifier.weight(1f)
           )
         }
+        Row(
+          modifier = Modifier.fillMaxWidth(),
+          horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+          CalibrationMetricTile(
+            label = "DESIGN ACC.",
+            value = "${(summary.designClassificationAccuracy * 100).toInt()}%",
+            tint = if (summary.designClassificationAccuracy >= 0.99) CupertinoGreen else CupertinoAmber,
+            modifier = Modifier.weight(1f)
+          )
+          CalibrationMetricTile(
+            label = "ANCHOR ACC.",
+            value = "${(summary.evidenceAnchorAccuracy * 100).toInt()}%",
+            tint = if (summary.evidenceAnchorAccuracy >= 0.99) CupertinoBlue else CupertinoAmber,
+            modifier = Modifier.weight(1f)
+          )
+          CalibrationMetricTile(
+            label = "NOISE STABLE",
+            value = "${(summary.scoreStabilityUnderNoiseRate * 100).toInt()}%",
+            tint = if (summary.scoreStabilityUnderNoiseRate >= 0.99) CupertinoGreen else CupertinoAmber,
+            modifier = Modifier.weight(1f)
+          )
+        }
 
         summary.caseResults.forEach { caseRes ->
           val passed = caseRes.falsePositives == 0 &&

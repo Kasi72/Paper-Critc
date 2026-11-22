@@ -72,6 +72,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.data.ai.epistemic.ReviewerCalibrationBenchmark
 import com.example.data.model.AiApiProviderEntry
 import com.example.data.model.ApiProtocolType
 import com.example.data.model.DefaultAiProviderCatalog
@@ -1292,6 +1293,10 @@ fun IosSettingsScreen(
 
       4 -> {
         item {
+          ReviewerCalibrationInstrumentCard()
+        }
+
+        item {
           IosGroupedCard(
             header = "30-Stage Reviewer2 + PhD-Skills Architecture"
           ) {
@@ -1306,6 +1311,213 @@ fun IosSettingsScreen(
         }
       }
     }
+  }
+}
+
+@Composable
+private fun ReviewerCalibrationInstrumentCard() {
+  var report by remember { mutableStateOf<ReviewerCalibrationBenchmark.CalibrationSummaryReport?>(null) }
+  var isRunning by remember { mutableStateOf(false) }
+  val scope = rememberCoroutineScope()
+  val palette = LocalNeumorphicPalette.current
+
+  IosGroupedCard(
+    header = "Reviewer Calibration Mode (Diagnostic Instrument)",
+    footer = "Evaluates deterministic statistical & epistemic safeguards against 5 expert-curated reference papers (Known Flawed, Known Robust, Causal Overclaim, ML Leakage, and Stop-and-Ask)."
+  ) {
+    Row(
+      verticalAlignment = Alignment.CenterVertically,
+      horizontalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+      IosSquircleIconBadge(
+        icon = Icons.Default.QueryStats,
+        tint = CupertinoIndigo,
+        size = 36.dp,
+        cornerRadius = 8.dp
+      )
+      Column(modifier = Modifier.weight(1f)) {
+        Text(
+          text = "Epistemic & Statistical Benchmark Suite",
+          style = MaterialTheme.typography.bodyMedium,
+          fontWeight = FontWeight.Bold
+        )
+        Text(
+          text = "Tracks Precision, Recall, False Positives, False Negatives, Severity Calibration, and Verdict Match.",
+          style = MaterialTheme.typography.labelSmall,
+          color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+      }
+    }
+
+    Spacer(modifier = Modifier.height(10.dp))
+
+    IosSquircleButton(
+      text = if (isRunning) "Running 5 Benchmarks..." else if (report == null) "Run Calibration Benchmark" else "Re-Run Calibration Suite",
+      onClick = {
+        if (!isRunning) {
+          isRunning = true
+          scope.launch {
+            report = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
+              ReviewerCalibrationBenchmark.runCalibration()
+            }
+            isRunning = false
+          }
+        }
+      },
+      enabled = !isRunning,
+      icon = Icons.Default.Science,
+      containerColor = CupertinoIndigo,
+      cornerRadius = 9.dp,
+      modifier = Modifier
+        .fillMaxWidth()
+        .testTag("run_calibration_button")
+    )
+
+    report?.let { summary ->
+      Spacer(modifier = Modifier.height(12.dp))
+      Column(
+        modifier = Modifier
+          .fillMaxWidth()
+          .testTag("calibration_results_panel"),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+      ) {
+        Row(
+          modifier = Modifier.fillMaxWidth(),
+          horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+          CalibrationMetricTile(
+            label = "PRECISION",
+            value = "${(summary.precision * 100).toInt()}%",
+            tint = if (summary.precision >= 0.99) CupertinoGreen else CupertinoAmber,
+            modifier = Modifier.weight(1f)
+          )
+          CalibrationMetricTile(
+            label = "RECALL",
+            value = "${(summary.recall * 100).toInt()}%",
+            tint = if (summary.recall >= 0.99) CupertinoGreen else CupertinoAmber,
+            modifier = Modifier.weight(1f)
+          )
+          CalibrationMetricTile(
+            label = "FP / FN",
+            value = "${summary.totalFalsePositives} / ${summary.totalFalseNegatives}",
+            tint = if (summary.totalFalsePositives == 0 && summary.totalFalseNegatives == 0) CupertinoGreen else CupertinoRed,
+            modifier = Modifier.weight(1f)
+          )
+        }
+        Row(
+          modifier = Modifier.fillMaxWidth(),
+          horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+          CalibrationMetricTile(
+            label = "SEVERITY CAL.",
+            value = "${(summary.severityCalibrationRate * 100).toInt()}%",
+            tint = if (summary.severityCalibrationRate >= 0.99) CupertinoBlue else CupertinoAmber,
+            modifier = Modifier.weight(1f)
+          )
+          CalibrationMetricTile(
+            label = "VERDICT MATCH",
+            value = "${(summary.verdictAgreementRate * 100).toInt()}%",
+            tint = if (summary.verdictAgreementRate >= 0.99) CupertinoGreen else CupertinoAmber,
+            modifier = Modifier.weight(1f)
+          )
+        }
+
+        summary.caseResults.forEach { caseRes ->
+          val passed = caseRes.falsePositives == 0 &&
+            caseRes.falseNegatives == 0 &&
+            caseRes.severityCalibrated &&
+            caseRes.verdictMatched
+          val badgeColor = if (passed) CupertinoGreen else CupertinoRed
+          val rowShape = SquircleShape(cornerRadius = 9.dp, smoothing = 0.88f)
+          Column(
+            modifier = Modifier
+              .fillMaxWidth()
+              .neuRecessed(
+                cornerRadius = 9.dp,
+                depth = 2.dp,
+                cavityColor = palette.surfaceRecessed
+              )
+              .padding(horizontal = 10.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(3.dp)
+          ) {
+            Row(
+              modifier = Modifier.fillMaxWidth(),
+              horizontalArrangement = Arrangement.SpaceBetween,
+              verticalAlignment = Alignment.CenterVertically
+            ) {
+              Text(
+                text = "${caseRes.caseId} • ${caseRes.title}",
+                style = MaterialTheme.typography.labelMedium,
+                fontWeight = FontWeight.Bold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f)
+              )
+              Box(
+                modifier = Modifier
+                  .clip(rowShape)
+                  .background(badgeColor.copy(alpha = 0.14f))
+                  .border(0.6.dp, badgeColor.copy(alpha = 0.40f), rowShape)
+                  .padding(horizontal = 6.dp, vertical = 2.dp)
+              ) {
+                Text(
+                  text = if (passed) "PASS" else "DRIFT",
+                  style = MaterialTheme.typography.labelSmall,
+                  fontFamily = JetBrainsMonoFamily,
+                  fontSize = 9.sp,
+                  fontWeight = FontWeight.ExtraBold,
+                  color = badgeColor
+                )
+              }
+            }
+            Text(
+              text = "Verdict: ${caseRes.resolvedVerdict.replace('_', ' ')} (Expert: ${caseRes.expertReferenceVerdict.replace('_', ' ')}) • TP=${caseRes.truePositives} FP=${caseRes.falsePositives} FN=${caseRes.falseNegatives}",
+              style = MaterialTheme.typography.labelSmall,
+              fontFamily = JetBrainsMonoFamily,
+              fontSize = 9.5.sp,
+              color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+          }
+        }
+      }
+    }
+  }
+}
+
+@Composable
+private fun CalibrationMetricTile(
+  label: String,
+  value: String,
+  tint: androidx.compose.ui.graphics.Color,
+  modifier: Modifier = Modifier
+) {
+  val palette = LocalNeumorphicPalette.current
+  Column(
+    modifier = modifier
+      .neuRecessed(
+        cornerRadius = 11.dp,
+        depth = 2.2.dp,
+        cavityColor = palette.surfaceRecessed
+      )
+      .padding(vertical = 8.dp, horizontal = 6.dp),
+    horizontalAlignment = Alignment.CenterHorizontally
+  ) {
+    Text(
+      text = label,
+      style = MaterialTheme.typography.labelSmall,
+      fontSize = 8.5.sp,
+      fontWeight = FontWeight.Bold,
+      color = MaterialTheme.colorScheme.onSurfaceVariant,
+      maxLines = 1
+    )
+    Spacer(modifier = Modifier.height(2.dp))
+    Text(
+      text = value,
+      style = MaterialTheme.typography.titleSmall,
+      fontFamily = JetBrainsMonoFamily,
+      fontWeight = FontWeight.ExtraBold,
+      color = tint
+    )
   }
 }
 

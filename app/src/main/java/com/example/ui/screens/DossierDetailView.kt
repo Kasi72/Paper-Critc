@@ -1626,9 +1626,18 @@ fun VerdictSquircleBadge(decision: String) {
       CupertinoGreen to Icons.Default.Verified
     normalized in setOf("MINOR_REVISION", "SOUND_WITH_CAVEATS", "MODERATE_CERTAINTY") ->
       CupertinoBlue to Icons.Default.Verified
-    normalized in setOf("MAJOR_REVISION", "REQUIRES_CORRECTION", "LOW_CERTAINTY") ->
+    normalized in setOf(
+      "MAJOR_REVISION",
+      "REQUIRES_CORRECTION",
+      "LOW_CERTAINTY",
+      "INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT"
+    ) ->
       CupertinoAmber to Icons.Default.Shield
     else -> CupertinoRed to Icons.Default.ReportProblem
+  }
+  val displayLabel = when (normalized) {
+    "INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT" -> "INSUFFICIENT EVIDENCE"
+    else -> decision.replace('_', ' ').uppercase()
   }
 
   val pillRadius = 11.dp
@@ -1651,7 +1660,7 @@ fun VerdictSquircleBadge(decision: String) {
       modifier = Modifier.size(13.dp)
     )
     Text(
-      text = decision.replace('_', ' ').uppercase(),
+      text = displayLabel,
       style = MaterialTheme.typography.labelSmall,
       fontSize = 10.sp,
       fontWeight = FontWeight.ExtraBold,
@@ -2425,6 +2434,21 @@ private fun EvidenceLedgerCard(
             }
           }
 
+          if (finding.flawTier.isNotBlank() || finding.reportingStatus.isNotBlank()) {
+            val tierText = buildList {
+              if (finding.flawTier.isNotBlank()) add("Tier: ${finding.flawTier.replace('_', ' ')}")
+              if (finding.reportingStatus.isNotBlank()) add("Reporting: ${finding.reportingStatus.replace('_', ' ')}")
+            }.joinToString(" • ")
+            Text(
+              text = tierText,
+              style = MaterialTheme.typography.labelSmall,
+              fontFamily = JetBrainsMonoFamily,
+              fontSize = 9.5.sp,
+              fontWeight = FontWeight.SemiBold,
+              color = CupertinoIndigo
+            )
+          }
+
           if (finding.verificationNotes.isNotBlank()) {
             Text(
               text = "Audit: ${finding.verificationNotes}",
@@ -2435,11 +2459,29 @@ private fun EvidenceLedgerCard(
             )
           }
 
+          if (finding.overturnEvidence.isNotBlank() && finding.status != FindingStatus.CONTRADICTED) {
+            Text(
+              text = "Overturn Evidence: ${finding.overturnEvidence}",
+              style = MaterialTheme.typography.labelSmall,
+              color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+          }
+
           if (finding.recommendedCorrection.isNotBlank() && finding.status != FindingStatus.CONTRADICTED) {
             Text(
               text = "Action: ${finding.recommendedCorrection}",
               style = MaterialTheme.typography.labelSmall,
               color = CupertinoBlue
+            )
+          }
+
+          if (finding.provenanceSummary.isNotBlank()) {
+            Text(
+              text = "Provenance: ${finding.provenanceSummary}",
+              style = MaterialTheme.typography.labelSmall,
+              fontFamily = JetBrainsMonoFamily,
+              fontSize = 9.sp,
+              color = MaterialTheme.colorScheme.onSurfaceVariant
             )
           }
         }

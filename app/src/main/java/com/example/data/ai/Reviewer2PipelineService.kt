@@ -2,6 +2,10 @@ package com.example.data.ai
 
 import android.graphics.Bitmap
 import android.util.Log
+import com.example.data.ai.epistemic.BidirectionalAdjudicator
+import com.example.data.ai.epistemic.EpistemicSafeguardEngine
+import com.example.data.ai.epistemic.EpistemicSafeguardReport
+import com.example.data.ai.epistemic.FlawSeverityTier
 import com.example.data.ai.stats.EvidenceDerivedScoreGate
 import com.example.data.ai.stats.ScoreCalculationBreakdown
 import com.example.data.ai.stats.StatisticalAuditReport
@@ -1069,6 +1073,21 @@ class Reviewer2PipelineService {
       adjudicatedFindings = emptyList(),
       statisticalAudit = forensicReport.quantForensics.statisticalAudit
     )
+    val coverageAwareEpistemic = forensicReport.quantForensics.statisticalAudit?.let { statAudit ->
+      EpistemicSafeguardEngine.evaluate(
+        text = manuscriptText,
+        statAudit = statAudit,
+        coverageReport = coverageReport,
+        extractionConfidence = preliminaryExtractionConfidence
+      )
+    } ?: forensicReport.quantForensics.epistemicSafeguards
+    val promptCoverageLabel = if (coverageReport != null) {
+      "${coverageReport.extractedPages}/${coverageReport.totalPages} pages"
+    } else if (primaryPrepared.wasTrimmed) {
+      "Trimmed (${primaryPrepared.omittedPages.size} omitted)"
+    } else {
+      "100%"
+    }
     val adjudicated = adjudicateFindingsAndScores(
       rawFindings = rawStructuredFindings,
       manuscriptText = manuscriptText,
@@ -1082,7 +1101,10 @@ class Reviewer2PipelineService {
       rawVerdict = pass2Json.optString("verdict", ""),
       reviewMode = options.reviewMode,
       extractionConfidence = preliminaryExtractionConfidence,
-      applyStatisticalScoreGate = true
+      applyStatisticalScoreGate = true,
+      epistemicReport = coverageAwareEpistemic,
+      modelVersion = if (useExternalProvider) externalProvider.modelId.ifBlank { externalProvider.serviceName } else "gemini-firebase-ai-logic",
+      promptCoverage = promptCoverageLabel
     )
 
     val credibilityScore = adjudicated.weightedCredibilityScore.toLong()
@@ -1194,6 +1216,15 @@ class Reviewer2PipelineService {
           }
           if (f.verificationNotes.isNotBlank()) {
             appendLine("• Verification Audit: ${f.verificationNotes}")
+          }
+          if (f.flawTier.isNotBlank() || f.reportingStatus.isNotBlank()) {
+            appendLine("• Classification: Tier=${f.flawTier.ifBlank { "UNSPECIFIED" }} | Reporting=${f.reportingStatus.ifBlank { "UNSPECIFIED" }}")
+          }
+          if (f.overturnEvidence.isNotBlank() && f.status != FindingStatus.CONTRADICTED) {
+            appendLine("• Minimum Evidence to Overturn: ${f.overturnEvidence}")
+          }
+          if (f.provenanceSummary.isNotBlank()) {
+            appendLine("• Provenance: ${f.provenanceSummary}")
           }
           if (f.recommendedCorrection.isNotBlank() && f.status != FindingStatus.CONTRADICTED) {
             appendLine("• Recommended Remedy: ${f.recommendedCorrection}")
@@ -2553,7 +2584,10 @@ class Reviewer2PipelineService {
       rawVerdict: String,
       reviewMode: ReviewMode,
       extractionConfidence: Int = 5,
-      applyStatisticalScoreGate: Boolean = false
+      applyStatisticalScoreGate: Boolean = false,
+      epistemicReport: EpistemicSafeguardReport? = null,
+      modelVersion: String = "gemini-firebase-ai-logic",
+      promptCoverage: String = "100%"
     ): AdjudicationResult {
       val absenceCounterChecks = listOf(
         Triple(
@@ -2862,6 +2896,58 @@ class Reviewer2PipelineService {
           }
       }
 
+      // 3c. Inject fatal/major epistemic contradictions & claim-overreach findings when score gate is active
+      val effectiveEpistemic = epistemicReport ?: forensicReport?.quantForensics?.epistemicSafeguards
+      if (applyStatisticalScoreGate && effectiveEpistemic != null && !effectiveEpistemic.stopAndAsk.shouldStopAndAsk) {
+        var nextEpiIdx = 1
+        effectiveEpistemic.contradictionMap.edges
+          .filter { it.severityTier == FlawSeverityTier.FATAL_TO_PRIMARY_CONCLUSION || it.severityTier == FlawSeverityTier.MATERIALLY_WEAKENS_CONFIDENCE }
+          .take(2)
+          .forEach { edge ->
+            val alreadyCovered = verifiedFindings.any {
+              it.title.contains(edge.contradictionType, ignoreCase = true) ||
+                it.allegation.contains(edge.description.take(28), ignoreCase = true)
+            }
+            if (!alreadyCovered) {
+              val isFatal = edge.severityTier == FlawSeverityTier.FATAL_TO_PRIMARY_CONCLUSION
+              verifiedFindings.add(
+                0,
+                ReviewFinding(
+                  id = "E-0${nextEpiIdx++}",
+                  title = "[${edge.severityTier.displayLabel}] ${edge.contradictionType}",
+                  allegation = edge.description,
+                  severity = if (isFatal) "CRITICAL" else "MAJOR",
+                  status = if (extractionConfidence >= 3) FindingStatus.VERIFIED else FindingStatus.PARTIALLY_SUPPORTED,
+                  supportingEvidence = listOf(
+                    EvidenceAnchor(
+                      pageNumber = edge.pages.firstOrNull() ?: 0,
+                      section = "${edge.fromSection} ↔ ${edge.toSection}",
+                      exactQuote = edge.quotes.firstOrNull().orEmpty()
+                    )
+                  ),
+                  methodologicalJustification = "Cross-section contradiction or claim-vs-design overreach detected by epistemic safeguard graph.",
+                  recommendedCorrection = edge.overturnEvidence,
+                  verificationNotes = "Epistemic contradiction edge (${edge.edgeId}).",
+                  overturnEvidence = edge.overturnEvidence
+                )
+              )
+            }
+          }
+      }
+
+      // 3d. Bidirectional Defense Adjudication (#13) + Flaw Tier (#10) + 4-State Reporting (#2) + Provenance (#14)
+      val finalFindings = if (applyStatisticalScoreGate || epistemicReport != null) {
+        BidirectionalAdjudicator.adjudicate(
+          findings = verifiedFindings,
+          manuscriptText = manuscriptText,
+          epistemicReport = effectiveEpistemic,
+          modelVersion = modelVersion,
+          promptCoverage = promptCoverage
+        ).findings
+      } else {
+        verifiedFindings
+      }
+
       // 4. Authoritative 6-axis weighted rubric computation + Phase 6 Evidence-Derived Score Gate
       val rawM = methodologyScore.coerceIn(1, 10)
       val s = significanceScore.coerceIn(1, 10)
@@ -2878,8 +2964,16 @@ class Reviewer2PipelineService {
           manuscriptText = manuscriptText
         )
       }
-      val m = if (applyStatisticalScoreGate && breakdown != null) breakdown.finalMethodologyScore else rawM
-      val math = if (applyStatisticalScoreGate && breakdown != null) breakdown.finalMathScore else rawMath
+      val m = if (applyStatisticalScoreGate && breakdown != null && effectiveEpistemic?.stopAndAsk?.shouldStopAndAsk != true) {
+        breakdown.finalMethodologyScore
+      } else {
+        rawM
+      }
+      val math = if (applyStatisticalScoreGate && breakdown != null && effectiveEpistemic?.stopAndAsk?.shouldStopAndAsk != true) {
+        breakdown.finalMathScore
+      } else {
+        rawMath
+      }
 
       val exactComposite = PaperReviewRubric.computeWeightedScore(
         methodology = m,
@@ -2890,22 +2984,28 @@ class Reviewer2PipelineService {
         reproducibility = r
       )
 
-      val hasVerifiedCriticalError = verifiedFindings.any {
+      val hasVerifiedCriticalError = finalFindings.any {
         it.status == FindingStatus.VERIFIED && it.severity == "CRITICAL"
       } || (applyStatisticalScoreGate && breakdown?.verdictCapReason != null && extractionConfidence >= 3)
-      val hasPartiallySupportedCriticalDiscrepancy = verifiedFindings.any {
+      val hasPartiallySupportedCriticalDiscrepancy = finalFindings.any {
         it.status == FindingStatus.PARTIALLY_SUPPORTED && it.severity == "CRITICAL"
       } || (applyStatisticalScoreGate && breakdown?.verdictCapReason != null && extractionConfidence < 3)
-      val resolvedVerdict = resolveVerdictForMode(
-        rawVerdict = rawVerdict,
-        compositeScore = exactComposite,
-        reviewMode = reviewMode,
-        hasVerifiedCriticalError = hasVerifiedCriticalError,
-        hasPartiallySupportedCriticalDiscrepancy = hasPartiallySupportedCriticalDiscrepancy
-      )
+
+      // Safeguard #15: Stop-and-Ask gate suspends strong verdicts when supplied material is incomplete/ambiguous
+      val resolvedVerdict = if (applyStatisticalScoreGate && effectiveEpistemic?.stopAndAsk?.shouldStopAndAsk == true) {
+        "INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT"
+      } else {
+        resolveVerdictForMode(
+          rawVerdict = rawVerdict,
+          compositeScore = exactComposite,
+          reviewMode = reviewMode,
+          hasVerifiedCriticalError = hasVerifiedCriticalError,
+          hasPartiallySupportedCriticalDiscrepancy = hasPartiallySupportedCriticalDiscrepancy
+        )
+      }
 
       return AdjudicationResult(
-        adjudicatedFindings = verifiedFindings,
+        adjudicatedFindings = finalFindings,
         methodologyScore = m,
         significanceScore = s,
         clarityScore = c,

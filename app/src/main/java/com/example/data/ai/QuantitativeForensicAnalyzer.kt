@@ -1,5 +1,7 @@
 package com.example.data.ai
 
+import com.example.data.ai.epistemic.EpistemicSafeguardEngine
+import com.example.data.ai.epistemic.EpistemicSafeguardReport
 import com.example.data.ai.stats.StatisticalAuditOrchestrator
 import com.example.data.ai.stats.StatisticalAuditReport
 import java.util.Locale
@@ -70,7 +72,8 @@ data class QuantitativeForensicReport(
   val algebraicAndMetricAlerts: List<String>,
   val diagnosticTable: List<QuantDiagnosticFinding>,
   val extractedPrecisionMetrics: List<String>,
-  val statisticalAudit: StatisticalAuditReport? = null
+  val statisticalAudit: StatisticalAuditReport? = null,
+  val epistemicSafeguards: EpistemicSafeguardReport? = null
 ) {
   val totalChecksExecuted: Int
     get() = statcheckResults.size + confidenceIntervalChecks.size + medianIqrChecks.size +
@@ -83,6 +86,10 @@ data class QuantitativeForensicReport(
     get() = diagnosticTable.count { it.status == QuantFindingStatus.WARN }
 
   fun toPromptBlock(): String = buildString {
+    if (epistemicSafeguards != null) {
+      appendLine(epistemicSafeguards.toPromptBlock())
+      appendLine()
+    }
     appendLine("[DETERMINISTIC QUANTITATIVE & STATISTICAL FORENSICS ENGINE (Exact Math Verification)]")
     appendLine(
       "Summary: ${statcheckResults.size} statcheck recomputation(s), " +
@@ -177,6 +184,13 @@ data class QuantitativeForensicReport(
         val safeEv = row.reportedEvidence.replace("|", "/").take(76)
         val safeDetail = row.diagnosticDetail.replace("|", "/").take(220)
         appendLine("| $safeCat | $safeEv | ${row.status.name} | $safeDetail |")
+      }
+    }
+    if (epistemicSafeguards != null) {
+      val epiMd = epistemicSafeguards.toAuditMarkdown()
+      if (epiMd.isNotBlank()) {
+        if (isNotEmpty()) appendLine()
+        appendLine(epiMd)
       }
     }
     if (statisticalAudit != null) {
@@ -387,6 +401,12 @@ object QuantitativeForensicAnalyzer {
     }
 
     val statisticalAudit = StatisticalAuditOrchestrator.audit(clean, studyDesign)
+    val epistemicSafeguards = EpistemicSafeguardEngine.evaluate(
+      text = clean,
+      statAudit = statisticalAudit,
+      coverageReport = null,
+      extractionConfidence = 5
+    )
 
     return QuantitativeForensicReport(
       statcheckResults = statchecks,
@@ -406,7 +426,8 @@ object QuantitativeForensicAnalyzer {
         }
       },
       extractedPrecisionMetrics = precisionMetrics,
-      statisticalAudit = statisticalAudit
+      statisticalAudit = statisticalAudit,
+      epistemicSafeguards = epistemicSafeguards
     )
   }
 

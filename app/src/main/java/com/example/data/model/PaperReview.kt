@@ -87,7 +87,11 @@ data class ReviewFinding(
   val counterEvidence: List<EvidenceAnchor> = emptyList(),
   val methodologicalJustification: String = "",
   val recommendedCorrection: String = "",
-  val verificationNotes: String = ""
+  val verificationNotes: String = "",
+  val reportingStatus: String = "", // REPORTED_AND_ADEQUATE, REPORTED_BUT_INADEQUATE, NOT_REPORTED, NOT_ASSESSABLE_FROM_SUPPLIED_MATERIAL
+  val flawTier: String = "", // FATAL_TO_PRIMARY_CONCLUSION, MATERIALLY_WEAKENS_CONFIDENCE, REQUIRES_REPORTING_CORRECTION, WORTHWHILE_ENHANCEMENT, COSMETIC_OR_EDITORIAL
+  val overturnEvidence: String = "", // Minimum concrete evidence that would overturn this critique
+  val provenanceSummary: String = "" // Page, deterministic/model source, parserVersion, ruleVersion, promptCoverage
 )
 
 object ReviewFindingCodec {
@@ -106,6 +110,10 @@ object ReviewFindingCodec {
       obj.put("methodologicalJustification", f.methodologicalJustification)
       obj.put("recommendedCorrection", f.recommendedCorrection)
       obj.put("verificationNotes", f.verificationNotes)
+      if (f.reportingStatus.isNotBlank()) obj.put("reportingStatus", f.reportingStatus)
+      if (f.flawTier.isNotBlank()) obj.put("flawTier", f.flawTier)
+      if (f.overturnEvidence.isNotBlank()) obj.put("overturnEvidence", f.overturnEvidence)
+      if (f.provenanceSummary.isNotBlank()) obj.put("provenanceSummary", f.provenanceSummary)
       arr.put(obj)
     }
     return arr.toString()
@@ -129,7 +137,11 @@ object ReviewFindingCodec {
               counterEvidence = decodeAnchors(obj.optJSONArray("counterEvidence")),
               methodologicalJustification = obj.optString("methodologicalJustification", ""),
               recommendedCorrection = obj.optString("recommendedCorrection", ""),
-              verificationNotes = obj.optString("verificationNotes", "")
+              verificationNotes = obj.optString("verificationNotes", ""),
+              reportingStatus = obj.optString("reportingStatus", ""),
+              flawTier = obj.optString("flawTier", ""),
+              overturnEvidence = obj.optString("overturnEvidence", ""),
+              provenanceSummary = obj.optString("provenanceSummary", "")
             )
           )
         }

@@ -22,7 +22,8 @@ import kotlin.math.min
 object DomainStatisticalAuditModules {
 
   fun classifySubDesign(text: String, parentArchetype: StudyDesignArchetype): AuditSubDesign {
-    val l = text.lowercase(Locale.US)
+    val activeBody = SemanticValidityEngine.extractActiveDesignClassificationText(text)
+    val l = activeBody.lowercase(Locale.US)
     val hasMetaPooling = l.contains("meta-analysis") || l.contains("forest plot") || l.contains("random-effects") ||
       l.contains("fixed-effect") || l.contains("dersimonian") || l.contains("tau-squared") || l.contains("τ²") ||
       Regex("""\bi(?:\^2|²|2)\s*[=<>]""").containsMatchIn(l)
@@ -1009,8 +1010,10 @@ object StatisticalAuditOrchestrator {
   fun audit(
     text: String,
     parentArchetype: StudyDesignArchetype,
-    coverageReport: DocumentCoverageReport? = null,
-    extractionConfidence: Int = 5
+    coverageReport: DocumentCoverageReport = DocumentCoverageReport.unknown(
+      reason = "StatisticalAuditOrchestrator.audit() invoked without explicit DocumentCoverageReport."
+    ),
+    extractionConfidence: Int = coverageReport.extractionConfidence
   ): StatisticalAuditReport {
     val ledger = StatisticalClaimParser.parse(text)
     val sanitized = ledger.sanitizedResult ?: SemanticValidityEngine.sanitizePdfExtractionNoise(text)

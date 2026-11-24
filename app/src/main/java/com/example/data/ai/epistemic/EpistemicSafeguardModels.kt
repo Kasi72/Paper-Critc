@@ -1,7 +1,10 @@
 package com.example.data.ai.epistemic
 
 import com.example.data.ai.QuantFindingStatus
+import com.example.data.ai.semantic.MethodologicalAssessmentStatus
 import com.example.data.ai.stats.AuditSubDesign
+import com.example.util.CoverageStatus
+import com.example.util.DossierFormattingEngine
 import java.util.Locale
 
 /**
@@ -53,12 +56,69 @@ enum class ClaimLevel(val level: Int, val displayLabel: String) {
 }
 
 /**
+ * Explicit applicability gate for identity card fields so non-applicable dimensions
+ * (e.g., intervention/comparator in a descriptive systematic review) are never mislabeled
+ * as missing or guessed from venue/affiliation text.
+ */
+enum class FieldApplicability(val displayLabel: String) {
+  APPLICABLE("Applicable"),
+  NOT_APPLICABLE("Not applicable to this study design"),
+  NOT_REPORTED("Not reported"),
+  NOT_ASSESSABLE("Not assessable from supplied material")
+}
+
+/**
+ * Explicit applicability gate for generic methodological checks (e.g. MID / ARR / NNT).
+ */
+enum class CheckApplicability(val displayLabel: String) {
+  APPLICABLE("Applicable"),
+  NOT_APPLICABLE("Not applicable to this review's estimand"),
+  NOT_REPORTED("Not reported"),
+  NOT_ASSESSABLE("Not assessable from supplied material")
+}
+
+/**
+ * Ranked candidate extraction record carrying section provenance and ambiguity state.
+ */
+data class ExtractedField<T>(
+  val value: T?,
+  val applicability: FieldApplicability,
+  val sourceSection: String?,
+  val sourcePage: Int?,
+  val sourceQuote: String?,
+  val confidence: Double,
+  val ambiguousCandidates: List<String> = emptyList()
+)
+
+/**
+ * Design-specific identity schema for Systematic Reviews & Meta-Analyses.
+ * Avoids forcing trial/causal fields (intervention, comparator, ATT/ATE) onto descriptive syntheses.
+ */
+data class ReviewIdentityCard(
+  val designType: String,
+  val synthesisUnit: String,
+  val includedStudyCount: Int?,
+  val includedEstimateCount: Int?,
+  val outcomeMetric: String?,
+  val populationOrSetting: String?,
+  val geographicScope: String?,
+  val timeWindow: String?,
+  val synthesisMethod: String?,
+  val estimand: String?,
+  val interventionOrExposure: String? = null,
+  val comparator: String? = null,
+  val interventionApplicability: FieldApplicability = FieldApplicability.NOT_APPLICABLE,
+  val comparatorApplicability: FieldApplicability = FieldApplicability.NOT_APPLICABLE
+)
+
+/**
  * Safeguard #1: Study Identity Card (forced BEFORE methodological critique).
  */
 data class IdentityField(
   val value: String,
   val status: ReportingStatus,
-  val note: String = ""
+  val note: String = "",
+  val applicability: FieldApplicability = FieldApplicability.APPLICABLE
 )
 
 data class StudyIdentityCard(
@@ -73,7 +133,9 @@ data class StudyIdentityCard(
   val primaryEstimand: IdentityField,
   val primaryAnalysis: IdentityField,
   val sampleSizeAndDenominator: IdentityField,
-  val uncertainFields: List<String>
+  val uncertainFields: List<String>,
+  val reviewIdentityCard: ReviewIdentityCard? = null,
+  val extractedFields: Map<String, ExtractedField<String>> = emptyMap()
 ) {
   val isAmbiguous: Boolean get() = uncertainFields.size >= 4 || studyDesign.status == ReportingStatus.NOT_ASSESSABLE_FROM_SUPPLIED_MATERIAL
 }
@@ -203,7 +265,18 @@ data class PracticalSignificanceAssessment(
   val absoluteAndBaselineRiskStatus: ReportingStatus,
   val tinyButSignificantFlag: Boolean,
   val wideNonSignificantSpunAsNoEffectFlag: Boolean,
-  val clinicalOrPolicyUtilitySummary: String
+  val clinicalOrPolicyUtilitySummary: String,
+  val practicalImportanceStatus: MethodologicalAssessmentStatus = MethodologicalAssessmentStatus.NOT_ASSESSABLE,
+  val requiredContextNote: String = "",
+  val isNormativeOrServiceCapacityReview: Boolean = false,
+  val midApplicability: CheckApplicability = CheckApplicability.APPLICABLE,
+  val baselineRiskApplicability: CheckApplicability = CheckApplicability.APPLICABLE,
+  val arrNntApplicability: CheckApplicability = CheckApplicability.APPLICABLE,
+  val clinicalBenefitRiskApplicability: CheckApplicability = CheckApplicability.APPLICABLE,
+  val predictionIntervalApplicability: CheckApplicability = CheckApplicability.NOT_APPLICABLE,
+  val unitHarmonizationApplicability: CheckApplicability = CheckApplicability.NOT_APPLICABLE,
+  val geographicTransportabilityApplicability: CheckApplicability = CheckApplicability.NOT_APPLICABLE,
+  val needVsUtilizationApplicability: CheckApplicability = CheckApplicability.NOT_APPLICABLE
 )
 
 /**
@@ -276,7 +349,9 @@ data class StopAndAskAssessment(
   val shouldStopAndAsk: Boolean,
   val verdictOverride: String?, // "INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT" when triggered
   val triggers: List<StopAndAskTrigger>,
-  val disclosureBanner: String
+  val disclosureBanner: String,
+  val coverageStatus: CoverageStatus = CoverageStatus.UNKNOWN,
+  val strongConclusionsDisabled: Boolean = false
 )
 
 /**
@@ -312,7 +387,10 @@ data class EpistemicSafeguardReport(
   val practicalSignificanceGate: PracticalSignificanceAssessment,
   val uncertaintyBudget: UncertaintyBudget,
   val overturnConditions: List<OverturnCondition>,
-  val stopAndAsk: StopAndAskAssessment
+  val stopAndAsk: StopAndAskAssessment,
+  val coverageStatus: CoverageStatus = stopAndAsk.coverageStatus,
+  val extractionConfidence: Int = 0,
+  val strongConclusionsDisabled: Boolean = stopAndAsk.strongConclusionsDisabled
 ) {
   val fatalFlawCount: Int
     get() = denominatorLedger.discrepancies.count { it.severityTier == FlawSeverityTier.FATAL_TO_PRIMARY_CONCLUSION } +
@@ -372,11 +450,17 @@ data class EpistemicSafeguardReport(
   }.trim()
 
   fun toAuditMarkdown(): String = buildString {
+    fun humanCode(code: String): String = code
+      .replace('_', ' ')
+      .lowercase(Locale.US)
+      .replaceFirstChar { it.titlecase(Locale.US) }
+
     if (stopAndAsk.shouldStopAndAsk) {
-      appendLine("[STOP-AND-ASK COMPLETENESS GATE — ${stopAndAsk.verdictOverride}]")
-      appendLine(stopAndAsk.disclosureBanner)
+      val overrideLabel = stopAndAsk.verdictOverride?.let(::humanCode) ?: "Insufficient evidence for assessment"
+      appendLine("[STOP-AND-ASK COMPLETENESS GATE — $overrideLabel]")
+      appendLine(DossierFormattingEngine.sanitizeTableCell(stopAndAsk.disclosureBanner))
       stopAndAsk.triggers.forEach { t ->
-        appendLine("• [${t.triggerCode}] ${t.reason} — Required from author/user: ${t.userQuestion}")
+        appendLine("• [${humanCode(t.triggerCode)}] ${DossierFormattingEngine.sanitizeTableCell(t.reason)} — Required from author/user: ${DossierFormattingEngine.sanitizeTableCell(t.userQuestion)}")
       }
       appendLine()
     }
@@ -385,15 +469,20 @@ data class EpistemicSafeguardReport(
     appendLine("| Study Dimension | Extracted Identity | Reporting Status |")
     appendLine("|---|---|---|")
     fun row(name: String, f: IdentityField) {
-      appendLine("| $name | ${f.value.replace("|", "/").take(95)} | ${f.status.displayLabel} |")
+      val valueCell = DossierFormattingEngine.clampCell(DossierFormattingEngine.sanitizeTableCell(f.value), 105)
+      val statusCell = when (f.applicability) {
+        FieldApplicability.NOT_APPLICABLE -> "Not applicable to this study design"
+        else -> f.status.displayLabel
+      }
+      appendLine("| $name | $valueCell | $statusCell |")
     }
     row("Study Design", studyIdentityCard.studyDesign)
     row("Unit of Analysis", studyIdentityCard.unitOfAnalysis)
-    row("Population", studyIdentityCard.population)
+    row("Population / Setting", studyIdentityCard.population)
     row("Exposure / Intervention", studyIdentityCard.exposureOrIntervention)
     row("Comparator", studyIdentityCard.comparator)
-    row("Outcome", studyIdentityCard.outcome)
-    row("Time Horizon", studyIdentityCard.timeHorizon)
+    row("Outcome / Target Metric", studyIdentityCard.outcome)
+    row("Time Horizon / Window", studyIdentityCard.timeHorizon)
     row("Primary Estimand", studyIdentityCard.primaryEstimand)
     row("Primary Analysis", studyIdentityCard.primaryAnalysis)
     row("Sample Size / Denominator", studyIdentityCard.sampleSizeAndDenominator)
@@ -407,33 +496,47 @@ data class EpistemicSafeguardReport(
       appendLine("| Category | Count (N) | Section / Table | Evidence |")
       appendLine("|---|---|---|---|")
       denominatorLedger.entries.take(10).forEach { e ->
-        val loc = listOf(e.section, e.tableFigure).filter { it.isNotBlank() }.joinToString(" / ")
-        appendLine("| ${e.category.label} | ${e.n} | ${loc.replace("|", "/")} | ${e.sourceQuote.replace("|", "/").take(70)} |")
+        val loc = DossierFormattingEngine.sanitizeTableCell(listOf(e.section, e.tableFigure).filter { it.isNotBlank() }.joinToString(" / "))
+        val ev = DossierFormattingEngine.clampCell(DossierFormattingEngine.sanitizeTableCell(e.sourceQuote), 76)
+        appendLine("| ${e.category.label} | ${e.n} | $loc | $ev |")
       }
     }
     denominatorLedger.discrepancies.forEach { d ->
-      appendLine("• [${d.severityTier.displayLabel} • ${d.reportingStatus.displayLabel}] ${d.discrepancyType}: ${d.description} | Minimum evidence to overturn: ${d.overturnEvidence}")
+      appendLine("• [${d.severityTier.displayLabel} • ${d.reportingStatus.displayLabel}] ${humanCode(d.discrepancyType)}: ${DossierFormattingEngine.sanitizeTableCell(d.description)} | Minimum evidence to overturn: ${DossierFormattingEngine.sanitizeTableCell(d.overturnEvidence)}")
     }
 
     appendLine()
     appendLine("[CLAIM HIERARCHY & PRIMARY-ANALYSIS DECLARATION]")
     appendLine("• Claimed Level: ${claimHierarchyAudit.highestClaimedLevel.displayLabel} vs. Design-Supported Maximum: ${claimHierarchyAudit.maxDesignSupportedLevel.displayLabel} (${if (claimHierarchyAudit.isOverclaimed) "OVERCLAIMED — ${claimHierarchyAudit.severityTier.displayLabel}" else "PROPORTIONATE"})")
-    appendLine("• Rationale: ${claimHierarchyAudit.justificationNote}")
-    appendLine("• Primary Analysis Declaration (${primaryAnalysisDeclaration.reportingStatus.displayLabel}): ${primaryAnalysisDeclaration.detail}")
+    appendLine("• Rationale: ${DossierFormattingEngine.sanitizeTableCell(claimHierarchyAudit.justificationNote)}")
+    appendLine("• Primary Analysis Declaration (${primaryAnalysisDeclaration.reportingStatus.displayLabel}): ${DossierFormattingEngine.sanitizeTableCell(primaryAnalysisDeclaration.detail)}")
 
     if (contradictionMap.edges.isNotEmpty()) {
       appendLine()
       appendLine("[CROSS-SECTION CONTRADICTION MAP (${contradictionMap.edges.size} Linkages)]")
       contradictionMap.edges.forEach { e ->
-        appendLine("• [${e.severityTier.displayLabel}] ${e.fromSection} ↔ ${e.toSection} (${e.contradictionType}): ${e.description} | Overturn with: ${e.overturnEvidence}")
+        appendLine("• [${e.severityTier.displayLabel}] ${e.fromSection} ↔ ${e.toSection} (${humanCode(e.contradictionType)}): ${DossierFormattingEngine.sanitizeTableCell(e.description)} | Overturn with: ${DossierFormattingEngine.sanitizeTableCell(e.overturnEvidence)}")
       }
     }
 
     appendLine()
     appendLine("[CLINICAL & PRACTICAL SIGNIFICANCE GATE]")
-    appendLine("• Statistical vs. Practical Magnitude: ${practicalSignificanceGate.clinicalOrPolicyUtilitySummary}")
-    appendLine("• Effect Magnitude: ${practicalSignificanceGate.effectMagnitudeNote} | Precision: ${practicalSignificanceGate.precisionNote}")
-    appendLine("• MID Reporting: ${practicalSignificanceGate.minimalImportantDifferenceStatus.displayLabel} | Absolute/Baseline Risk: ${practicalSignificanceGate.absoluteAndBaselineRiskStatus.displayLabel}")
+    appendLine("• Statistical vs. Practical Magnitude: ${DossierFormattingEngine.sanitizeTableCell(practicalSignificanceGate.clinicalOrPolicyUtilitySummary)}")
+    appendLine("• Effect Magnitude: ${DossierFormattingEngine.sanitizeTableCell(practicalSignificanceGate.effectMagnitudeNote)} | Precision: ${DossierFormattingEngine.sanitizeTableCell(practicalSignificanceGate.precisionNote)}")
+    val midLabel = if (practicalSignificanceGate.midApplicability == CheckApplicability.NOT_APPLICABLE) {
+      practicalSignificanceGate.midApplicability.displayLabel
+    } else {
+      practicalSignificanceGate.minimalImportantDifferenceStatus.displayLabel
+    }
+    val riskLabel = if (practicalSignificanceGate.baselineRiskApplicability == CheckApplicability.NOT_APPLICABLE) {
+      practicalSignificanceGate.baselineRiskApplicability.displayLabel
+    } else {
+      practicalSignificanceGate.absoluteAndBaselineRiskStatus.displayLabel
+    }
+    appendLine("• MID Reporting: $midLabel | Absolute/Baseline Risk: $riskLabel")
+    if (practicalSignificanceGate.isNormativeOrServiceCapacityReview) {
+      appendLine("• Normative / Capacity Review Applicability: Prediction interval (${practicalSignificanceGate.predictionIntervalApplicability.displayLabel}); Unit harmonization (${practicalSignificanceGate.unitHarmonizationApplicability.displayLabel}); Geographic transportability (${practicalSignificanceGate.geographicTransportabilityApplicability.displayLabel}); Need vs. utilization distinction (${practicalSignificanceGate.needVsUtilizationApplicability.displayLabel}).")
+    }
 
     if (conclusionFragility.isNotEmpty()) {
       appendLine()
@@ -442,12 +545,12 @@ data class EpistemicSafeguardReport(
       appendLine("|---|---|---|---|---|---|")
       conclusionFragility.take(6).forEach { f ->
         appendLine(
-          "| ${f.targetFinding.replace("|", "/").take(45)} " +
-            "| ${f.keyAssumption.replace("|", "/").take(48)} " +
-            "| ${f.plausibleViolation.replace("|", "/").take(54)} " +
-            "| ${f.likelyBiasDirection.replace("|", "/").take(40)} " +
-            "| ${f.minimumSensitivityAnalysis.replace("|", "/").take(55)} " +
-            "| ${f.wouldHeadlineSurvive.replace("|", "/").take(38)} |"
+          "| ${DossierFormattingEngine.clampCell(DossierFormattingEngine.sanitizeTableCell(f.targetFinding), 52)} " +
+            "| ${DossierFormattingEngine.clampCell(DossierFormattingEngine.sanitizeTableCell(f.keyAssumption), 52)} " +
+            "| ${DossierFormattingEngine.clampCell(DossierFormattingEngine.sanitizeTableCell(f.plausibleViolation), 58)} " +
+            "| ${DossierFormattingEngine.clampCell(DossierFormattingEngine.sanitizeTableCell(f.likelyBiasDirection), 44)} " +
+            "| ${DossierFormattingEngine.clampCell(DossierFormattingEngine.sanitizeTableCell(f.minimumSensitivityAnalysis), 60)} " +
+            "| ${DossierFormattingEngine.clampCell(DossierFormattingEngine.sanitizeTableCell(f.wouldHeadlineSurvive), 42)} |"
         )
       }
     }
@@ -458,24 +561,24 @@ data class EpistemicSafeguardReport(
       val elevated = alternativeExplanations.filter { it.plausibility in setOf("HIGH", "MODERATE") }
       val summaryList = if (elevated.isNotEmpty()) elevated else alternativeExplanations.take(5)
       summaryList.take(7).forEach { alt ->
-        appendLine("• [${alt.plausibility} • ${alt.reportingStatus.displayLabel}] ${alt.mechanism}: ${alt.rationale}")
+        appendLine("• [${alt.plausibility} • ${alt.reportingStatus.displayLabel}] ${alt.mechanism}: ${DossierFormattingEngine.sanitizeTableCell(alt.rationale)}")
       }
     }
 
     appendLine()
     appendLine("[EXPLICIT UNCERTAINTY BUDGET (Scientific vs. Extraction Separation)]")
-    appendLine("• Scientific Uncertainty: ${uncertaintyBudget.scientificUncertaintyLevel} | Extraction Uncertainty: ${uncertaintyBudget.extractionUncertaintyLevel} — ${uncertaintyBudget.separationNote}")
+    appendLine("• Scientific Uncertainty: ${uncertaintyBudget.scientificUncertaintyLevel} | Extraction Uncertainty: ${uncertaintyBudget.extractionUncertaintyLevel} — ${DossierFormattingEngine.sanitizeTableCell(uncertaintyBudget.separationNote)}")
     appendLine("| Uncertainty Source | Level | Reporting Status | Assessment |")
     appendLine("|---|---|---|---|")
     uncertaintyBudget.items.forEach { u ->
-      appendLine("| ${u.source.displayLabel} | ${u.level} | ${u.reportingStatus.displayLabel} | ${u.note.replace("|", "/").take(110)} |")
+      appendLine("| ${u.source.displayLabel} | ${u.level} | ${u.reportingStatus.displayLabel} | ${DossierFormattingEngine.clampCell(DossierFormattingEngine.sanitizeTableCell(u.note), 120)} |")
     }
 
     if (overturnConditions.isNotEmpty()) {
       appendLine()
       appendLine("[MINIMUM EVIDENCE TO OVERTURN MAJOR CRITIQUES]")
       overturnConditions.take(8).forEach { o ->
-        appendLine("• [${o.severityTier.displayLabel}] ${o.critiqueTitle} -> Overturned by (${o.evidenceCategory}): ${o.minimumEvidenceToOverturn}")
+        appendLine("• [${o.severityTier.displayLabel}] ${DossierFormattingEngine.sanitizeTableCell(o.critiqueTitle)} -> Overturned by (${humanCode(o.evidenceCategory)}): ${DossierFormattingEngine.sanitizeTableCell(o.minimumEvidenceToOverturn)}")
       }
     }
   }.trim()

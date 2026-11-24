@@ -1227,8 +1227,8 @@ fun IosSettingsScreen(
             IosSettingToggleRow(
               icon = Icons.Default.Policy,
               iconTint = CupertinoAmber,
-              title = "Confidential Local-Only Mode",
-              subtitle = "Keep unpublished manuscripts strictly in on-device Room storage (no Firestore upload, excluded from Android cloud backups)",
+              title = "Local-Only Report Storage",
+              subtitle = "Store saved reports strictly on this device (no Firestore upload or cloud backup). AI analysis still sends manuscript text to your selected AI provider.",
               checked = settingsState.confidentialLocalOnly,
               onCheckedChange = { enabled ->
                 onUpdateSettings {
@@ -1322,8 +1322,8 @@ private fun ReviewerCalibrationInstrumentCard() {
   val palette = LocalNeumorphicPalette.current
 
   IosGroupedCard(
-    header = "Reviewer Calibration Mode (Diagnostic Instrument)",
-    footer = "Evaluates deterministic statistical & epistemic safeguards against 5 expert-curated reference papers (Known Flawed, Known Robust, Causal Overclaim, ML Leakage, and Stop-and-Ask)."
+    header = "Embedded Regression Suite (Not External Calibration)",
+    footer = "Internal diagnostic verification against embedded unit & adversarial fixtures. Tracks explicit positive/negative labels, Wilson 95% CIs, strict quote anchors, and 10-perturbation noise stability (external blinded corpus pending)."
   ) {
     Row(
       verticalAlignment = Alignment.CenterVertically,
@@ -1337,12 +1337,12 @@ private fun ReviewerCalibrationInstrumentCard() {
       )
       Column(modifier = Modifier.weight(1f)) {
         Text(
-          text = "Epistemic & Statistical Benchmark Suite",
+          text = "Embedded Epistemic & Statistical Regression Suite",
           style = MaterialTheme.typography.bodyMedium,
           fontWeight = FontWeight.Bold
         )
         Text(
-          text = "Tracks Precision, Recall, False Positives, False Negatives, Severity Calibration, and Verdict Match.",
+          text = "Explicit label matrix, strict quote-anchor checks, 10-perturbation noise suite, and Wilson 95% CIs.",
           style = MaterialTheme.typography.labelSmall,
           color = MaterialTheme.colorScheme.onSurfaceVariant
         )
@@ -1352,7 +1352,7 @@ private fun ReviewerCalibrationInstrumentCard() {
     Spacer(modifier = Modifier.height(10.dp))
 
     IosSquircleButton(
-      text = if (isRunning) "Running 5 Benchmarks..." else if (report == null) "Run Calibration Benchmark" else "Re-Run Calibration Suite",
+      text = if (isRunning) "Running Regression Suite..." else if (report == null) "Run Embedded Regression Suite" else "Re-Run Regression Suite",
       onClick = {
         if (!isRunning) {
           isRunning = true
@@ -1381,6 +1381,13 @@ private fun ReviewerCalibrationInstrumentCard() {
           .testTag("calibration_results_panel"),
         verticalArrangement = Arrangement.spacedBy(8.dp)
       ) {
+        Text(
+          text = summary.honestCalibrationNotice,
+          style = MaterialTheme.typography.labelSmall,
+          fontWeight = FontWeight.SemiBold,
+          color = if (summary.allEmbeddedFixturesPassed) CupertinoGreen else CupertinoAmber,
+          modifier = Modifier.testTag("calibration_honest_notice")
+        )
         Row(
           modifier = Modifier.fillMaxWidth(),
           horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -1398,26 +1405,9 @@ private fun ReviewerCalibrationInstrumentCard() {
             modifier = Modifier.weight(1f)
           )
           CalibrationMetricTile(
-            label = "FP / FN",
-            value = "${summary.totalFalsePositives} / ${summary.totalFalseNegatives}",
-            tint = if (summary.totalFalsePositives == 0 && summary.totalFalseNegatives == 0) CupertinoGreen else CupertinoRed,
-            modifier = Modifier.weight(1f)
-          )
-        }
-        Row(
-          modifier = Modifier.fillMaxWidth(),
-          horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-          CalibrationMetricTile(
-            label = "SEVERITY CAL.",
-            value = "${(summary.severityCalibrationRate * 100).toInt()}%",
-            tint = if (summary.severityCalibrationRate >= 0.99) CupertinoBlue else CupertinoAmber,
-            modifier = Modifier.weight(1f)
-          )
-          CalibrationMetricTile(
-            label = "VERDICT MATCH",
-            value = "${(summary.verdictAgreementRate * 100).toInt()}%",
-            tint = if (summary.verdictAgreementRate >= 0.99) CupertinoGreen else CupertinoAmber,
+            label = "FPR (${summary.explicitNegativeLabelCount} NEG)",
+            value = "${summary.totalFalsePositives}/${summary.explicitNegativeLabelCount}",
+            tint = if (summary.totalFalsePositives == 0) CupertinoGreen else CupertinoRed,
             modifier = Modifier.weight(1f)
           )
         }
@@ -1432,18 +1422,48 @@ private fun ReviewerCalibrationInstrumentCard() {
             modifier = Modifier.weight(1f)
           )
           CalibrationMetricTile(
-            label = "ANCHOR ACC.",
+            label = "STRICT ANCHOR",
             value = "${(summary.evidenceAnchorAccuracy * 100).toInt()}%",
             tint = if (summary.evidenceAnchorAccuracy >= 0.99) CupertinoBlue else CupertinoAmber,
             modifier = Modifier.weight(1f)
           )
           CalibrationMetricTile(
-            label = "NOISE STABLE",
+            label = "VERDICT MATCH",
+            value = "${(summary.verdictAgreementRate * 100).toInt()}%",
+            tint = if (summary.verdictAgreementRate >= 0.99) CupertinoGreen else CupertinoAmber,
+            modifier = Modifier.weight(1f)
+          )
+        }
+        Row(
+          modifier = Modifier.fillMaxWidth(),
+          horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+          CalibrationMetricTile(
+            label = "SCORE STABLE",
             value = "${(summary.scoreStabilityUnderNoiseRate * 100).toInt()}%",
             tint = if (summary.scoreStabilityUnderNoiseRate >= 0.99) CupertinoGreen else CupertinoAmber,
             modifier = Modifier.weight(1f)
           )
+          CalibrationMetricTile(
+            label = "FINDING STABLE",
+            value = "${(summary.findingStabilityUnderNoiseRate * 100).toInt()}%",
+            tint = if (summary.findingStabilityUnderNoiseRate >= 0.99) CupertinoGreen else CupertinoAmber,
+            modifier = Modifier.weight(1f)
+          )
+          CalibrationMetricTile(
+            label = "OCR 0-FALSE-VER",
+            value = "${(summary.ocrZeroFalseVerifiedRate * 100).toInt()}%",
+            tint = if (summary.ocrZeroFalseVerifiedRate >= 0.99) CupertinoBlue else CupertinoRed,
+            modifier = Modifier.weight(1f)
+          )
         }
+        Text(
+          text = "Wilson 95% CIs — Precision: ${summary.precisionCi.formatPercentWithCi()} • Recall: ${summary.recallCi.formatPercentWithCi()} • FPR: ${summary.fprCi.formatPercentWithCi()}",
+          style = MaterialTheme.typography.labelSmall,
+          fontFamily = JetBrainsMonoFamily,
+          fontSize = 9.5.sp,
+          color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
 
         summary.caseResults.forEach { caseRes ->
           val passed = caseRes.falsePositives == 0 &&

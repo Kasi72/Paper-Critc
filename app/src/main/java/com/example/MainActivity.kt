@@ -629,26 +629,32 @@ private fun IosTopHeaderBar(
           )
         }
 
-        // Tactile Circular Light / Dark Theme Medallion
+        // Tactile Circular Light / Dark Theme Medallion (48dp accessible touch target)
         val themeBtnShape = SquircleShape(cornerRadius = 19.dp, smoothing = 0.86f)
         IconButton(
           onClick = onToggleTheme,
           modifier = Modifier
-            .size(38.dp)
-            .neuRaised(
-              cornerRadius = 19.dp,
-              elevation = 4.5.dp,
-              surfaceColor = palette.surfaceRaised
-            )
-            .clip(themeBtnShape)
+            .size(48.dp)
             .testTag("top_bar_theme_toggle")
         ) {
-          Icon(
-            imageVector = if (isDarkActive) Icons.Default.LightMode else Icons.Default.DarkMode,
-            contentDescription = if (isDarkActive) "Switch to Light Mode" else "Switch to Dark Mode",
-            tint = if (isDarkActive) AmberGold400 else MaterialTheme.colorScheme.primary,
-            modifier = Modifier.size(17.dp)
-          )
+          Box(
+            modifier = Modifier
+              .size(38.dp)
+              .neuRaised(
+                cornerRadius = 19.dp,
+                elevation = 4.5.dp,
+                surfaceColor = palette.surfaceRaised
+              )
+              .clip(themeBtnShape),
+            contentAlignment = Alignment.Center
+          ) {
+            Icon(
+              imageVector = if (isDarkActive) Icons.Default.LightMode else Icons.Default.DarkMode,
+              contentDescription = if (isDarkActive) "Switch to Light Mode" else "Switch to Dark Mode",
+              tint = if (isDarkActive) AmberGold400 else MaterialTheme.colorScheme.primary,
+              modifier = Modifier.size(17.dp)
+            )
+          }
         }
       }
     }
@@ -782,14 +788,14 @@ private fun GlobalLivePipelineBanner(
           IconButton(
             onClick = onCancel,
             modifier = Modifier
-              .size(28.dp)
+              .size(48.dp)
               .testTag("global_pipeline_cancel_button")
           ) {
             Icon(
               imageVector = Icons.Default.Close,
               contentDescription = "Cancel running review",
               tint = MaterialTheme.colorScheme.onSurfaceVariant,
-              modifier = Modifier.size(15.dp)
+              modifier = Modifier.size(16.dp)
             )
           }
         }

@@ -66,46 +66,62 @@ class ReviewRepository(private val db: FirebaseFirestore) {
     )
   }
 
-  suspend fun getUserReviews(): Result<List<PaperReview>> = runCatching {
-    val uid = requireUserId()
+  suspend fun getUserReviews(): Result<List<PaperReview>> {
+    val uid = try {
+      requireUserId()
+    } catch (e: Exception) {
+      return Result.failure(e)
+    }
     val path = "users/$uid/reviews"
-    try {
+    return try {
       val snapshot = db.collection("users")
         .document(uid)
         .collection("reviews")
         .whereEqualTo("userId", uid)
         .get()
         .await()
-      snapshot.toObjects(
-        PaperReview::class.java,
-        DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
-      ).sortedByDescending { it.createdAt ?: Timestamp(0, 0) }
+      Result.success(
+        snapshot.toObjects(
+          PaperReview::class.java,
+          DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
+        ).sortedByDescending { it.createdAt ?: Timestamp(0, 0) }
+      )
     } catch (e: CancellationException) {
       throw e
     } catch (e: Exception) {
       handleFirestoreError(e, OperationType.LIST, path)
-      throw e
+      Result.failure(e)
     }
   }
 
-  suspend fun getReviewById(reviewId: String, ownerUserId: String = requireUserId()): Result<PaperReview> = runCatching {
-    val docRef = db.collection("users").document(ownerUserId).collection("reviews").document(reviewId)
-    try {
+  suspend fun getReviewById(reviewId: String, ownerUserId: String? = null): Result<PaperReview> {
+    val resolvedOwner = try {
+      ownerUserId?.takeIf { it.isNotBlank() } ?: requireUserId()
+    } catch (e: Exception) {
+      return Result.failure(e)
+    }
+    val docRef = db.collection("users").document(resolvedOwner).collection("reviews").document(reviewId)
+    return try {
       val snapshot = docRef.get().await()
-      snapshot.toObject(
+      val review = snapshot.toObject(
         PaperReview::class.java,
         DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
       ) ?: throw IllegalStateException("Review document $reviewId not found")
+      Result.success(review)
     } catch (e: CancellationException) {
       throw e
     } catch (e: Exception) {
       handleFirestoreError(e, OperationType.GET, docRef.path)
-      throw e
+      Result.failure(e)
     }
   }
 
-  suspend fun createReview(review: PaperReview): Result<String> = runCatching {
-    val uid = requireUserId()
+  suspend fun createReview(review: PaperReview): Result<String> {
+    val uid = try {
+      requireUserId()
+    } catch (e: Exception) {
+      return Result.failure(e)
+    }
     val docRef = db.collection("users").document(uid).collection("reviews").document()
     // Never include "id" in raw Map payload when @DocumentId is on PaperReview
     val payload = buildFirestorePayload(
@@ -114,21 +130,28 @@ class ReviewRepository(private val db: FirebaseFirestore) {
       createdAtValue = FieldValue.serverTimestamp(),
       updatedAtValue = FieldValue.serverTimestamp()
     )
-    try {
+    return try {
       docRef.set(payload).await()
-      docRef.id
+      Result.success(docRef.id)
     } catch (e: CancellationException) {
       throw e
     } catch (e: Exception) {
       handleFirestoreError(e, OperationType.CREATE, docRef.path)
-      throw e
+      Result.failure(e)
     }
   }
 
-  suspend fun updateReview(review: PaperReview): Result<Unit> = runCatching {
-    val uid = requireUserId()
-    require(review.id.isNotBlank()) { "Review ID must not be blank for update" }
-    val existingCreatedAt = requireNotNull(review.createdAt) { "Review createdAt must not be null for update" }
+  suspend fun updateReview(review: PaperReview): Result<Unit> {
+    val uid = try {
+      requireUserId()
+    } catch (e: Exception) {
+      return Result.failure(e)
+    }
+    if (review.id.isBlank()) {
+      return Result.failure(IllegalArgumentException("Review ID must not be blank for update"))
+    }
+    val existingCreatedAt = review.createdAt
+      ?: return Result.failure(IllegalArgumentException("Review createdAt must not be null for update"))
     val docRef = db.collection("users").document(uid).collection("reviews").document(review.id)
     val payload = buildFirestorePayload(
       review = review,
@@ -136,46 +159,55 @@ class ReviewRepository(private val db: FirebaseFirestore) {
       createdAtValue = existingCreatedAt,
       updatedAtValue = FieldValue.serverTimestamp()
     )
-    try {
+    return try {
       docRef.set(payload).await()
+      Result.success(Unit)
     } catch (e: CancellationException) {
       throw e
     } catch (e: Exception) {
       handleFirestoreError(e, OperationType.UPDATE, docRef.path)
-      throw e
+      Result.failure(e)
     }
   }
 
-  suspend fun deleteReview(reviewId: String): Result<Unit> = runCatching {
-    val uid = requireUserId()
-    require(reviewId.isNotBlank()) { "Review ID must not be blank for delete" }
+  suspend fun deleteReview(reviewId: String): Result<Unit> {
+    val uid = try {
+      requireUserId()
+    } catch (e: Exception) {
+      return Result.failure(e)
+    }
+    if (reviewId.isBlank()) {
+      return Result.failure(IllegalArgumentException("Review ID must not be blank for delete"))
+    }
     val docRef = db.collection("users").document(uid).collection("reviews").document(reviewId)
-    try {
+    return try {
       docRef.delete().await()
+      Result.success(Unit)
     } catch (e: CancellationException) {
       throw e
     } catch (e: Exception) {
       handleFirestoreError(e, OperationType.DELETE, docRef.path)
-      throw e
+      Result.failure(e)
     }
   }
 
   companion object {
     private val POST_PUB_VERDICTS = setOf(
       "HIGH_CREDIBILITY", "SOUND_WITH_CAVEATS", "REQUIRES_CORRECTION", "MAJOR_CONCERNS", "LOW_CREDIBILITY",
-      "INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT"
+      "INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT", "PROVISIONAL_APPRAISAL_DESIGN_UNCERTAIN"
     )
     private val JOURNAL_VERDICTS = setOf(
-      "ACCEPT", "MINOR_REVISION", "MAJOR_REVISION", "REJECT_AND_RESUBMIT", "REJECT",
-      "INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT"
+      "ACCEPT", "MINOR_REVISION", "MINOR_REVISION_WITH_CAVEATS", "MAJOR_REVISION", "REJECT_AND_RESUBMIT", "REJECT",
+      "INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT", "PROVISIONAL_APPRAISAL_DESIGN_UNCERTAIN"
     )
     private val CLINICAL_VERDICTS = setOf(
       "HIGH_CERTAINTY", "MODERATE_CERTAINTY", "LOW_CERTAINTY", "VERY_LOW_CERTAINTY",
-      "INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT"
+      "INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT", "PROVISIONAL_APPRAISAL_DESIGN_UNCERTAIN"
     )
 
     private val ALLOWED_VALIDATION_STATUSES = setOf(
-      "VERIFIED", "ADJUDICATED_WITH_CAVEATS", "PARTIALLY_VALIDATED", "UNVERIFIED"
+      "VERIFIED", "ADJUDICATED_WITH_CAVEATS", "PARTIALLY_VALIDATED", "PROVISIONAL",
+      "UNVERIFIED", "LEGACY_UNVALIDATED", "REQUIRES_REANALYSIS"
     )
 
     internal fun allowedVerdictsForMode(mode: ReviewMode): Set<String> = when (mode) {
@@ -192,6 +224,12 @@ class ReviewRepository(private val db: FirebaseFirestore) {
     internal fun normalizeVerdict(raw: String, mode: ReviewMode = ReviewMode.POST_PUBLICATION_APPRAISAL): String {
       val upper = raw.trim().uppercase(Locale.US).replace(' ', '_').replace('-', '_')
       if (upper in allowedVerdictsForMode(mode)) return upper
+      if (upper.contains("PROVISIONAL") && upper.contains("UNCERTAIN")) {
+        return "PROVISIONAL_APPRAISAL_DESIGN_UNCERTAIN"
+      }
+      if (upper.contains("INSUFFICIENT_EVIDENCE")) {
+        return "INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT"
+      }
       return when (mode) {
         ReviewMode.POST_PUBLICATION_APPRAISAL -> when {
           upper.contains("VERY_LOW") || upper == "REJECT" || upper.contains("LOW_CRED") -> "LOW_CREDIBILITY"
@@ -210,6 +248,7 @@ class ReviewRepository(private val db: FirebaseFirestore) {
           upper.contains("VERY_LOW") || upper.contains("LOW_CRED") || upper == "REJECT" -> "REJECT"
           upper.contains("RESUBMIT") || upper.contains("MAJOR_CONCERN") -> "REJECT_AND_RESUBMIT"
           upper.contains("CORRECTION") || upper.contains("LOW_CERT") || upper.contains("MAJOR") -> "MAJOR_REVISION"
+          upper.contains("MINOR") && upper.contains("CAVEAT") -> "MINOR_REVISION_WITH_CAVEATS"
           upper.contains("HIGH") || upper == "ACCEPT" -> "ACCEPT"
           else -> "MINOR_REVISION"
         }

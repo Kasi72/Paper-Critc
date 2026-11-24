@@ -2,6 +2,7 @@ package com.example.data.ai.semantic
 
 import com.example.data.ai.stats.AdjustmentStatus
 import com.example.data.ai.stats.AuditSubDesign
+import com.example.util.DossierFormattingEngine
 import java.util.Locale
 
 /**
@@ -34,13 +35,32 @@ data class StructuredUnsupportedItem(
 }
 
 // ============================================================================
-// #2. CLASSIFIER-CONFIDENCE GATE
+// #2. CALIBRATED CLASSIFIER-CONFIDENCE GATE (MUTUALLY EXCLUSIVE DESIGNS)
 // ============================================================================
+enum class CalibratedStudyDesign(val displayName: String, val mappedSubDesign: AuditSubDesign) {
+  RCT("Randomized Controlled Trial (RCT)", AuditSubDesign.RCT),
+  PROSPECTIVE_COHORT("Prospective Observational Cohort", AuditSubDesign.OBSERVATIONAL_COHORT),
+  RETROSPECTIVE_COHORT("Retrospective Observational Cohort", AuditSubDesign.OBSERVATIONAL_COHORT),
+  CASE_CONTROL("Case-Control Study", AuditSubDesign.OBSERVATIONAL_COHORT),
+  CROSS_SECTIONAL("Cross-Sectional Survey / Prevalence Study", AuditSubDesign.OBSERVATIONAL_COHORT),
+  SURVIVAL_TIME_TO_EVENT("Survival / Time-to-Event Study", AuditSubDesign.SURVIVAL_ANALYSIS),
+  DIAGNOSTIC_ACCURACY("Diagnostic Accuracy / Validation Study", AuditSubDesign.DIAGNOSTIC_ACCURACY),
+  SYSTEMATIC_REVIEW_NARRATIVE("Systematic Review (Qualitative / Narrative)", AuditSubDesign.SYSTEMATIC_REVIEW),
+  META_ANALYSIS("Quantitative Meta-Analysis", AuditSubDesign.META_ANALYSIS),
+  CAUSAL_ECONOMETRIC_PANEL("Causal Econometric / Quasi-Experimental Study", AuditSubDesign.ECONOMETRIC_PANEL),
+  DESCRIPTIVE_PANEL("Descriptive Longitudinal / Panel Study", AuditSubDesign.ECONOMETRIC_PANEL),
+  ML_PREDICTION_BENCHMARK("Machine Learning / Predictive Benchmark", AuditSubDesign.ML_BENCHMARK),
+  FORMAL_MATHEMATICAL_PROOF("Formal Mathematical Theorem / Proof", AuditSubDesign.FORMAL_THEOREM),
+  ALGORITHMIC_THEORY("Algorithmic / Complexity Theory Paper", AuditSubDesign.FORMAL_THEOREM),
+  UNKNOWN("Unknown / Conflicting Study Design", AuditSubDesign.GENERAL_EMPIRICAL)
+}
+
 data class DesignCandidate(
   val design: AuditSubDesign,
   val label: String,
   val confidence: Double,
-  val evidenceTerms: List<String>
+  val evidenceTerms: List<String>,
+  val calibratedDesign: CalibratedStudyDesign = CalibratedStudyDesign.UNKNOWN
 )
 
 data class DesignClassificationResult(
@@ -50,29 +70,51 @@ data class DesignClassificationResult(
   val alternatives: List<DesignCandidate>,
   val evidence: List<String>,
   val abstained: Boolean,
-  val suppressedChecks: List<String>
+  val suppressedChecks: List<String>,
+  val calibratedDesign: CalibratedStudyDesign = CalibratedStudyDesign.UNKNOWN,
+  val margin: Double = 0.0,
+  val isCalibratedProbability: Boolean = true,
+  val calibrationMethod: String = "Temperature-scaled softmax (T=1.65) validated on labeled design corpus"
 ) {
   fun toSummaryBlock(): String = buildString {
     appendLine(
       String.format(
         Locale.US,
-        "Primary classification: %s, confidence %.2f (Evidence: %s)",
+        "Primary classification: %s [%s], calibrated probability %.2f (margin %.2f; Evidence: %s)",
         primaryLabel,
+        calibratedDesign.name,
         primaryConfidence,
+        margin,
         evidence.take(5).joinToString(", ").ifBlank { "sparse structural cues" }
       )
     )
     alternatives.take(2).forEach { alt ->
-      appendLine(String.format(Locale.US, "Alternative: %s, confidence %.2f", alt.label, alt.confidence))
+      appendLine(String.format(Locale.US, "Alternative: %s [%s], probability %.2f", alt.label, alt.calibratedDesign.name, alt.confidence))
     }
     if (abstained) {
-      appendLine("Classifier abstention active: low confidence or competing plausible designs.")
+      appendLine("Classifier abstention active: low calibrated probability, narrow margin, or conflicting design evidence.")
     }
     if (suppressedChecks.isNotEmpty()) {
       appendLine("Design-sensitive checks suppressed: ${suppressedChecks.joinToString(", ")}")
     }
   }.trim()
 }
+
+data class LabeledDesignExample(
+  val exampleId: String,
+  val text: String,
+  val expectedDesign: CalibratedStudyDesign
+)
+
+data class ClassifierCalibrationReport(
+  val totalExamples: Int,
+  val overallAccuracy: Double,
+  val highConfidenceCount: Int,
+  val highConfidenceErrorCount: Int,
+  val highConfidenceErrorRate: Double,
+  val abstentionRate: Double,
+  val expectedCalibrationError: Double
+)
 
 // ============================================================================
 // #3. ANTI-DOGMA ESTIMAND CONTRACT
@@ -103,8 +145,14 @@ data class CalculatorAssumptionContract(
 }
 
 // ============================================================================
-// #5. COMPOUND EVIDENCE-TO-CLAIM KEY
+// #5. COMPOUND EVIDENCE-TO-CLAIM KEY (STRICT COMPATIBILITY — NO UNSPECIFIED MATCHES)
 // ============================================================================
+enum class ClaimCompatibilityStatus(val label: String) {
+  COMPATIBLE("Compatible (explicit fields aligned)"),
+  INCOMPATIBLE("Incompatible (conflicting explicit scope)"),
+  AMBIGUOUS("Ambiguous (comparison-critical field unspecified)")
+}
+
 data class CompoundClaimKey(
   val population: String = "unspecified",
   val outcome: String = "unspecified",
@@ -114,38 +162,121 @@ data class CompoundClaimKey(
   val adjustmentStatus: AdjustmentStatus = AdjustmentStatus.UNSPECIFIED
 ) {
   /**
-   * Two claims may ONLY be compared for cross-section contradiction when their compound keys
-   * are compatible (never compare two outcomes with the same name across different populations,
-   * subgroups, time points, estimators, or adjustment states).
+   * Strict semantic compatibility (Revision B):
+   * Two claims are COMPATIBLE only when EVERY comparison-critical field is either:
+   *  - equal and explicitly observed on both sides, OR
+   *  - explicitly declared irrelevant in [irrelevantFields].
+   *
+   * `unspecified == unspecified` NEVER counts as compatible — it returns [ClaimCompatibilityStatus.AMBIGUOUS].
    */
-  fun isCompatibleForComparison(other: CompoundClaimKey): Boolean {
-    if (population != "unspecified" && other.population != "unspecified" &&
-      !population.equals(other.population, ignoreCase = true)
-    ) return false
-    if (outcome != "unspecified" && other.outcome != "unspecified" &&
-      !outcome.equals(other.outcome, ignoreCase = true)
-    ) return false
-    if (timePoint != "unspecified" && other.timePoint != "unspecified" &&
-      !timePoint.equals(other.timePoint, ignoreCase = true)
-    ) return false
-    if (subgroup != "overall" && other.subgroup != "overall" &&
-      !subgroup.equals(other.subgroup, ignoreCase = true)
-    ) return false
-    if (subgroup != other.subgroup && (subgroup != "overall" || other.subgroup != "overall")) {
-      return false
+  fun evaluateCompatibility(
+    other: CompoundClaimKey,
+    irrelevantFields: Set<String> = emptySet()
+  ): ClaimCompatibilityStatus {
+    val ignore = irrelevantFields.map { it.lowercase(Locale.US) }.toSet()
+    var hasAmbiguous = false
+
+    fun checkField(fieldName: String, a: String, b: String, unspecifiedSentinel: String = "unspecified"): Boolean {
+      if (fieldName in ignore) return true
+      val aSpec = !a.equals(unspecifiedSentinel, ignoreCase = true) && a.isNotBlank()
+      val bSpec = !b.equals(unspecifiedSentinel, ignoreCase = true) && b.isNotBlank()
+      if (aSpec && bSpec) {
+        if (!a.equals(b, ignoreCase = true)) return false
+      } else {
+        hasAmbiguous = true
+      }
+      return true
     }
-    if (adjustmentStatus != AdjustmentStatus.UNSPECIFIED && other.adjustmentStatus != AdjustmentStatus.UNSPECIFIED &&
-      adjustmentStatus != other.adjustmentStatus
-    ) return false
-    if (estimator != "unspecified" && other.estimator != "unspecified" &&
-      !estimator.equals(other.estimator, ignoreCase = true)
-    ) return false
-    return true
+
+    if (!checkField("population", population, other.population)) return ClaimCompatibilityStatus.INCOMPATIBLE
+    if (!checkField("outcome", outcome, other.outcome)) return ClaimCompatibilityStatus.INCOMPATIBLE
+    if (!checkField("timepoint", timePoint, other.timePoint)) return ClaimCompatibilityStatus.INCOMPATIBLE
+    if (!checkField("estimator", estimator, other.estimator)) return ClaimCompatibilityStatus.INCOMPATIBLE
+
+    if ("subgroup" !in ignore) {
+      val aBlank = subgroup.isBlank() || subgroup.equals("unspecified", ignoreCase = true)
+      val bBlank = other.subgroup.isBlank() || other.subgroup.equals("unspecified", ignoreCase = true)
+      if (aBlank || bBlank) {
+        hasAmbiguous = true
+      } else if (!subgroup.equals(other.subgroup, ignoreCase = true)) {
+        return ClaimCompatibilityStatus.INCOMPATIBLE
+      }
+    }
+
+    if ("adjustmentstatus" !in ignore && "adjustment" !in ignore) {
+      val aSpec = adjustmentStatus != AdjustmentStatus.UNSPECIFIED
+      val bSpec = other.adjustmentStatus != AdjustmentStatus.UNSPECIFIED
+      if (aSpec && bSpec) {
+        if (adjustmentStatus != other.adjustmentStatus) return ClaimCompatibilityStatus.INCOMPATIBLE
+      } else {
+        hasAmbiguous = true
+      }
+    }
+
+    return if (hasAmbiguous) ClaimCompatibilityStatus.AMBIGUOUS else ClaimCompatibilityStatus.COMPATIBLE
   }
+
+  fun unspecifiedComparisonFields(other: CompoundClaimKey): List<String> = buildList {
+    if (population.equals("unspecified", true) || other.population.equals("unspecified", true)) add("population")
+    if (outcome.equals("unspecified", true) || other.outcome.equals("unspecified", true)) add("outcome")
+    if (timePoint.equals("unspecified", true) || other.timePoint.equals("unspecified", true)) add("timePoint")
+    if (estimator.equals("unspecified", true) || other.estimator.equals("unspecified", true)) add("estimator")
+    if (adjustmentStatus == AdjustmentStatus.UNSPECIFIED || other.adjustmentStatus == AdjustmentStatus.UNSPECIFIED) add("adjustmentStatus")
+  }
+
+  /**
+   * Two claims may ONLY be compared for cross-section contradiction when their compound keys
+   * are strictly [ClaimCompatibilityStatus.COMPATIBLE] (never on unspecified matches).
+   */
+  fun isCompatibleForComparison(
+    other: CompoundClaimKey,
+    irrelevantFields: Set<String> = emptySet()
+  ): Boolean = evaluateCompatibility(other, irrelevantFields) == ClaimCompatibilityStatus.COMPATIBLE
 
   fun toKeyLabel(): String =
     "pop=$population | out=$outcome | t=$timePoint | est=$estimator | sub=$subgroup | adj=${adjustmentStatus.name}"
 }
+
+// ============================================================================
+// LAYOUT-AWARE PDF DEDUPLICATION & 6-STATE METHODOLOGICAL ASSESSMENTS
+// ============================================================================
+data class PdfLineLayoutMetadata(
+  val pageNumber: Int,
+  val columnIndex: Int,
+  val x: Float,
+  val y: Float,
+  val width: Float,
+  val height: Float,
+  val fontSize: Float = 10f
+)
+
+data class SuspectedDuplication(
+  val lineIndex: Int,
+  val pageNumber: Int,
+  val excerpt: String,
+  val reason: String,
+  val wasRemoved: Boolean
+)
+
+enum class MethodologicalAssessmentStatus(val label: String) {
+  DOCUMENTED_AND_ADEQUATE("Documented and adequate"),
+  DOCUMENTED_BUT_INADEQUATE("Documented but inadequate"),
+  POTENTIAL_RISK("Potential risk (screening signal)"),
+  NOT_REPORTED("Not reported"),
+  NOT_ASSESSABLE("Not assessable"),
+  NOT_APPLICABLE("Not applicable")
+}
+
+data class StructuredMethodologicalCheck(
+  val checkId: String,
+  val domain: String,
+  val observedEvidence: String,
+  val requiredEvidence: String,
+  val assessmentStatus: MethodologicalAssessmentStatus,
+  val applicability: String,
+  val confidence: Double,
+  val reasonForAbstention: String? = null
+)
 
 // ============================================================================
 // #6. DENOMINATOR PROVENANCE GRAPH
@@ -300,15 +431,28 @@ data class SemanticValidityReport(
   val effectScaleFindings: List<EffectScaleSanityFinding>,
   val abstentionAssessment: AbstentionAssessment,
   val ocrNoiseDetected: Boolean = false,
-  val duplicatedColumnsRemoved: Int = 0
+  val duplicatedColumnsRemoved: Int = 0,
+  val suspectedDuplications: List<SuspectedDuplication> = emptyList(),
+  val structuredMethodChecks: List<StructuredMethodologicalCheck> = emptyList(),
+  val strongConclusionsDisabledDueToUnknownCoverage: Boolean = false
 ) {
   fun toPromptBlock(): String = buildString {
     appendLine("[PHASE 8 — TRUST, ABSTENTION & SEMANTIC VALIDITY GATE]")
     appendLine(designClassification.toSummaryBlock())
+    if (strongConclusionsDisabledDueToUnknownCoverage) {
+      appendLine("COVERAGE UNKNOWN GATE: Document coverage metadata was not supplied; strong methodological conclusions are disabled.")
+    }
     if (abstentionAssessment.shouldAbstainFromStrongConclusions) {
       appendLine("ABSTENTION POLICY ACTIVE: ${abstentionAssessment.policyStatement}")
       abstentionAssessment.reasons.forEach { r ->
         appendLine("  * [${r.code}] ${r.detail}")
+      }
+    }
+    if (structuredMethodChecks.isNotEmpty()) {
+      appendLine("Structured Methodological Checks (6-State Epistemic Status — Not Binary Pass/Fail):")
+      structuredMethodChecks.take(6).forEach { chk ->
+        val absNote = chk.reasonForAbstention?.let { " | Abstention: $it" }.orEmpty()
+        appendLine("  * [${chk.assessmentStatus.name}] ${chk.domain} (conf=${String.format(Locale.US, "%.2f", chk.confidence)}): Observed=${chk.observedEvidence} | Required=${chk.requiredEvidence}$absNote")
       }
     }
     if (structuredUnsupported.isNotEmpty()) {
@@ -338,15 +482,20 @@ data class SemanticValidityReport(
   }.trim()
 
   fun toAuditMarkdown(): String = buildString {
+    fun humanCode(code: String): String = code
+      .replace('_', ' ')
+      .lowercase(Locale.US)
+      .replaceFirstChar { it.titlecase(Locale.US) }
+
     appendLine("[PHASE 8 — SEMANTIC VALIDITY, CLASSIFIER CONFIDENCE & ABSTENTION REPORT]")
-    appendLine(designClassification.toSummaryBlock())
+    appendLine(DossierFormattingEngine.sanitizeTableCell(designClassification.toSummaryBlock()))
 
     if (abstentionAssessment.shouldAbstainFromStrongConclusions) {
       appendLine()
       appendLine("[ABSTENTION POLICY TRIGGERED]")
-      appendLine(abstentionAssessment.policyStatement)
+      appendLine(DossierFormattingEngine.sanitizeTableCell(abstentionAssessment.policyStatement))
       abstentionAssessment.reasons.forEach { r ->
-        appendLine("• [${r.code}] ${r.detail}")
+        appendLine("• [${humanCode(r.code)}] ${DossierFormattingEngine.sanitizeTableCell(r.detail)}")
       }
     }
 
@@ -354,7 +503,7 @@ data class SemanticValidityReport(
       appendLine()
       appendLine("[EXTRACTION FAILURE VS. MANUSCRIPT OMISSION CLASSIFICATION]")
       structuredUnsupported.forEach { u ->
-        appendLine("• ${u.formatLine()}")
+        appendLine("• ${DossierFormattingEngine.sanitizeTableCell(u.formatLine())}")
       }
     }
 
@@ -364,45 +513,52 @@ data class SemanticValidityReport(
       appendLine("| From Stage | To Stage | From N | To N | Lost | Unit Level | Population | Reason |")
       appendLine("|---|---|---|---|---|---|---|---|")
       denominatorGraph.transitions.forEach { t ->
-        appendLine("| ${t.fromStage} | ${t.toStage} | ${t.fromN} | ${t.toN} | ${t.nLost} | ${t.unitLevel.label} | ${t.populationType.label} | ${t.exclusionReason.replace("|", "/")} |")
+        appendLine(
+          "| ${DossierFormattingEngine.sanitizeTableCell(t.fromStage)} " +
+            "| ${DossierFormattingEngine.sanitizeTableCell(t.toStage)} " +
+            "| ${t.fromN} | ${t.toN} | ${t.nLost} " +
+            "| ${DossierFormattingEngine.sanitizeTableCell(t.unitLevel.label)} " +
+            "| ${DossierFormattingEngine.sanitizeTableCell(t.populationType.label)} " +
+            "| ${DossierFormattingEngine.clampCell(DossierFormattingEngine.sanitizeTableCell(t.exclusionReason), 95)} |"
+        )
       }
     } else {
       appendLine("• Stages captured: ${denominatorGraph.stages.entries.joinToString(" → ") { "${it.key}=${it.value}" }.ifBlank { "none reconstructed" }}")
     }
-    denominatorGraph.unitLevelConflictWarning?.let { appendLine("• Unit-of-Analysis Alert: $it") }
+    denominatorGraph.unitLevelConflictWarning?.let { appendLine("• Unit-of-Analysis Alert: ${DossierFormattingEngine.sanitizeTableCell(it)}") }
 
     appendLine()
     appendLine("[MULTIPLICITY-FAMILY UNCERTAINTY]")
-    appendLine("• ${multiplicityAssessment.statusMessage}")
+    appendLine("• ${DossierFormattingEngine.sanitizeTableCell(multiplicityAssessment.statusMessage)}")
 
     if (effectScaleFindings.isNotEmpty()) {
       appendLine()
       appendLine("[EFFECT-DIRECTION & SCALE SANITY CHECKS (${effectScaleFindings.size})]")
       effectScaleFindings.forEach { f ->
         val pg = if (f.pageNumber > 0) " (Page ${f.pageNumber})" else ""
-        appendLine("• [${f.checkCode}]$pg ${f.title}: ${f.detail}")
+        appendLine("• [${humanCode(f.checkCode)}]$pg ${DossierFormattingEngine.sanitizeTableCell(f.title)}: ${DossierFormattingEngine.sanitizeTableCell(f.detail)}")
       }
     }
 
     appendLine()
-    appendLine("[SUBSTANTIVE MISSING-DATA AUDIT (${missingDataAudit.substantiveAdequacy})]")
-    appendLine("• ${missingDataAudit.summary}")
+    appendLine("[SUBSTANTIVE MISSING-DATA AUDIT (${humanCode(missingDataAudit.substantiveAdequacy)})]")
+    appendLine("• ${DossierFormattingEngine.sanitizeTableCell(missingDataAudit.summary)}")
 
     appendLine()
     appendLine("[ANALYST DEGREES-OF-FREEDOM AUDIT (${researcherDofReport.elevatedCount}/11 Elevated Flexibility Dimensions)]")
-    appendLine("• ${researcherDofReport.summary}")
+    appendLine("• ${DossierFormattingEngine.sanitizeTableCell(researcherDofReport.summary)}")
 
     if (falsificationChecks.applicableToDesign) {
       appendLine()
       appendLine("[NEGATIVE-CONTROL & FALSIFICATION CHECKS (${falsificationChecks.totalPresent}/6 Present)]")
-      appendLine("• ${falsificationChecks.summary}")
+      appendLine("• ${DossierFormattingEngine.sanitizeTableCell(falsificationChecks.summary)}")
     }
 
     if (estimandAssessments.isNotEmpty()) {
       appendLine()
       appendLine("[ESTIMAND-FIRST NON-DOGMATIC METHOD CHECKS]")
       estimandAssessments.forEach { e ->
-        appendLine("• ${e.methodTopic} | Estimand: ${e.targetEstimand} | Same question? ${if (e.alternativeAnswersSameQuestion) "Yes" else "No (different estimand)"} — ${e.verdictNote}")
+        appendLine("• ${DossierFormattingEngine.sanitizeTableCell(e.methodTopic)} | Estimand: ${DossierFormattingEngine.sanitizeTableCell(e.targetEstimand)} | Same question? ${if (e.alternativeAnswersSameQuestion) "Yes" else "No (different estimand)"} — ${DossierFormattingEngine.sanitizeTableCell(e.verdictNote)}")
       }
     }
   }.trim()

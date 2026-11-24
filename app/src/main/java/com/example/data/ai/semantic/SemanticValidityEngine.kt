@@ -9,9 +9,11 @@ import com.example.data.ai.stats.ClaimParseStatus
 import com.example.data.ai.stats.NumericalReconstructionResult
 import com.example.data.ai.stats.QuantitativeClaim
 import com.example.data.ai.stats.StatisticalClaimParser
+import com.example.util.CoverageStatus
 import com.example.util.DocumentCoverageReport
 import java.util.Locale
 import kotlin.math.abs
+import kotlin.math.exp
 import kotlin.math.max
 
 /**
@@ -36,7 +38,8 @@ object SemanticValidityEngine {
   data class SanitizedTextResult(
     val text: String,
     val duplicatedColumnsRemoved: Int,
-    val ocrNoiseDetected: Boolean
+    val ocrNoiseDetected: Boolean,
+    val suspectedDuplications: List<SuspectedDuplication> = emptyList()
   )
 
   private val ocrDigitConfusionRegex = Regex(
@@ -44,212 +47,453 @@ object SemanticValidityEngine {
   )
 
   /**
-   * Deduplicates consecutive duplicated multi-word lines/paragraphs caused by 2-column PDF extraction
-   * and detects OCR digit confusion (e.g., `p = O.04`, `OR = l.45`) so OCR noise is classified as
-   * `PRESENT_BUT_UNREADABLE` instead of fabricating arithmetic errors.
+   * Layout-aware PDF deduplication (Revision E / P2):
+   * - When [layoutMetadata] is supplied, deduplicates ONLY when layout evidence matches
+   *   (same page + same column or overlapping bounding box/x-y coordinates).
+   * - When only plain text is available, removes ONLY immediately consecutive identical long lines
+   *   on the same page (classic 2-column extractor double-emit), and PRESERVES non-adjacent
+   *   repeated lines (e.g., repeated Methods clauses, table row labels, eligibility statements)
+   *   while tagging them in [SanitizedTextResult.suspectedDuplications] instead of silently deleting them.
    */
-  fun sanitizePdfExtractionNoise(rawText: String): SanitizedTextResult {
+  fun sanitizePdfExtractionNoise(
+    rawText: String,
+    layoutMetadata: List<PdfLineLayoutMetadata>? = null
+  ): SanitizedTextResult {
     val lines = rawText.lines()
     val deduped = mutableListOf<String>()
+    val suspected = mutableListOf<SuspectedDuplication>()
     var removed = 0
-    val recentLongLines = ArrayDeque<String>()
+    val hasLayout = layoutMetadata != null && layoutMetadata.size == lines.size
 
-    for (line in lines) {
+    var currentPage = 0
+    var prevNonBlankNorm = ""
+    var prevNonBlankPage = -1
+    val seenByNorm = mutableMapOf<String, MutableList<Pair<Int, PdfLineLayoutMetadata?>>>()
+    val pageTagRegex = Regex("""^\[PAGE\s+(\d+)\]$""", RegexOption.IGNORE_CASE)
+
+    for (idx in lines.indices) {
+      val line = lines[idx]
       val trimmed = line.trim()
-      val normalized = trimmed.replace(Regex("""\s+"""), " ")
-      val isLongContent = normalized.length >= 45 && !normalized.startsWith("[PAGE", ignoreCase = true)
-      if (isLongContent && normalized in recentLongLines) {
-        removed++
+      val pageHit = pageTagRegex.matchEntire(trimmed)
+      if (pageHit != null) {
+        currentPage = pageHit.groupValues[1].toIntOrNull() ?: currentPage
+        deduped.add(line)
         continue
       }
-      deduped.add(line)
+      val normalized = trimmed.replace(Regex("""\s+"""), " ")
+      val isLongContent = normalized.length >= 45
+      val curMeta = if (hasLayout) layoutMetadata?.getOrNull(idx) else null
+      val effectivePage = curMeta?.pageNumber ?: currentPage
+
       if (isLongContent) {
-        recentLongLines.addLast(normalized)
-        if (recentLongLines.size > 6) recentLongLines.removeFirst()
+        val priorEntries = seenByNorm[normalized]
+        if (hasLayout && priorEntries != null) {
+          val matchingLayout = priorEntries.firstOrNull { (_, prevMeta) ->
+            prevMeta != null && curMeta != null &&
+              prevMeta.pageNumber == curMeta.pageNumber &&
+              (prevMeta.columnIndex == curMeta.columnIndex ||
+                (abs(prevMeta.x - curMeta.x) <= 24f && abs(prevMeta.y - curMeta.y) <= 24f))
+          }
+          if (matchingLayout != null) {
+            removed++
+            suspected.add(
+              SuspectedDuplication(
+                lineIndex = idx,
+                pageNumber = effectivePage,
+                excerpt = normalized.take(100),
+                reason = "Layout-verified duplicate on page $effectivePage (same column/bounding region).",
+                wasRemoved = true
+              )
+            )
+            continue
+          } else {
+            // Different page or different column/region -> legitimate repetition; preserve & note
+            suspected.add(
+              SuspectedDuplication(
+                lineIndex = idx,
+                pageNumber = effectivePage,
+                excerpt = normalized.take(100),
+                reason = "Repeated text in distinct page/column layout region — preserved as legitimate text.",
+                wasRemoved = false
+              )
+            )
+          }
+        } else if (!hasLayout && prevNonBlankNorm == normalized && prevNonBlankPage == effectivePage) {
+          // Immediately consecutive duplicate on the same page -> safe column double-emit dedup
+          removed++
+          suspected.add(
+            SuspectedDuplication(
+              lineIndex = idx,
+              pageNumber = effectivePage,
+              excerpt = normalized.take(100),
+              reason = "Immediately consecutive identical long line on same page (likely PDF column double-emit).",
+              wasRemoved = true
+            )
+          )
+          continue
+        } else if (!hasLayout && priorEntries != null) {
+          // Non-adjacent plain-text repetition without layout metadata -> DO NOT silently delete!
+          suspected.add(
+            SuspectedDuplication(
+              lineIndex = idx,
+              pageNumber = effectivePage,
+              excerpt = normalized.take(100),
+              reason = "Possible extraction duplication (plain-text only; no layout coordinates — preserved without deletion).",
+              wasRemoved = false
+            )
+          )
+        }
+        seenByNorm.getOrPut(normalized) { mutableListOf() }.add(idx to curMeta)
+      }
+
+      deduped.add(line)
+      if (normalized.isNotBlank()) {
+        prevNonBlankNorm = normalized
+        prevNonBlankPage = effectivePage
       }
     }
 
     val cleaned = deduped.joinToString("\n")
     val hasOcrNoise = ocrDigitConfusionRegex.containsMatchIn(cleaned) ||
       cleaned.count { it == '\uFFFD' } >= 2
-    return SanitizedTextResult(cleaned, removed, hasOcrNoise)
+    return SanitizedTextResult(cleaned, removed, hasOcrNoise, suspected)
   }
 
   // ============================================================================
-  // #2. CLASSIFIER-CONFIDENCE GATE
+  // #2. SECTION-FILTERED, MUTUALLY EXCLUSIVE, CALIBRATED DESIGN CLASSIFIER
   // ============================================================================
+  private val referencesHeaderRegex = Regex(
+    """(?im)^\s*(?:\d+(?:\.\d+)*\.?\s+)?(references|bibliography|works\s+cited|literature\s+cited)\s*$"""
+  )
+  private val quotedPriorWorkRegex = Regex(
+    """(?i)(?:[A-Z][A-Za-z\-]+(?:\s+et\s+al\.?)?\s*\(\s*(?:19|20)\d{2}[a-z]?\s*\)(?:et\s+al\.|\.\d|[^.\n]){0,220}|(?:previous|prior|earlier|other)\s+(?:studies|trials|papers|work|authors|meta-analyses|benchmarks)(?:et\s+al\.|\.\d|[^.\n]){0,220}|"[^"\n]{10,160}")"""
+  )
+
+  /**
+   * Strips References/Bibliography sections and quoted/cited prior-work clauses so terms like
+   * "randomized", "benchmark", or "proof" in citations cannot contaminate study-design classification.
+   */
+  internal fun extractActiveDesignClassificationText(rawText: String): String {
+    val refMatch = referencesHeaderRegex.find(rawText)
+    val bodyOnly = if (refMatch != null) rawText.substring(0, refMatch.range.first) else rawText
+    return quotedPriorWorkRegex.replace(bodyOnly, " ")
+  }
+
+  private const val CALIBRATION_TEMPERATURE = 1.65
+  private const val UNKNOWN_BASELINE_LOGIT = 2.60
+
   fun classifyDesignWithConfidence(
     text: String,
     parentArchetype: StudyDesignArchetype
   ): DesignClassificationResult {
-    val l = text.lowercase(Locale.US)
-    val scores = mutableMapOf<AuditSubDesign, Pair<Double, MutableList<String>>>()
-    fun addScore(design: AuditSubDesign, weight: Double, term: String) {
+    val activeBody = extractActiveDesignClassificationText(text)
+    val l = activeBody.lowercase(Locale.US)
+    val scores = mutableMapOf<CalibratedStudyDesign, Pair<Double, MutableList<String>>>()
+    fun addScore(design: CalibratedStudyDesign, weight: Double, term: String) {
       val entry = scores.getOrPut(design) { 0.0 to mutableListOf() }
-      entry.second.add(term)
-      scores[design] = (entry.first + weight) to entry.second
+      if (term !in entry.second) {
+        entry.second.add(term)
+        scores[design] = (entry.first + weight) to entry.second
+      }
     }
 
-    // Meta-analysis vs Narrative/Systematic review
+    // 1. Quantitative Meta-Analysis vs. Qualitative Systematic Review
     val metaTerms = listOf(
-      "meta-analysis" to 3.2, "forest plot" to 2.2, "dersimonian" to 2.4, "reml" to 1.8,
-      "paule-mandel" to 2.2, "tau-squared" to 1.8, "τ²" to 1.8, "pooled estimate" to 2.0,
+      "meta-analysis" to 3.6, "forest plot" to 2.2, "dersimonian" to 2.5, "reml" to 1.8,
+      "paule-mandel" to 2.3, "tau-squared" to 1.8, "τ²" to 1.8, "pooled estimate" to 2.0,
       "pooled odds ratio" to 2.2, "random-effects model" to 2.0, "fixed-effect model" to 1.8,
       "hartung-knapp" to 2.0
     )
-    metaTerms.forEach { (k, w) -> if (l.contains(k)) addScore(AuditSubDesign.META_ANALYSIS, w, k) }
-    if (Regex("""\bi(?:\^2|²|2)\s*[=<>]""").containsMatchIn(l)) addScore(AuditSubDesign.META_ANALYSIS, 2.0, "I²")
-
-    val srTerms = listOf("systematic review" to 2.8, "prisma" to 2.2, "prospero" to 2.0, "narrative synthesis" to 2.4, "scoping review" to 2.2, "cochrane" to 1.4)
-    srTerms.forEach { (k, w) -> if (l.contains(k)) addScore(AuditSubDesign.SYSTEMATIC_REVIEW, w, k) }
-
-    // RCT vs Observational Cohort vs Case-Control
-    val rctTerms = listOf(
-      "randomized controlled" to 3.4, "randomised controlled" to 3.4, "randomly assigned" to 2.8,
-      "double-blind" to 2.4, "placebo-controlled" to 2.4, "consort" to 2.2,
-      "allocation concealment" to 2.2, "intention-to-treat" to 1.6, "cluster-randomized" to 2.8,
-      "per-protocol" to 1.2
-    )
-    rctTerms.forEach { (k, w) -> if (l.contains(k)) addScore(AuditSubDesign.RCT, w, k) }
-    if (!l.contains("randomized controlled") && !l.contains("randomised controlled") &&
-      Regex("""(?<!non[- ])(?<!un)\b(?:randomized|randomised)\b""").containsMatchIn(l)
-    ) {
-      addScore(AuditSubDesign.RCT, 1.8, "randomized")
+    metaTerms.forEach { (k, w) -> if (l.contains(k)) addScore(CalibratedStudyDesign.META_ANALYSIS, w, k) }
+    if (Regex("""\bi(?:\^2|²|2)\s*[=<>]""").containsMatchIn(l)) {
+      addScore(CalibratedStudyDesign.META_ANALYSIS, 2.0, "I²")
     }
 
-    val cohortTerms = listOf(
-      "retrospective cohort" to 3.0, "prospective cohort" to 3.0, "cohort study" to 2.6,
-      "observational study" to 2.2, "strobe" to 2.0, "propensity score" to 1.8,
-      "cross-sectional" to 2.2, "longitudinal cohort" to 2.4
+    val srTerms = listOf(
+      "systematic review" to 3.0, "prisma" to 2.2, "prospero" to 2.0,
+      "narrative synthesis" to 2.6, "scoping review" to 2.4, "cochrane" to 1.4
     )
-    cohortTerms.forEach { (k, w) -> if (l.contains(k)) addScore(AuditSubDesign.OBSERVATIONAL_COHORT, w, k) }
-    if (l.contains("retrospective") && !l.contains("retrospective cohort")) {
-      addScore(AuditSubDesign.OBSERVATIONAL_COHORT, 1.2, "retrospective")
-    }
-    val isCaseControl = l.contains("case-control") || l.contains("case control")
-    if (isCaseControl) addScore(AuditSubDesign.OBSERVATIONAL_COHORT, 2.5, "case-control")
-
-    // Survival / Time-to-Event
-    val survTerms = listOf(
-      "kaplan-meier" to 2.6, "cox proportional" to 2.8, "hazard ratio" to 2.0,
-      "time-to-event" to 2.6, "competing risk" to 2.2, "fine-gray" to 2.4, "log-rank" to 1.8, "person-years" to 1.5
-    )
-    survTerms.forEach { (k, w) -> if (l.contains(k)) addScore(AuditSubDesign.SURVIVAL_ANALYSIS, w, k) }
-
-    // Diagnostic Accuracy vs Prediction / ML Benchmark
-    val diagTerms = listOf(
-      "diagnostic accuracy" to 3.2, "stard" to 2.5, "quadas" to 2.5, "reference standard" to 2.4,
-      "gold standard" to 1.8, "sensitivity and specificity" to 2.4, "likelihood ratio" to 1.8, "ppv" to 1.2, "npv" to 1.2
-    )
-    diagTerms.forEach { (k, w) -> if (l.contains(k)) addScore(AuditSubDesign.DIAGNOSTIC_ACCURACY, w, k) }
-
-    val mlTerms = listOf(
-      "train/test" to 2.6, "cross-validation" to 2.2, "neural network" to 2.4, "transformer" to 2.4,
-      "deep learning" to 2.4, "ablation" to 2.0, "hyperparameter" to 2.2, "xgboost" to 2.2,
-      "random forest" to 2.0, "benchmark" to 1.6, "classifier" to 1.2, "holdout" to 1.6, "epoch" to 1.6
-    )
-    mlTerms.forEach { (k, w) -> if (l.contains(k)) addScore(AuditSubDesign.ML_BENCHMARK, w, k) }
-
-    // Causal Panel vs Descriptive Panel / Econometrics
-    val econTerms = listOf(
-      "difference-in-differences" to 3.2, "instrumental variable" to 3.2, "two-stage least squares" to 3.0,
-      "2sls" to 2.6, "regression discontinuity" to 3.2, "staggered adoption" to 2.6,
-      "two-way fixed effects" to 2.6, "twfe" to 2.4, "parallel trends" to 2.4, "panel data" to 1.6
-    )
-    econTerms.forEach { (k, w) -> if (l.contains(k)) addScore(AuditSubDesign.ECONOMETRIC_PANEL, w, k) }
-
-    // Formal Theorem vs Algorithmic Theory
-    val mathTerms = listOf(
-      "theorem" to 2.4, "lemma" to 2.2, "proposition" to 1.8, "proof" to 2.2,
-      "q.e.d" to 2.0, "banach" to 2.4, "hilbert" to 2.4, "dominated convergence" to 2.2, "fubini" to 2.0
-    )
-    mathTerms.forEach { (k, w) -> if (l.contains(k)) addScore(AuditSubDesign.FORMAL_THEOREM, w, k) }
-
-    val ranked = scores.entries.sortedByDescending { it.value.first }
-    if (ranked.isEmpty()) {
-      val fallback = when (parentArchetype) {
-        StudyDesignArchetype.SYSTEMATIC_REVIEW_META_ANALYSIS -> AuditSubDesign.SYSTEMATIC_REVIEW
-        StudyDesignArchetype.ECONOMETRICS_CAUSAL -> AuditSubDesign.ECONOMETRIC_PANEL
-        StudyDesignArchetype.MACHINE_LEARNING_AI -> AuditSubDesign.ML_BENCHMARK
-        StudyDesignArchetype.THEORETICAL_FORMAL -> AuditSubDesign.FORMAL_THEOREM
-        StudyDesignArchetype.CLINICAL_EPIDEMIOLOGICAL -> AuditSubDesign.OBSERVATIONAL_COHORT
-        else -> AuditSubDesign.GENERAL_EMPIRICAL
+    val hasQuantPooling = scores[CalibratedStudyDesign.META_ANALYSIS]?.first ?: 0.0 >= 3.0
+    srTerms.forEach { (k, w) ->
+      if (l.contains(k)) {
+        // Only credit qualitative systematic review when not primarily a quantitative meta-analysis
+        val adjWeight = if (hasQuantPooling && k != "narrative synthesis") w * 0.35 else w
+        addScore(CalibratedStudyDesign.SYSTEMATIC_REVIEW_NARRATIVE, adjWeight, k)
       }
+    }
+
+    // 2. Randomized Controlled Trial (RCT)
+    val rctTerms = listOf(
+      "randomized controlled" to 3.8, "randomised controlled" to 3.8, "randomly assigned" to 3.0,
+      "double-blind" to 2.4, "placebo-controlled" to 2.4, "consort" to 2.4,
+      "allocation concealment" to 2.4, "intention-to-treat" to 1.8, "cluster-randomized" to 3.2,
+      "per-protocol" to 1.3
+    )
+    rctTerms.forEach { (k, w) -> if (l.contains(k)) addScore(CalibratedStudyDesign.RCT, w, k) }
+    if (!l.contains("randomized controlled") && !l.contains("randomised controlled") &&
+      Regex("""(?<!non[- ])(?<!un)(?<!quasi[- ])\b(?:randomized|randomised)\b""").containsMatchIn(l)
+    ) {
+      addScore(CalibratedStudyDesign.RCT, 2.0, "randomized")
+    }
+
+    // 3. Mutually exclusive Observational Designs: Case-Control, Cross-Sectional, Prospective Cohort, Retrospective Cohort
+    val isCaseControl = l.contains("case-control") || l.contains("case control") ||
+      (l.contains("matched controls") && l.contains("cases"))
+    if (isCaseControl) {
+      addScore(CalibratedStudyDesign.CASE_CONTROL, 3.8, "case-control")
+      if (l.contains("strobe")) addScore(CalibratedStudyDesign.CASE_CONTROL, 1.4, "strobe")
+      if (l.contains("matched controls")) addScore(CalibratedStudyDesign.CASE_CONTROL, 1.8, "matched controls")
+      if (l.contains("odds ratio")) addScore(CalibratedStudyDesign.CASE_CONTROL, 1.0, "odds ratio")
+    }
+
+    val isCrossSectional = l.contains("cross-sectional") || l.contains("cross sectional") ||
+      l.contains("prevalence survey") || l.contains("national health survey")
+    if (isCrossSectional) {
+      addScore(CalibratedStudyDesign.CROSS_SECTIONAL, 3.8, "cross-sectional")
+      if (l.contains("survey")) addScore(CalibratedStudyDesign.CROSS_SECTIONAL, 1.5, "survey")
+      if (l.contains("prevalence")) addScore(CalibratedStudyDesign.CROSS_SECTIONAL, 1.3, "prevalence")
+      if (l.contains("observational")) addScore(CalibratedStudyDesign.CROSS_SECTIONAL, 1.0, "observational")
+      if (l.contains("strobe")) addScore(CalibratedStudyDesign.CROSS_SECTIONAL, 1.2, "strobe")
+    }
+
+    if (l.contains("prospective cohort") || l.contains("longitudinal cohort")) {
+      addScore(CalibratedStudyDesign.PROSPECTIVE_COHORT, 3.6, "prospective cohort")
+      if (l.contains("strobe")) addScore(CalibratedStudyDesign.PROSPECTIVE_COHORT, 1.4, "strobe")
+      if (l.contains("follow-up") || l.contains("followed")) addScore(CalibratedStudyDesign.PROSPECTIVE_COHORT, 1.2, "follow-up")
+    }
+    if (l.contains("retrospective cohort")) {
+      addScore(CalibratedStudyDesign.RETROSPECTIVE_COHORT, 3.6, "retrospective cohort")
+      if (l.contains("strobe")) addScore(CalibratedStudyDesign.RETROSPECTIVE_COHORT, 1.4, "strobe")
+      if (l.contains("propensity score")) addScore(CalibratedStudyDesign.RETROSPECTIVE_COHORT, 1.6, "propensity score")
+    } else if (!isCaseControl && !isCrossSectional && (l.contains("cohort study") || l.contains("observational study"))) {
+      val target = if (l.contains("prospective")) CalibratedStudyDesign.PROSPECTIVE_COHORT else CalibratedStudyDesign.RETROSPECTIVE_COHORT
+      if (l.contains("cohort study")) addScore(target, 3.0, "cohort study")
+      if (l.contains("observational study")) addScore(target, 2.2, "observational study")
+      if (l.contains("propensity score")) addScore(target, 1.6, "propensity score")
+      if (l.contains("strobe")) addScore(target, 1.6, "strobe")
+    }
+
+    // 4. Survival / Time-to-Event
+    val survTerms = listOf(
+      "kaplan-meier" to 2.8, "cox proportional" to 3.2, "hazard ratio" to 2.0,
+      "time-to-event" to 3.0, "competing risk" to 2.2, "fine-gray" to 2.4,
+      "log-rank" to 1.8, "person-years" to 1.4
+    )
+    survTerms.forEach { (k, w) -> if (l.contains(k)) addScore(CalibratedStudyDesign.SURVIVAL_TIME_TO_EVENT, w, k) }
+
+    // 5. Diagnostic Accuracy
+    val diagTerms = listOf(
+      "diagnostic accuracy" to 3.8, "stard" to 2.6, "quadas" to 2.6, "reference standard" to 2.6,
+      "gold standard" to 1.8, "sensitivity and specificity" to 2.6, "likelihood ratio" to 1.8
+    )
+    diagTerms.forEach { (k, w) -> if (l.contains(k)) addScore(CalibratedStudyDesign.DIAGNOSTIC_ACCURACY, w, k) }
+
+    // 6. Machine Learning / Predictive Benchmark (require genuine ML modeling bundle, NOT bare "benchmark dataset"!)
+    val mlCoreTerms = listOf(
+      "train/test" to 2.8, "cross-validation" to 2.4, "neural network" to 2.6, "transformer" to 2.6,
+      "deep learning" to 2.6, "ablation" to 2.2, "hyperparameter" to 2.4, "xgboost" to 2.4,
+      "random forest" to 2.2, "holdout" to 1.8, "epoch" to 1.8, "classifier" to 1.6
+    )
+    mlCoreTerms.forEach { (k, w) -> if (l.contains(k)) addScore(CalibratedStudyDesign.ML_PREDICTION_BENCHMARK, w, k) }
+    val hasMlCoreBundle = (scores[CalibratedStudyDesign.ML_PREDICTION_BENCHMARK]?.first ?: 0.0) >= 1.5
+    if (hasMlCoreBundle && l.contains("benchmark")) {
+      addScore(CalibratedStudyDesign.ML_PREDICTION_BENCHMARK, 1.4, "benchmark")
+    }
+
+    // 7. Causal Econometric Panel vs. Descriptive Panel
+    val causalEconTerms = listOf(
+      "difference-in-differences" to 3.6, "instrumental variable" to 3.6, "two-stage least squares" to 3.2,
+      "2sls" to 2.8, "regression discontinuity" to 3.6, "staggered adoption" to 2.8,
+      "two-way fixed effects" to 2.6, "twfe" to 2.4, "parallel trends" to 2.6
+    )
+    causalEconTerms.forEach { (k, w) -> if (l.contains(k)) addScore(CalibratedStudyDesign.CAUSAL_ECONOMETRIC_PANEL, w, k) }
+    if (l.contains("descriptive panel") && (scores[CalibratedStudyDesign.CAUSAL_ECONOMETRIC_PANEL]?.first ?: 0.0) < 2.0) {
+      addScore(CalibratedStudyDesign.DESCRIPTIVE_PANEL, 3.4, "descriptive panel")
+      if (l.contains("panel data")) addScore(CalibratedStudyDesign.DESCRIPTIVE_PANEL, 1.6, "panel data")
+    } else if (l.contains("panel data") && (scores[CalibratedStudyDesign.CAUSAL_ECONOMETRIC_PANEL]?.first ?: 0.0) >= 2.0) {
+      addScore(CalibratedStudyDesign.CAUSAL_ECONOMETRIC_PANEL, 1.4, "panel data")
+    }
+
+    // 8. Formal Mathematical Proof vs. Algorithmic Theory (never trigger from bare "proof" in an empirical paper!)
+    val mathCoreTerms = listOf(
+      "theorem" to 2.8, "lemma" to 2.5, "proposition" to 2.0, "q.e.d" to 2.4,
+      "banach" to 2.6, "hilbert" to 2.6, "dominated convergence" to 2.4, "fubini" to 2.2,
+      "corollary" to 2.0, "axiom" to 1.8
+    )
+    mathCoreTerms.forEach { (k, w) -> if (l.contains(k)) addScore(CalibratedStudyDesign.FORMAL_MATHEMATICAL_PROOF, w, k) }
+    val hasMathBundle = (scores[CalibratedStudyDesign.FORMAL_MATHEMATICAL_PROOF]?.first ?: 0.0) >= 2.0
+    if (hasMathBundle && Regex("""\bproof\b""").containsMatchIn(l) && !l.contains("proof of concept") && !l.contains("proof-of-concept")) {
+      addScore(CalibratedStudyDesign.FORMAL_MATHEMATICAL_PROOF, 1.8, "proof")
+    }
+    if ((l.contains("time complexity") || l.contains("asymptotic complexity") || l.contains("np-hard")) &&
+      (l.contains("algorithm") || l.contains("o(n"))
+    ) {
+      addScore(CalibratedStudyDesign.ALGORITHMIC_THEORY, 3.6, "algorithmic complexity")
+      if (l.contains("theorem") || l.contains("lemma")) addScore(CalibratedStudyDesign.ALGORITHMIC_THEORY, 1.8, "theorem/lemma")
+    }
+
+    // Remove candidates lacking a positive design evidence bundle (logit < 2.0 and single weak term)
+    val qualifiedScores = scores.filter { (_, pair) -> pair.first >= 2.0 || pair.second.size >= 2 }
+
+    if (qualifiedScores.isEmpty()) {
       return DesignClassificationResult(
-        primaryDesign = fallback,
-        primaryLabel = fallback.displayName,
-        primaryConfidence = 0.30,
+        primaryDesign = AuditSubDesign.GENERAL_EMPIRICAL,
+        primaryLabel = CalibratedStudyDesign.UNKNOWN.displayName,
+        primaryConfidence = 0.25,
         alternatives = emptyList(),
         evidence = emptyList(),
         abstained = true,
-        suppressedChecks = listOf("Design-specific causal/estimator checks suppressed (insufficient design evidence)")
+        suppressedChecks = listOf("Design-specific causal/estimator checks suppressed (insufficient positive design evidence bundle)"),
+        calibratedDesign = CalibratedStudyDesign.UNKNOWN,
+        margin = 0.0
       )
     }
 
-    val topScore = ranked.first().value.first
-    val totalScore = ranked.sumOf { it.value.first } + 1.5 // smoothing prior prevents overconfidence on single keyword
-    val topDesign = ranked.first().key
-    val primaryConf = (topScore / totalScore).coerceIn(0.25, 0.98)
+    // Temperature-scaled softmax including an explicit UNKNOWN class prior
+    val logits = mutableMapOf<CalibratedStudyDesign, Double>()
+    qualifiedScores.forEach { (d, pair) -> logits[d] = pair.first }
+    logits[CalibratedStudyDesign.UNKNOWN] = UNKNOWN_BASELINE_LOGIT
+    val maxLogit = logits.values.max()
+    val expScores = logits.mapValues { (_, v) -> exp((v - maxLogit) / CALIBRATION_TEMPERATURE) }
+    val partition = expScores.values.sum()
+    val probs = expScores.mapValues { (_, e) -> e / partition }
 
-    val alternatives = ranked.drop(1).take(2).map { (d, pair) ->
-      DesignCandidate(
-        design = d,
-        label = resolveFineDesignLabel(d, l),
-        confidence = (pair.first / totalScore).coerceIn(0.05, 0.70),
-        evidenceTerms = pair.second.distinct()
-      )
-    }.toMutableList()
+    val rankedAll = probs.entries.sortedByDescending { it.value }
+    val topEntry = rankedAll.first()
+    val nonUnknownRanked = rankedAll.filter { it.key != CalibratedStudyDesign.UNKNOWN }
+    val runnerUpProb = rankedAll.getOrNull(1)?.value ?: 0.0
+    val margin = (topEntry.value - runnerUpProb).coerceAtLeast(0.0)
 
-    // Explicit cohort vs case-control disambiguation
-    val primaryLabel = resolveFineDesignLabel(topDesign, l)
-    if (topDesign == AuditSubDesign.OBSERVATIONAL_COHORT && l.contains("retrospective") && !isCaseControl && l.contains("odds ratio")) {
-      alternatives.add(0, DesignCandidate(AuditSubDesign.OBSERVATIONAL_COHORT, "case-control", (0.24).coerceAtMost(1.0 - primaryConf), listOf("retrospective", "odds ratio")))
+    val topDesignKey = topEntry.key
+    val primaryProb = topEntry.value.coerceIn(0.05, 0.99)
+    val abstained = topDesignKey == CalibratedStudyDesign.UNKNOWN ||
+      primaryProb < 0.50 ||
+      (margin < 0.14 && runnerUpProb >= 0.22)
+
+    val resolvedCalibrated = if (abstained && (topDesignKey == CalibratedStudyDesign.UNKNOWN || margin < 0.08)) {
+      CalibratedStudyDesign.UNKNOWN
+    } else {
+      topDesignKey
+    }
+    val mappedSub = if (resolvedCalibrated == CalibratedStudyDesign.UNKNOWN) {
+      nonUnknownRanked.firstOrNull()?.key?.mappedSubDesign ?: AuditSubDesign.GENERAL_EMPIRICAL
+    } else {
+      resolvedCalibrated.mappedSubDesign
     }
 
-    val runnerUpConf = alternatives.firstOrNull()?.confidence ?: 0.0
-    val margin = primaryConf - runnerUpConf
-    val abstained = primaryConf < 0.55 || (margin < 0.15 && runnerUpConf >= 0.25)
+    val alternatives = nonUnknownRanked
+      .filter { it.key != resolvedCalibrated }
+      .take(2)
+      .map { (d, p) ->
+        DesignCandidate(
+          design = d.mappedSubDesign,
+          label = d.displayName,
+          confidence = p.coerceIn(0.01, 0.95),
+          evidenceTerms = qualifiedScores[d]?.second.orEmpty(),
+          calibratedDesign = d
+        )
+      }
 
     val suppressed = mutableListOf<String>()
     if (abstained) {
       suppressed.add("design-sensitive methodological FAIL escalations")
     }
-    if (isCaseControl || alternatives.any { it.label.contains("case-control", true) && it.confidence >= 0.20 }) {
+    if (resolvedCalibrated == CalibratedStudyDesign.CASE_CONTROL ||
+      alternatives.any { it.calibratedDesign == CalibratedStudyDesign.CASE_CONTROL && it.confidence >= 0.20 }
+    ) {
       suppressed.add("incidence-rate and risk-ratio direct-risk checks")
     }
-    if (topDesign == AuditSubDesign.SYSTEMATIC_REVIEW && !l.contains("meta-analysis")) {
+    if (resolvedCalibrated == CalibratedStudyDesign.CROSS_SECTIONAL) {
+      suppressed.add("longitudinal follow-up and cohort attrition checks")
+    }
+    if (resolvedCalibrated == CalibratedStudyDesign.SYSTEMATIC_REVIEW_NARRATIVE) {
       suppressed.add("pooled heterogeneity (I²/τ²) and forest-plot checks")
     }
-    if (topDesign == AuditSubDesign.ECONOMETRIC_PANEL && l.contains("descriptive panel") && !l.contains("causal")) {
+    if (resolvedCalibrated == CalibratedStudyDesign.DESCRIPTIVE_PANEL) {
       suppressed.add("causal identification (DiD/IV/RDD) requirements")
     }
-    if (topDesign == AuditSubDesign.FORMAL_THEOREM && (l.contains("time complexity") || l.contains("algorithm") || l.contains("o(n"))) {
+    if (resolvedCalibrated == CalibratedStudyDesign.ALGORITHMIC_THEORY) {
       suppressed.add("measure-theoretic integral interchange requirements")
     }
 
     return DesignClassificationResult(
-      primaryDesign = topDesign,
-      primaryLabel = primaryLabel,
-      primaryConfidence = primaryConf,
-      alternatives = alternatives.take(2),
-      evidence = ranked.first().value.second.distinct(),
+      primaryDesign = mappedSub,
+      primaryLabel = resolvedCalibrated.displayName,
+      primaryConfidence = primaryProb,
+      alternatives = alternatives,
+      evidence = qualifiedScores[topDesignKey]?.second.orEmpty(),
       abstained = abstained,
-      suppressedChecks = suppressed.distinct()
+      suppressedChecks = suppressed.distinct(),
+      calibratedDesign = resolvedCalibrated,
+      margin = margin
     )
   }
 
-  private fun resolveFineDesignLabel(design: AuditSubDesign, l: String): String = when (design) {
-    AuditSubDesign.OBSERVATIONAL_COHORT -> when {
-      l.contains("case-control") || l.contains("case control") -> "case-control study"
-      l.contains("cross-sectional") -> "cross-sectional study"
-      l.contains("retrospective") -> "retrospective cohort"
-      l.contains("prospective") -> "prospective cohort"
-      else -> "observational cohort"
+  /**
+   * Labeled corpus for evaluating design-classifier calibration (accuracy, high-confidence error rate, ECE).
+   */
+  val defaultLabeledDesignCorpus: List<LabeledDesignExample> = listOf(
+    LabeledDesignExample("D-01", "Abstract\nA double-blind placebo-controlled randomized controlled trial (CONSORT) with allocation concealment randomly assigned 240 patients to Drug A vs placebo.", CalibratedStudyDesign.RCT),
+    LabeledDesignExample("D-02", "Abstract\nA prospective cohort study (STROBE) followed 1,200 adults over 5 years to evaluate statin exposure and stroke.", CalibratedStudyDesign.PROSPECTIVE_COHORT),
+    LabeledDesignExample("D-03", "Abstract\nA retrospective cohort study (STROBE) used propensity score matching on 3,400 EHR records.", CalibratedStudyDesign.RETROSPECTIVE_COHORT),
+    LabeledDesignExample("D-04", "Abstract\nA matched case-control study (STROBE) compared 250 lung cancer cases with 500 matched controls reporting odds ratios.", CalibratedStudyDesign.CASE_CONTROL),
+    LabeledDesignExample("D-05", "Abstract\nA cross-sectional national health survey (STROBE) evaluated hypertension prevalence across 12,000 adults.", CalibratedStudyDesign.CROSS_SECTIONAL),
+    LabeledDesignExample("D-06", "Abstract\nA time-to-event study estimated Cox proportional hazards and Kaplan-Meier curves with Fine-Gray competing risks.", CalibratedStudyDesign.SURVIVAL_TIME_TO_EVENT),
+    LabeledDesignExample("D-07", "Abstract\nA diagnostic accuracy study (STARD, QUADAS) evaluated a rapid assay against the biopsy reference standard for sensitivity and specificity.", CalibratedStudyDesign.DIAGNOSTIC_ACCURACY),
+    LabeledDesignExample("D-08", "Abstract\nA systematic review (PRISMA, PROSPERO) conducted a qualitative narrative synthesis of 18 studies without pooling.", CalibratedStudyDesign.SYSTEMATIC_REVIEW_NARRATIVE),
+    LabeledDesignExample("D-09", "Abstract\nA quantitative meta-analysis pooled 14 trials using a DerSimonian-Laird random-effects model with forest plot and I² = 62%.", CalibratedStudyDesign.META_ANALYSIS),
+    LabeledDesignExample("D-10", "Abstract\nA staggered adoption difference-in-differences panel data study tested parallel trends with two-way fixed effects.", CalibratedStudyDesign.CAUSAL_ECONOMETRIC_PANEL),
+    LabeledDesignExample("D-11", "Abstract\nA deep learning Transformer neural network was trained with 5-fold cross-validation, hyperparameter tuning, and ablation on a holdout split.", CalibratedStudyDesign.ML_PREDICTION_BENCHMARK),
+    LabeledDesignExample("D-12", "Theorem 1. In a complete Banach space, Lemma 2 establishes convergence by dominated convergence. Proof. By induction... Q.E.D.", CalibratedStudyDesign.FORMAL_MATHEMATICAL_PROOF)
+  )
+
+  fun evaluateDesignClassifierCalibration(
+    corpus: List<LabeledDesignExample> = defaultLabeledDesignCorpus
+  ): ClassifierCalibrationReport {
+    if (corpus.isEmpty()) {
+      return ClassifierCalibrationReport(0, 1.0, 0, 0, 0.0, 0.0, 0.0)
     }
-    AuditSubDesign.SYSTEMATIC_REVIEW -> if (l.contains("narrative")) "narrative / qualitative systematic review" else "systematic review"
-    AuditSubDesign.ECONOMETRIC_PANEL -> if (l.contains("descriptive panel") && !l.contains("difference-in-differences") && !l.contains("instrumental")) "descriptive panel study" else "causal econometric panel"
-    AuditSubDesign.FORMAL_THEOREM -> if (l.contains("algorithm") && l.contains("complexity")) "algorithmic theory paper" else "formal mathematical proof"
-    else -> design.displayName
+    var correct = 0
+    var highConfCount = 0
+    var highConfErrors = 0
+    var abstainedCount = 0
+    val binCounts = IntArray(5)
+    val binConfSum = DoubleArray(5)
+    val binAccSum = DoubleArray(5)
+
+    for (ex in corpus) {
+      val res = classifyDesignWithConfidence(ex.text, ex.expectedDesign.mappedSubDesign.parentArchetype)
+      val isCorrect = res.calibratedDesign == ex.expectedDesign
+      if (isCorrect) correct++
+      if (res.abstained) abstainedCount++
+      if (!res.abstained && res.primaryConfidence >= 0.70) {
+        highConfCount++
+        if (!isCorrect) highConfErrors++
+      }
+      val bin = ((res.primaryConfidence * 5.0).toInt()).coerceIn(0, 4)
+      binCounts[bin]++
+      binConfSum[bin] += res.primaryConfidence
+      binAccSum[bin] += if (isCorrect) 1.0 else 0.0
+    }
+
+    var ece = 0.0
+    for (b in 0 until 5) {
+      if (binCounts[b] > 0) {
+        val avgConf = binConfSum[b] / binCounts[b]
+        val avgAcc = binAccSum[b] / binCounts[b]
+        ece += (binCounts[b].toDouble() / corpus.size) * abs(avgAcc - avgConf)
+      }
+    }
+
+    return ClassifierCalibrationReport(
+      totalExamples = corpus.size,
+      overallAccuracy = correct.toDouble() / corpus.size,
+      highConfidenceCount = highConfCount,
+      highConfidenceErrorCount = highConfErrors,
+      highConfidenceErrorRate = if (highConfCount > 0) highConfErrors.toDouble() / highConfCount else 0.0,
+      abstentionRate = abstainedCount.toDouble() / corpus.size,
+      expectedCalibrationError = ece
+    )
   }
 
   // ============================================================================
@@ -317,18 +561,19 @@ object SemanticValidityEngine {
     designClassification: DesignClassificationResult,
     ledger: StatisticalClaimParser.ParsedManuscriptLedger,
     reconstructions: List<NumericalReconstructionResult>,
-    coverageReport: DocumentCoverageReport? = null,
-    extractionConfidence: Int = 5
+    coverageReport: DocumentCoverageReport = DocumentCoverageReport.unknown(),
+    extractionConfidence: Int = coverageReport.extractionConfidence
   ): SemanticValidityReport {
     val text = sanitized.text
     val l = text.lowercase(Locale.US)
+    val unknownCoverage = coverageReport.isCoverageUnknown || extractionConfidence == DocumentCoverageReport.EXTRACTION_CONFIDENCE_UNKNOWN
 
     val structuredUnsupported = buildStructuredUnsupportedItems(
       text = text,
       l = l,
       sanitized = sanitized,
       ledger = ledger,
-      coverageReport = coverageReport
+      coverageReport = if (unknownCoverage) null else coverageReport
     )
     val estimandAssessments = buildAntiDogmaEstimandChecks(text, l, designClassification.primaryDesign)
     val denominatorGraph = buildDenominatorProvenanceGraph(text, l, ledger)
@@ -347,6 +592,14 @@ object SemanticValidityEngine {
       extractionConfidence = extractionConfidence,
       ocrNoise = sanitized.ocrNoiseDetected
     )
+    val structuredMethodChecks = buildStructuredMethodChecks(
+      designClassification = designClassification,
+      missingDataAudit = missingDataAudit,
+      dofReport = dofReport,
+      falsificationChecks = falsificationChecks,
+      effectScaleFindings = effectScaleFindings,
+      unknownCoverage = unknownCoverage
+    )
 
     return SemanticValidityReport(
       designClassification = designClassification,
@@ -360,7 +613,109 @@ object SemanticValidityEngine {
       effectScaleFindings = effectScaleFindings,
       abstentionAssessment = abstention,
       ocrNoiseDetected = sanitized.ocrNoiseDetected,
-      duplicatedColumnsRemoved = sanitized.duplicatedColumnsRemoved
+      duplicatedColumnsRemoved = sanitized.duplicatedColumnsRemoved,
+      suspectedDuplications = sanitized.suspectedDuplications,
+      structuredMethodChecks = structuredMethodChecks,
+      strongConclusionsDisabledDueToUnknownCoverage = unknownCoverage
+    )
+  }
+
+  private fun buildStructuredMethodChecks(
+    designClassification: DesignClassificationResult,
+    missingDataAudit: MissingDataAuditReport,
+    dofReport: ResearcherDegreesOfFreedomReport,
+    falsificationChecks: FalsificationCheckReport,
+    effectScaleFindings: List<EffectScaleSanityFinding>,
+    unknownCoverage: Boolean
+  ): List<StructuredMethodologicalCheck> = buildList {
+    // 1. Missing-data handling (keyword screening vs substantive imputation specification)
+    val missStatus = when {
+      unknownCoverage -> MethodologicalAssessmentStatus.NOT_ASSESSABLE
+      missingDataAudit.substantiveAdequacy == "ADEQUATE" -> MethodologicalAssessmentStatus.DOCUMENTED_AND_ADEQUATE
+      missingDataAudit.substantiveAdequacy == "PARTIAL_MI_UNDERSPECIFIED" -> MethodologicalAssessmentStatus.DOCUMENTED_BUT_INADEQUATE
+      missingDataAudit.substantiveAdequacy == "INADEQUATE_COMPLETE_CASE" -> MethodologicalAssessmentStatus.POTENTIAL_RISK
+      else -> MethodologicalAssessmentStatus.NOT_REPORTED
+    }
+    add(
+      StructuredMethodologicalCheck(
+        checkId = "SMC-MISSING",
+        domain = "Missing-Data Mechanism & Imputation Specification",
+        observedEvidence = missingDataAudit.summary,
+        requiredEvidence = "Missingness rates by variable/group/outcome, auxiliary variables in imputation model, and MNAR sensitivity analysis.",
+        assessmentStatus = missStatus,
+        applicability = if (designClassification.primaryDesign == AuditSubDesign.FORMAL_THEOREM) "Not applicable to deductive proofs" else "Applicable to empirical studies with participant/record attrition",
+        confidence = if (unknownCoverage) 0.30 else if (missingDataAudit.multipleImputationUsed) 0.72 else 0.58,
+        reasonForAbstention = if (unknownCoverage) "Document coverage is UNKNOWN; missing-data tables may reside in unextracted pages." else if (missStatus == MethodologicalAssessmentStatus.NOT_REPORTED) "Imputation model cannot be reconstructed solely from manuscript wording." else null
+      )
+    )
+
+    // 2. Analyst degrees of freedom (screening signal, not definitive proof of p-hacking)
+    val dofStatus = when {
+      designClassification.primaryDesign == AuditSubDesign.FORMAL_THEOREM -> MethodologicalAssessmentStatus.NOT_APPLICABLE
+      unknownCoverage -> MethodologicalAssessmentStatus.NOT_ASSESSABLE
+      dofReport.elevatedCount >= 2 -> MethodologicalAssessmentStatus.POTENTIAL_RISK
+      dofReport.elevatedCount == 1 -> MethodologicalAssessmentStatus.POTENTIAL_RISK
+      else -> MethodologicalAssessmentStatus.DOCUMENTED_AND_ADEQUATE
+    }
+    add(
+      StructuredMethodologicalCheck(
+        checkId = "SMC-DOF",
+        domain = "Analyst Degrees of Freedom (11 Flexibility Dimensions)",
+        observedEvidence = dofReport.summary,
+        requiredEvidence = "Timestamped preregistration/SAP specifying covariate set, outlier rules, cutpoints, and primary model before unblinding.",
+        assessmentStatus = dofStatus,
+        applicability = "Applicable to confirmatory empirical analyses (screening signal only without SAP inspection)",
+        confidence = if (unknownCoverage) 0.30 else 0.62,
+        reasonForAbstention = if (unknownCoverage) "Coverage UNKNOWN; protocol/SAP references may be outside extracted text." else "Phrase-level flexibility cues are screening signals requiring protocol verification."
+      )
+    )
+
+    // 3. Negative-control & falsification checks (applicability-dependent!)
+    val falsifApplicable = falsificationChecks.applicableToDesign &&
+      designClassification.calibratedDesign !in setOf(
+        CalibratedStudyDesign.RCT,
+        CalibratedStudyDesign.FORMAL_MATHEMATICAL_PROOF,
+        CalibratedStudyDesign.ALGORITHMIC_THEORY,
+        CalibratedStudyDesign.DIAGNOSTIC_ACCURACY,
+        CalibratedStudyDesign.ML_PREDICTION_BENCHMARK,
+        CalibratedStudyDesign.DESCRIPTIVE_PANEL
+      )
+    val falsifStatus = when {
+      !falsifApplicable -> MethodologicalAssessmentStatus.NOT_APPLICABLE
+      unknownCoverage -> MethodologicalAssessmentStatus.NOT_ASSESSABLE
+      falsificationChecks.totalPresent >= 1 -> MethodologicalAssessmentStatus.DOCUMENTED_AND_ADEQUATE
+      else -> MethodologicalAssessmentStatus.NOT_REPORTED
+    }
+    add(
+      StructuredMethodologicalCheck(
+        checkId = "SMC-FALSIF",
+        domain = "Negative-Control & Falsification Checks",
+        observedEvidence = if (!falsifApplicable) "Not applicable to ${designClassification.calibratedDesign.displayName}." else falsificationChecks.summary,
+        requiredEvidence = "Pre-specified negative-control exposure/outcome, placebo date, or falsification endpoint with observed null behavior.",
+        assessmentStatus = falsifStatus,
+        applicability = if (falsifApplicable) "Applicable to observational/quasi-experimental causal inference" else "Not applicable to ${designClassification.calibratedDesign.displayName}",
+        confidence = if (!falsifApplicable) 0.90 else if (unknownCoverage) 0.30 else 0.65,
+        reasonForAbstention = if (unknownCoverage) "Coverage UNKNOWN; falsification tests may appear in omitted pages or supplement." else if (!falsifApplicable) "Design does not require observational negative controls." else null
+      )
+    )
+
+    // 4. Effect-direction & scale interpretation
+    val scaleStatus = when {
+      effectScaleFindings.isNotEmpty() -> MethodologicalAssessmentStatus.DOCUMENTED_BUT_INADEQUATE
+      unknownCoverage -> MethodologicalAssessmentStatus.NOT_ASSESSABLE
+      else -> MethodologicalAssessmentStatus.DOCUMENTED_AND_ADEQUATE
+    }
+    add(
+      StructuredMethodologicalCheck(
+        checkId = "SMC-SCALE",
+        domain = "Effect-Direction & Scale Sanity Checks",
+        observedEvidence = if (effectScaleFindings.isEmpty()) "No scale-conflation language detected in extracted text." else "${effectScaleFindings.size} scale/interpretation flag(s): ${effectScaleFindings.joinToString(", ") { it.checkCode }}",
+        requiredEvidence = "Consistent ratio vs. additive scale interpretation, baseline risk alongside RRR, and interaction p-values for subgroup claims.",
+        assessmentStatus = scaleStatus,
+        applicability = "Applicable whenever quantitative effect measures or subgroup comparisons are reported",
+        confidence = if (effectScaleFindings.isNotEmpty()) 0.78 else if (unknownCoverage) 0.35 else 0.70,
+        reasonForAbstention = if (unknownCoverage && effectScaleFindings.isEmpty()) "Coverage UNKNOWN; results text may be incomplete." else null
+      )
     )
   }
 
@@ -620,8 +975,8 @@ object SemanticValidityEngine {
     for (i in 0 until orderedFound.size - 1) {
       val fromSt = orderedFound[i]
       val toSt = orderedFound[i + 1]
-      val fromN = stages[fromSt]!!
-      val toN = stages[toSt]!!
+      val fromN = stages[fromSt] ?: continue
+      val toN = stages[toSt] ?: continue
       val lost = fromN - toN
       transitions.add(
         DenominatorTransitionEdge(
@@ -1078,9 +1433,18 @@ object SemanticValidityEngine {
       )
     }
 
+    if (coverageReport == null || coverageReport.isCoverageUnknown || extractionConfidence == DocumentCoverageReport.EXTRACTION_CONFIDENCE_UNKNOWN) {
+      reasons.add(
+        AbstentionReason(
+          "UNKNOWN_COVERAGE",
+          "Document coverage and extraction confidence are UNKNOWN; strong methodological conclusions are disabled until coverage metadata is supplied."
+        )
+      )
+    }
+
     val shouldAbstain = reasons.size >= 2 ||
-      extractionConfidence <= 2 ||
-      reasons.any { it.code in setOf("ABSTRACT_ONLY", "MISSING_TABLES", "UNREADABLE_FIGURES") }
+      extractionConfidence in 1..2 ||
+      reasons.any { it.code in setOf("ABSTRACT_ONLY", "MISSING_TABLES", "UNREADABLE_FIGURES", "UNKNOWN_COVERAGE") }
 
     val statement = if (shouldAbstain) {
       "This issue is potentially important, but the supplied evidence is insufficient to classify it definitively (${reasons.size} abstention guard(s) active)."

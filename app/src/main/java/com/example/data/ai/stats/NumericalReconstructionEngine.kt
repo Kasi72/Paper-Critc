@@ -9,6 +9,7 @@ import kotlin.math.exp
 import kotlin.math.ln
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
 /**
@@ -48,7 +49,26 @@ object NumericalReconstructionEngine {
     val arrCiUpper: Double = arr,
     val nntCrossesZero: Boolean = false,
     val hasZeroCell: Boolean = false,
-    val isDoubleZeroEvents: Boolean = false
+    val isDoubleZeroEvents: Boolean = false,
+    val nntDirection: String = when {
+      arr > 1e-6 -> "NNTB"
+      arr < -1e-6 -> "NNTH"
+      else -> "NO_DIFFERENCE"
+    },
+    val nntSignedLabel: String = when {
+      nntCrossesZero -> "ARR 95% CI spans zero (NNTB to ∞ to NNTH)"
+      nnt == null -> "No risk difference (NNT undefined)"
+      arr > 0.0 -> "NNTB = ${String.format(Locale.US, "%.1f", nnt)}"
+      else -> "NNTH = ${String.format(Locale.US, "%.1f", nnt)}"
+    },
+    val fisherWasApproximated: Boolean = false,
+    val fisherMethodLabel: String = "Exact two-sided hypergeometric Fisher"
+  )
+
+  data class FisherPResult(
+    val pValue: Double,
+    val isExact: Boolean,
+    val methodLabel: String
   )
 
   data class MetaAnalysisExactSummary(
@@ -73,7 +93,11 @@ object NumericalReconstructionEngine {
     val predictionIntervalUpper: Double?,
     val mostInfluentialStudy: String?,
     val maxLooShift: Double,
-    val looCrossesNull: Boolean
+    val looCrossesNull: Boolean,
+    val randomEffectPM: Double = randomEffectDL,
+    val randomSePM: Double = randomSeDL,
+    val randomLowerPM: Double = randomLowerDL,
+    val randomUpperPM: Double = randomUpperDL
   )
 
   data class SmdExactMetrics(
@@ -130,11 +154,11 @@ object NumericalReconstructionEngine {
         reconstructRegressionClaim(nextId(), claim)?.let { results.add(it) }
       }
 
-    // 5. Ratio / Survival HR & OR/RR CI log-symmetry & implied SE consistency
+    // 5. Ratio / Survival HR & OR/RR/PR CI log-symmetry & implied SE consistency
     activeClaims.filter {
       it.pointEstimate != null && it.ciLower != null && it.ciUpper != null &&
         it.parseStatus != ClaimParseStatus.AMBIGUOUS &&
-        it.effectMeasure.uppercase(Locale.US) in setOf("OR", "AOR", "RR", "ARR", "HR", "AHR", "IRR")
+        it.effectMeasure.uppercase(Locale.US) in setOf("OR", "AOR", "RR", "ARR", "HR", "AHR", "IRR", "PR")
     }.take(14).forEach { claim ->
       reconstructRatioOrSurvivalCi(nextId(), claim)?.let { results.add(it) }
     }
@@ -265,6 +289,17 @@ object NumericalReconstructionEngine {
     val arrHi = arr + z * seArr
     val nntCrossesZero = (arrLo < 0.0 && arrHi > 0.0)
     val nnt = if (abs(arr) > 1e-6) 1.0 / abs(arr) else null
+    val nntDirection = when {
+      arr > 1e-6 -> "NNTB"
+      arr < -1e-6 -> "NNTH"
+      else -> "NO_DIFFERENCE"
+    }
+    val nntSignedLabel = when {
+      nntCrossesZero -> "ARR 95% CI spans zero (NNTB to ∞ to NNTH)"
+      nnt == null -> "No risk difference (NNT undefined)"
+      arr > 0.0 -> "NNTB = ${formatNum(nnt)}"
+      else -> "NNTH = ${formatNum(nnt)}"
+    }
     val isDoubleZero = (a == 0 && c == 0)
 
     val total = (n1 + n2).toDouble()
@@ -277,7 +312,7 @@ object NumericalReconstructionEngine {
       total * num * num / (n1.toDouble() * n2.toDouble() * (a + c).toDouble() * (b + d).toDouble())
     } else 0.0
     val chiP = QuantitativeForensicAnalyzer.chiSquareUpperTailP(chiSq, 1.0)
-    val fisherP = exactFisherTwoSidedP(a, b, c, d)
+    val fisherResult = computeFisherTwoSidedPWithMethod(a, b, c, d)
 
     return TwoByTwoExactMetrics(
       or = or,
@@ -290,31 +325,47 @@ object NumericalReconstructionEngine {
       nnt = nnt,
       chiSquare = chiSq,
       chiSquareP = chiP,
-      fisherExactTwoSidedP = fisherP,
+      fisherExactTwoSidedP = fisherResult.pValue,
       arrCiLower = arrLo,
       arrCiUpper = arrHi,
       nntCrossesZero = nntCrossesZero,
       hasZeroCell = hasZero,
-      isDoubleZeroEvents = isDoubleZero
+      isDoubleZeroEvents = isDoubleZero,
+      nntDirection = nntDirection,
+      nntSignedLabel = nntSignedLabel,
+      fisherWasApproximated = !fisherResult.isExact,
+      fisherMethodLabel = fisherResult.methodLabel
     )
   }
 
   /**
-   * Exact two-sided Fisher's exact test p-value via log-factorial hypergeometric probabilities.
+   * Computes a two-sided Fisher's exact test p-value via log-factorial hypergeometric probabilities,
+   * explicitly recording whether the exact hypergeometric sum was used or whether an asymptotic
+   * Pearson chi-square approximation was substituted because the feasible table range exceeded 50,000.
    */
-  fun exactFisherTwoSidedP(a: Int, b: Int, c: Int, d: Int): Double {
+  fun computeFisherTwoSidedPWithMethod(a: Int, b: Int, c: Int, d: Int): FisherPResult {
     val n1 = a + b
     val n2 = c + d
     val m1 = a + c
     val total = n1 + n2
-    if (total <= 0) return 1.0
+    if (total <= 0) {
+      return FisherPResult(1.0, isExact = true, methodLabel = "Exact two-sided hypergeometric Fisher")
+    }
     val minA = max(0, m1 - n2)
     val maxA = min(n1, m1)
     if (maxA - minA > 50_000) {
-      // Fallback to chi-square for huge N where exact summation is unnecessary and asymptotic is exact
       val num = (a.toDouble() * d.toDouble() - b.toDouble() * c.toDouble())
       val denom = n1.toDouble() * n2.toDouble() * m1.toDouble() * (b + d).toDouble()
-      return if (denom > 0.0) QuantitativeForensicAnalyzer.chiSquareUpperTailP(total * num * num / denom, 1.0) else 1.0
+      val approxP = if (denom > 0.0) {
+        QuantitativeForensicAnalyzer.chiSquareUpperTailP(total * num * num / denom, 1.0)
+      } else {
+        1.0
+      }
+      return FisherPResult(
+        pValue = approxP.coerceIn(0.0, 1.0),
+        isExact = false,
+        methodLabel = "Asymptotic Pearson chi-square approximation (feasible hypergeometric range ${maxA - minA} > 50,000; not exact Fisher)"
+      )
     }
     val logDenom = logChoose(total, m1)
     fun prob(x: Int): Double {
@@ -327,8 +378,19 @@ object NumericalReconstructionEngine {
       val px = prob(x)
       if (px <= pObs + 1e-12) pSum += px
     }
-    return pSum.coerceIn(0.0, 1.0)
+    return FisherPResult(
+      pValue = pSum.coerceIn(0.0, 1.0),
+      isExact = true,
+      methodLabel = "Exact two-sided hypergeometric Fisher"
+    )
   }
+
+  /**
+   * Two-sided Fisher's exact test p-value (exact hypergeometric sum up to feasible range 50,000;
+   * see [computeFisherTwoSidedPWithMethod] for explicit exact-vs-asymptotic provenance).
+   */
+  fun exactFisherTwoSidedP(a: Int, b: Int, c: Int, d: Int): Double =
+    computeFisherTwoSidedPWithMethod(a, b, c, d).pValue
 
   private fun reconstructTwoByTwoTable(
     tbl: TwoByTwoTableClaim,
@@ -375,13 +437,17 @@ object NumericalReconstructionEngine {
     }
 
     val orContract = CalculatorAssumptionContract(
-      calculatorScope = "2x2 Odds Ratio & Exact Fisher",
-      assumptionsSatisfied = listOf("Complete 2x2 counts ($cellSummary)", "Two-sided hypergeometric Fisher p-value"),
+      calculatorScope = "2x2 Odds Ratio & ${if (calc.fisherWasApproximated) "Asymptotic Chi-Square" else "Exact Fisher"}",
+      assumptionsSatisfied = listOf("Complete 2x2 counts ($cellSummary)", calc.fisherMethodLabel),
       assumptionsUnknown = listOf("Whether study is cohort/RCT vs case-control", "Whether reported OR was covariate-adjusted or Firth-penalized", "Whether observations are clustered"),
       alternativeValidInterpretations = buildList {
         add("Reversed reference arm yields reciprocal 1/OR=${formatNum(1.0 / calc.or)}")
         if (calc.hasZeroCell) add("Exact conditional MLE / Peto OR / Firth penalized logistic regression differ from Haldane +0.5")
-        add("Fisher's exact test conditions on both margins; mid-p or Barnard/Boschloo exact tests are valid alternatives")
+        if (calc.fisherWasApproximated) {
+          add("Asymptotic Pearson chi-square approximation used because feasible hypergeometric range exceeded 50,000")
+        } else {
+          add("Fisher's exact test conditions on both margins; mid-p or Barnard/Boschloo exact tests are valid alternatives")
+        }
       }
     )
 
@@ -492,14 +558,14 @@ object NumericalReconstructionEngine {
         else -> StatisticalFindingType.PASS
       }
       val nntStr = if (calc.nntCrossesZero) {
-        "ARR=${formatNum(calc.arr * 100)}% (95% CI ${formatNum(calc.arrCiLower * 100)}% to ${formatNum(calc.arrCiUpper * 100)}%), NNT crosses ∞ (NNTB to ∞ to NNTH)"
+        "ARR=${formatNum(calc.arr * 100)}% (95% CI ${formatNum(calc.arrCiLower * 100)}% to ${formatNum(calc.arrCiUpper * 100)}%), ${calc.nntSignedLabel}"
       } else {
-        "ARR=${formatNum(abs(calc.arr) * 100)}%, NNT=${formatNum(calc.nnt)}"
+        "ARR=${formatNum(calc.arr * 100)}%, ${calc.nntSignedLabel}"
       }
       out.add(
         NumericalReconstructionResult(
           checkId = nextId(),
-          calculatorName = "2x2 Clinical Magnitude (ARR/NNT)",
+          calculatorName = "2x2 Clinical Magnitude (ARR / NNTB-NNTH)",
           reportedValue = "NNT=${formatNum(tbl.reportedNnt)}",
           recomputedValue = nntStr,
           tolerance = "±12% (rounding of ARR)",
@@ -511,14 +577,15 @@ object NumericalReconstructionEngine {
           findingType = fType,
           isScreeningSignal = calc.nntCrossesZero,
           scientificConsequence = when {
-            fail -> "Clinical benefit magnitude (NNT) is miscalculated from reported arm risks."
+            fail -> "Clinical effect magnitude (${calc.nntDirection}) disagrees with reported arm risks."
             calc.nntCrossesZero -> "ARR 95% CI spans zero, so NNT CI is discontinuous across infinity (NNTB to ∞ to NNTH) and should be reported alongside ARR CI."
-            else -> "NNT matches 1/|ARR|."
+            calc.nntDirection == "NNTH" -> "Signed risk difference indicates harm (NNTH=${formatNum(calc.nnt)}); confirm benefit-vs-harm arm orientation."
+            else -> "${calc.nntSignedLabel} matches 1/|ARR|."
           },
           detail = when {
-            fail -> "1/|ARR| = 1/${formatNum(abs(calc.arr))} = ${formatNum(calc.nnt)}, conflicting with reported NNT=${formatNum(tbl.reportedNnt)}."
-            calc.nntCrossesZero -> "Point NNT≈${formatNum(calc.nnt)}, but ARR 95% CI (${formatNum(calc.arrCiLower * 100)}% to ${formatNum(calc.arrCiUpper * 100)}%) crosses zero (NNTB to ∞ to NNTH)."
-            else -> "Reported NNT=${formatNum(tbl.reportedNnt)} aligns with exact 1/|ARR|=${formatNum(calc.nnt)}."
+            fail -> "Signed ARR=${formatNum(calc.arr * 100)}% implies ${calc.nntSignedLabel}, conflicting with reported NNT=${formatNum(tbl.reportedNnt)}."
+            calc.nntCrossesZero -> "Point ${calc.nntDirection}≈${formatNum(calc.nnt)}, but ARR 95% CI (${formatNum(calc.arrCiLower * 100)}% to ${formatNum(calc.arrCiUpper * 100)}%) crosses zero (NNTB to ∞ to NNTH)."
+            else -> "Reported NNT=${formatNum(tbl.reportedNnt)} aligns with ${calc.nntSignedLabel} (signed ARR=${formatNum(calc.arr * 100)}%)."
           },
           assumptionContract = rrContract
         )
@@ -530,7 +597,7 @@ object NumericalReconstructionEngine {
       val pConflict = tbl.reportedP != null &&
         ((tbl.reportedP < 0.05 && calc.chiSquareP > 0.08 && calc.fisherExactTwoSidedP > 0.08) ||
           (tbl.reportedP >= 0.05 && calc.chiSquareP < 0.025 && calc.fisherExactTwoSidedP < 0.025))
-      val nntSuffix = if (calc.nntCrossesZero) ", NNT crosses ∞ (NNTB..∞..NNTH)" else calc.nnt?.let { ", NNT=${formatNum(it)}" }.orEmpty()
+      val nntSuffix = ", ${calc.nntSignedLabel}"
       out.add(
         NumericalReconstructionResult(
           checkId = nextId(),
@@ -798,12 +865,12 @@ object NumericalReconstructionEngine {
     val hi = claim.ciUpper ?: return null
     val label = claim.effectMeasure.uppercase(Locale.US)
 
-    if (!est.isFinite() || !lo.isFinite() || !hi.isFinite() || est <= 0.0 || lo <= 0.0 || hi <= 0.0) {
+    if (!est.isFinite() || !lo.isFinite() || !hi.isFinite() || est <= 0.0 || lo < 0.0 || hi <= 0.0) {
       return NumericalReconstructionResult(
         checkId = checkId,
         calculatorName = "Ratio / Survival CI Domain ($label)",
         reportedValue = claim.sourceQuote,
-        recomputedValue = "Positive finite ratio required (> 0)",
+        recomputedValue = "Positive finite ratio required (est > 0, bounds >= 0)",
         tolerance = "Strict positivity & finiteness",
         sourceEvidence = claim.sourceQuote,
         pageNumber = claim.page,
@@ -846,6 +913,35 @@ object NumericalReconstructionEngine {
       )
     }
 
+    // Valid point estimate with a zero lower bound (e.g., PR = 2.21, 95% CI 0.00 to 4.50)
+    // reflects high variance / linear-scale truncation or sparse events — NOT an arithmetic error.
+    if (lo == 0.0) {
+      return NumericalReconstructionResult(
+        checkId = checkId,
+        calculatorName = "Ratio / Interval Precision ($label)",
+        reportedValue = "$label=$est [$lo, $hi]",
+        recomputedValue = "Wide interval spanning 0.00 to $hi (contains point estimate $est)",
+        tolerance = "Precision & variance diagnostic",
+        sourceEvidence = claim.sourceQuote,
+        pageNumber = claim.page,
+        section = claim.section,
+        assumptions = listOf(
+          "Valid confidence interval containing the positive point estimate; lower bound at 0.00 can arise from linear-scale truncation, random-effects heterogeneity, or sparse data."
+        ),
+        status = QuantFindingStatus.WARN,
+        findingType = StatisticalFindingType.IMPRECISION_OR_HIGH_VARIANCE,
+        isScreeningSignal = true,
+        scientificConsequence = "Wide interval spanning zero indicates high imprecision or heterogeneity rather than a confirmed arithmetic error.",
+        detail = "$label=$est (95% CI $lo to $hi) is geometrically valid (est lies inside bounds) but exhibits extreme imprecision/high variance. Report prediction intervals, influence diagnostics, leave-one-out analysis, and sensitivity analyses under prespecified outlier rules.",
+        assumptionContract = CalculatorAssumptionContract(
+          calculatorScope = "Wide / zero-truncated CI precision diagnostic ($label)",
+          assumptionsSatisfied = listOf("Point estimate $est lies within [$lo, $hi]"),
+          assumptionsUnknown = listOf("Whether CI was truncated at zero on linear scale or driven by between-study heterogeneity"),
+          alternativeValidInterpretations = listOf("Linear-scale random-effects pooling or Hartung-Knapp intervals under high I² can legitimately touch 0.00")
+        )
+      )
+    }
+
     val lnEst = ln(est)
     val lnLo = ln(lo)
     val lnHi = ln(hi)
@@ -870,28 +966,79 @@ object NumericalReconstructionEngine {
       )
     )
 
-    // Check p-value vs CI null-crossing contradiction
+    // Assumption-aware CI-vs-p consistency check (P0-07):
+    // Respects the actual confidence level (e.g., 90% CI -> α=0.10, 95% CI -> α=0.05, 99% CI -> α=0.01),
+    // multiplicity-adjusted p-values (Bonferroni/Holm/FDR/q-value), and one-sided tests.
+    val alphaLevel = (1.0 - claim.ciLevel).coerceIn(0.001, 0.25)
+    val ciPctLabel = "${(claim.ciLevel * 100.0).roundToInt()}%"
+    val quoteLower = claim.sourceQuote.lowercase(Locale.US)
+    val isAdjustedP = Regex(
+      """\b(?:adjusted\s+p|p[\s_-]?adj|bonferroni|holm|hochberg|benjamini|fdr|q[\s-]?value|multiplicity[- ]adjusted|corrected\s+p)\b""",
+      RegexOption.IGNORE_CASE
+    ).containsMatchIn(quoteLower)
+    val isOneSided = Regex(
+      """\b(?:one[- ]sided|one[- ]tailed|1[- ]sided|1[- ]tailed)\b""",
+      RegexOption.IGNORE_CASE
+    ).containsMatchIn(quoteLower)
     val ciExcludesNull = lo > 1.005 || hi < 0.995
     val ciIncludesNull = lo < 0.99 && hi > 1.01
     val repP = claim.pValue
-    val pContradictsCi = repP != null && claim.pValueOperator == "=" &&
-      ((ciExcludesNull && repP > 0.06) || (ciIncludesNull && repP < 0.04))
+    val upperAlphaMargin = alphaLevel * 1.25
+    val lowerAlphaMargin = alphaLevel * 0.75
+    val rawPDisagreesWithCi = repP != null && claim.pValueOperator == "=" &&
+      ((ciExcludesNull && repP > upperAlphaMargin) || (ciIncludesNull && repP < lowerAlphaMargin))
+    val pContradictsCi = rawPDisagreesWithCi && !isAdjustedP && !isOneSided
+    val pRequiresProcedureVerification = rawPDisagreesWithCi && (isAdjustedP || isOneSided)
 
     return when {
-      pContradictsCi -> NumericalReconstructionResult(
+      pContradictsCi && repP != null -> NumericalReconstructionResult(
         checkId = checkId,
         calculatorName = "Ratio / Survival CI-vs-p ($label)",
-        reportedValue = "${claim.sourceQuote}, p=${formatP(repP!!)}",
-        recomputedValue = "Implied Wald SE(ln)=${formatNum(impliedSe)}, p≈${formatP(impliedP)}",
-        tolerance = "CI null-crossing vs α=0.05",
+        reportedValue = "${claim.sourceQuote}, p=${formatP(repP)}",
+        recomputedValue = "Implied Wald SE(ln)=${formatNum(impliedSe)}, p≈${formatP(impliedP)} ($ciPctLabel CI -> α=${formatNum(alphaLevel)})",
+        tolerance = "$ciPctLabel CI null-crossing vs two-sided α=${formatNum(alphaLevel)}",
         sourceEvidence = claim.sourceQuote,
         pageNumber = claim.page,
         section = claim.section,
-        assumptions = listOf("95% CI exclusion of 1.0 corresponds to two-sided Wald p < 0.05."),
+        assumptions = listOf("$ciPctLabel CI exclusion of 1.0 corresponds to two-sided unadjusted Wald p < ${formatNum(alphaLevel)}."),
         status = QuantFindingStatus.FAIL,
         findingType = StatisticalFindingType.INTERNAL_CONTRADICTION,
-        scientificConsequence = "Confidence interval and p-value give contradictory statistical significance conclusions.",
-        detail = "$label=$est ($lo–$hi) ${if (ciExcludesNull) "excludes" else "crosses"} 1.0, contradicting reported p=${formatP(repP)} (implied Wald p≈${formatP(impliedP)}).",
+        scientificConsequence = "Confidence interval and p-value give contradictory statistical significance conclusions under unadjusted two-sided testing at α=${formatNum(alphaLevel)}.",
+        detail = "$label=$est ($ciPctLabel CI $lo–$hi) ${if (ciExcludesNull) "excludes" else "crosses"} 1.0, contradicting reported p=${formatP(repP)} relative to α=${formatNum(alphaLevel)} (implied Wald p≈${formatP(impliedP)}). Verify whether p-value was multiplicity-adjusted or computed from a different test.",
+        assumptionContract = ratioContract
+      )
+      pRequiresProcedureVerification && repP != null -> NumericalReconstructionResult(
+        checkId = checkId,
+        calculatorName = "Ratio / Survival CI-vs-p ($label • Adjusted/One-Sided Guard)",
+        reportedValue = "${claim.sourceQuote}, p=${formatP(repP)}",
+        recomputedValue = "Implied unadjusted two-sided Wald p≈${formatP(impliedP)} ($ciPctLabel CI -> α=${formatNum(alphaLevel)})",
+        tolerance = "Adjusted / one-sided testing procedure verification",
+        sourceEvidence = claim.sourceQuote,
+        pageNumber = claim.page,
+        section = claim.section,
+        assumptions = listOf("Multiplicity-adjusted or one-sided p-values can legitimately differ from an unadjusted two-sided $ciPctLabel CI."),
+        status = QuantFindingStatus.WARN,
+        findingType = StatisticalFindingType.ASSUMPTION_UNCHECKED,
+        isScreeningSignal = true,
+        scientificConsequence = "Requires verification of whether the CI and p-value use matching adjustment/sidedness rather than indicating a confirmed contradiction.",
+        detail = "$label=$est ($ciPctLabel CI $lo–$hi) differs from reported p=${formatP(repP)}, but context indicates ${if (isAdjustedP) "multiplicity-adjusted p-values" else "one-sided testing"}; verify CI/p procedure alignment.",
+        assumptionContract = ratioContract
+      )
+      (hi / lo >= 10.0) || (hi / est >= 2.0 && (hi - lo) >= 2.0) -> NumericalReconstructionResult(
+        checkId = checkId,
+        calculatorName = "Ratio / Interval Precision ($label)",
+        reportedValue = "$label=$est [$lo, $hi]",
+        recomputedValue = "Implied SE(ln)=${formatNum(impliedSe)}, width ratio=${formatNum(hi / lo)}x",
+        tolerance = "Precision & variance diagnostic",
+        sourceEvidence = claim.sourceQuote,
+        pageNumber = claim.page,
+        section = claim.section,
+        assumptions = listOf("Point estimate lies inside its confidence interval; wide bounds reflect imprecision or high heterogeneity rather than an arithmetic defect."),
+        status = QuantFindingStatus.WARN,
+        findingType = StatisticalFindingType.IMPRECISION_OR_HIGH_VARIANCE,
+        isScreeningSignal = true,
+        scientificConsequence = "Wide interval reflects substantial uncertainty or between-study variance.",
+        detail = "$label=$est ($lo–$hi) is geometrically valid but highly imprecise (width ratio ${formatNum(hi / lo)}x). Report prediction intervals, influence diagnostics, leave-one-out analysis, and sensitivity analyses under prespecified outlier rules.",
         assumptionContract = ratioContract
       )
       relAsym > 0.30 && logHalf > 0.08 -> NumericalReconstructionResult(
@@ -982,47 +1129,70 @@ object NumericalReconstructionEngine {
     val cDenom = sumW - (wFE.sumOf { it * it } / sumW)
     val tau2DL = if (cDenom > 0.0) max(0.0, (q - df) / cDenom) else 0.0
 
-    // Paule-Mandel iterative τ² (solves Q_gen(τ²) = k - 1)
-    val tau2PM = solvePauleMandelTau2(y, v, tau2DL)
+    // DerSimonian-Laird pooled random-effects estimate (strictly using tau2DL)
+    val wDL = v.map { 1.0 / (it + tau2DL) }
+    val sumWDL = wDL.sum()
+    val muDL = y.indices.sumOf { wDL[it] * y[it] } / sumWDL
+    val seDL = sqrt(1.0 / sumWDL)
 
-    // Random-Effects (using Paule-Mandel if converged, else DL; both reported)
+    // Paule-Mandel iterative τ² (solves Q_gen(τ²) = k - 1) and pooled random-effects estimate
+    val tau2PM = solvePauleMandelTau2(y, v, tau2DL)
     val tau2Use = tau2PM
     val wRE = v.map { 1.0 / (it + tau2Use) }
     val sumWRE = wRE.sum()
-    val muRE = y.indices.sumOf { wRE[it] * y[it] } / sumWRE
-    val seRE = sqrt(1.0 / sumWRE)
+    val muPM = y.indices.sumOf { wRE[it] * y[it] } / sumWRE
+    val sePM = sqrt(1.0 / sumWRE)
 
-    // Hartung-Knapp-Sidik-Jonkman (HKSJ) t-CI
-    val qHksj = y.indices.sumOf { wRE[it] * (y[it] - muRE) * (y[it] - muRE) } / df.toDouble()
+    // Hartung-Knapp-Sidik-Jonkman (HKSJ) t-CI (using Paule-Mandel τ²)
+    val qHksj = y.indices.sumOf { wRE[it] * (y[it] - muPM) * (y[it] - muPM) } / df.toDouble()
     val seHK = sqrt(max(1.0, qHksj) / sumWRE)
     val tCritHK = studentTQuantile(0.975, df.toDouble())
-    val hkLo = muRE - tCritHK * seHK
-    val hkHi = muRE + tCritHK * seHK
+    val hkLo = muPM - tCritHK * seHK
+    val hkHi = muPM + tCritHK * seHK
 
     // 95% Prediction Interval (requires k >= 3, df = k - 2)
     val (piLo, piHi) = if (k >= 3) {
       val tCritPI = studentTQuantile(0.975, (k - 2).toDouble())
-      val halfPI = tCritPI * sqrt(tau2Use + seRE * seRE)
-      (muRE - halfPI) to (muRE + halfPI)
+      val halfPI = tCritPI * sqrt(tau2Use + sePM * sePM)
+      (muPM - halfPI) to (muPM + halfPI)
     } else null to null
 
-    // Leave-One-Out (LOO) Influence Diagnostics
+    // Leave-One-Out (LOO) Influence Diagnostics (P1-09):
+    // Re-estimates τ²_PM for every omitted study AND evaluates significance with the same HKSJ
+    // confidence-interval method as the full meta-analysis (consistent inference).
     var maxShift = 0.0
     var dominantStudy: String? = null
     var crossesNull = false
     if (k >= 3) {
       val baseSignificant = (hkLo > 0.0 && hkHi > 0.0) || (hkLo < 0.0 && hkHi < 0.0)
       for (dropIdx in studies.indices) {
-        val sub = studies.filterIndexed { i, _ -> i != dropIdx }
-        val wSub = sub.map { 1.0 / (it.standardError * it.standardError + tau2Use) }
-        val muSub = sub.indices.sumOf { wSub[it] * sub[it].effect } / wSub.sum()
-        val seSub = sqrt(1.0 / wSub.sum())
-        val shift = abs(muSub - muRE)
+        val ySub = y.filterIndexed { i, _ -> i != dropIdx }
+        val vSub = v.filterIndexed { i, _ -> i != dropIdx }
+        val kSub = ySub.size
+        val dfSub = kSub - 1
+        val wFeSub = vSub.map { 1.0 / it }
+        val sumWFeSub = wFeSub.sum()
+        val muFeSub = ySub.indices.sumOf { wFeSub[it] * ySub[it] } / sumWFeSub
+        val qSub = ySub.indices.sumOf { wFeSub[it] * (ySub[it] - muFeSub) * (ySub[it] - muFeSub) }
+        val cSub = sumWFeSub - (wFeSub.sumOf { it * it } / sumWFeSub)
+        val tau2DlSub = if (cSub > 0.0) max(0.0, (qSub - dfSub) / cSub) else 0.0
+        val tau2PmSub = solvePauleMandelTau2(ySub, vSub, tau2DlSub)
+
+        val wSub = vSub.map { 1.0 / (it + tau2PmSub) }
+        val sumWSub = wSub.sum()
+        val muSub = ySub.indices.sumOf { wSub[it] * ySub[it] } / sumWSub
+        val qHksjSub = ySub.indices.sumOf { wSub[it] * (ySub[it] - muSub) * (ySub[it] - muSub) } / dfSub.toDouble()
+        val seHkSub = sqrt(max(1.0, qHksjSub) / sumWSub)
+        val tCritSub = studentTQuantile(0.975, dfSub.toDouble())
+        val hkSubLo = muSub - tCritSub * seHkSub
+        val hkSubHi = muSub + tCritSub * seHkSub
+
+        val shift = abs(muSub - muPM)
         if (shift > maxShift) {
           maxShift = shift
           dominantStudy = studies[dropIdx].studyLabel
         }
-        val subSig = (muSub - z95 * seSub > 0.0) || (muSub + z95 * seSub < 0.0)
+        val subSig = (hkSubLo > 0.0 && hkSubHi > 0.0) || (hkSubLo < 0.0 && hkSubHi < 0.0)
         if (baseSignificant && !subSig) crossesNull = true
       }
     }
@@ -1039,17 +1209,21 @@ object NumericalReconstructionEngine {
       iSquaredPct = i2,
       tauSquaredDL = tau2DL,
       tauSquaredPM = tau2PM,
-      randomEffectDL = muRE,
-      randomSeDL = seRE,
-      randomLowerDL = muRE - z95 * seRE,
-      randomUpperDL = muRE + z95 * seRE,
+      randomEffectDL = muDL,
+      randomSeDL = seDL,
+      randomLowerDL = muDL - z95 * seDL,
+      randomUpperDL = muDL + z95 * seDL,
       hartungKnappLower = hkLo,
       hartungKnappUpper = hkHi,
       predictionIntervalLower = piLo,
       predictionIntervalUpper = piHi,
       mostInfluentialStudy = dominantStudy,
       maxLooShift = maxShift,
-      looCrossesNull = crossesNull
+      looCrossesNull = crossesNull,
+      randomEffectPM = muPM,
+      randomSePM = sePM,
+      randomLowerPM = muPM - z95 * sePM,
+      randomUpperPM = muPM + z95 * sePM
     )
   }
 
@@ -1122,7 +1296,7 @@ object NumericalReconstructionEngine {
         checkId = nextId(),
         calculatorName = "Meta-Analysis Pooling (IVW/PM/HKSJ/PI)",
         reportedValue = "k=${summary.k} study effects extracted",
-        recomputedValue = "RE=${fmtEst(summary.randomEffectDL)} (HKSJ ${fmtEst(summary.hartungKnappLower)}–${fmtEst(summary.hartungKnappUpper)}), I²=${formatNum(summary.iSquaredPct)}%, τ²_PM=${formatNum(summary.tauSquaredPM)}, 95% PI $piStr",
+        recomputedValue = "RE(PM)=${fmtEst(summary.randomEffectPM)} (HKSJ ${fmtEst(summary.hartungKnappLower)}–${fmtEst(summary.hartungKnappUpper)}), RE(DL)=${fmtEst(summary.randomEffectDL)}, I²=${formatNum(summary.iSquaredPct)}%, τ²_PM=${formatNum(summary.tauSquaredPM)}, 95% PI $piStr",
         tolerance = "Exact Q / Paule-Mandel τ² / HKSJ",
         sourceEvidence = studies.take(4).joinToString("; ") { it.studyLabel },
         pageNumber = studies.first().page,
@@ -1167,18 +1341,18 @@ object NumericalReconstructionEngine {
         NumericalReconstructionResult(
           checkId = nextId(),
           calculatorName = "Meta-Analysis Leave-One-Out Influence",
-          reportedValue = "Pooled effect=${fmtEst(summary.randomEffectDL)}",
-          recomputedValue = "Dropping '${summary.mostInfluentialStudy}' shifts estimate by ${formatNum(summary.maxLooShift)} & crosses null",
-          tolerance = "LOO significance stability",
+          reportedValue = "Pooled RE(PM)=${fmtEst(summary.randomEffectPM)}",
+          recomputedValue = "Dropping '${summary.mostInfluentialStudy}' shifts estimate by ${formatNum(summary.maxLooShift)} & crosses null (re-estimated τ²_PM + HKSJ)",
+          tolerance = "LOO significance stability (re-estimated τ²_PM + HKSJ)",
           sourceEvidence = "Most influential study: ${summary.mostInfluentialStudy}",
           pageNumber = studies.first().page,
           section = "Results",
-          assumptions = listOf("Leave-one-out random-effects sensitivity at fixed τ²_PM."),
+          assumptions = listOf("Leave-one-out random-effects sensitivity re-estimating Paule-Mandel τ² and HKSJ CI for each omitted study."),
           status = QuantFindingStatus.WARN,
           findingType = StatisticalFindingType.POSSIBLE_BIAS,
           isScreeningSignal = true,
           scientificConsequence = "Pooled significance depends on a single influential study ('${summary.mostInfluentialStudy}').",
-          detail = "Leave-one-out sensitivity shows omitting '${summary.mostInfluentialStudy}' renders the pooled effect non-significant.",
+          detail = "Leave-one-out sensitivity (with re-estimated τ²_PM and HKSJ intervals) shows omitting '${summary.mostInfluentialStudy}' renders the pooled effect non-significant.",
           assumptionContract = metaContract
         )
       )

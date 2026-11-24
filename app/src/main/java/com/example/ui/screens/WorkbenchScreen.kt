@@ -157,12 +157,22 @@ fun WorkbenchScreen(
   val resolvedPreFlight = preFlight ?: remember(
     formState.manuscriptText,
     formState.options.isEmpirical,
-    formState.replicationCodeText
+    formState.replicationCodeText,
+    formState.coverageReport
   ) {
+    val resolvedCov = formState.coverageReport ?: if (formState.manuscriptText.isNotBlank()) {
+      com.example.util.DocumentCoverageReport.forCompleteText(
+        text = formState.manuscriptText,
+        engine = "Direct Text Editor"
+      )
+    } else {
+      com.example.util.DocumentCoverageReport.unknown("Empty manuscript editor")
+    }
     ManuscriptForensicEngine.analyzeManuscript(
       text = formState.manuscriptText,
       isEmpiricalTrack = formState.options.isEmpirical,
-      replicationCode = formState.replicationCodeText
+      replicationCode = formState.replicationCodeText,
+      coverageReport = resolvedCov
     )
   }
 

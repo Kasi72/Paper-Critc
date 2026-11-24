@@ -2,8 +2,8 @@ package com.example.data.ai
 
 import com.example.data.model.AiApiProviderEntry
 import com.example.data.model.ApiProtocolType
-import java.io.BufferedReader
-import java.io.InputStreamReader
+import java.io.ByteArrayOutputStream
+import java.io.InputStream
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.InetAddress
@@ -14,12 +14,15 @@ import java.net.URL
 import java.util.Locale
 import javax.net.ssl.HttpsURLConnection
 import javax.net.ssl.SSLSocketFactory
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 
 object ExternalApiGatewayClient {
+
+  private const val MAX_HTTP_RESPONSE_BYTES = 4_000_000
 
   internal data class ValidatedEndpoint(
     val url: URL,
@@ -220,9 +223,9 @@ object ExternalApiGatewayClient {
 
   suspend fun testProviderConnection(provider: AiApiProviderEntry): Result<String> =
     withContext(Dispatchers.IO) {
-      runCatching {
+      try {
         if (provider.protocolType == ApiProtocolType.FIREBASE_AI_LOGIC_KEYLESS) {
-          return@runCatching "Built-in Firebase AI Logic (App Check Attested) is active and ready. Zero API key needed."
+          return@withContext Result.success("Built-in Firebase AI Logic (App Check Attested) is active and ready. Zero API key needed.")
         }
         validateAndPinEndpoint(provider.baseUrl, resolveDns = true)
         val key = provider.apiKey.trim()
@@ -237,7 +240,11 @@ object ExternalApiGatewayClient {
           expectJsonObject = false
         )
         val elapsedMs = System.currentTimeMillis() - startMs
-        "Connected (${elapsedMs}ms) • ${provider.modelId}: ${reply.take(120)}"
+        Result.success("Connected (${elapsedMs}ms) • ${provider.modelId}: ${reply.take(120)}")
+      } catch (e: CancellationException) {
+        throw e
+      } catch (e: Throwable) {
+        Result.failure(e)
       }
     }
 
@@ -453,9 +460,7 @@ object ExternalApiGatewayClient {
       } else {
         connection.errorStream ?: connection.inputStream
       }
-      val body = stream?.let {
-        BufferedReader(InputStreamReader(it, Charsets.UTF_8)).use { reader -> reader.readText() }
-      }.orEmpty()
+      val body = stream?.use { readStreamBoundedUtf8(it, MAX_HTTP_RESPONSE_BYTES) }.orEmpty()
       if (statusCode !in 200..299) {
         throw IllegalStateException("HTTP $statusCode from API provider: ${body.take(260)}")
       }
@@ -463,6 +468,19 @@ object ExternalApiGatewayClient {
     } finally {
       connection.disconnect()
     }
+  }
+
+  private fun readStreamBoundedUtf8(input: InputStream, maxBytes: Int): String {
+    val out = ByteArrayOutputStream()
+    val buffer = ByteArray(8192)
+    var remaining = maxBytes
+    while (remaining > 0) {
+      val read = input.read(buffer, 0, minOf(buffer.size, remaining))
+      if (read <= 0) break
+      out.write(buffer, 0, read)
+      remaining -= read
+    }
+    return out.toByteArray().toString(Charsets.UTF_8)
   }
 
   fun extractCleanJsonObject(rawText: String): String {

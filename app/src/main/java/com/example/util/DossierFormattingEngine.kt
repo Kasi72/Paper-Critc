@@ -202,6 +202,163 @@ object DossierFormattingEngine {
     return text.replace(Regex("""\n{3,}"""), "\n\n").trim()
   }
 
+  private enum class InternalHeaderType(val defaultTag: String) {
+    STAGE("STAGE"),
+    AUDIT("AUDIT"),
+    IDENTITY("IDENTITY"),
+    CLAIM_HIERARCHY("CLAIMS"),
+    PRACTICAL_SIGNIFICANCE("SIGNIFICANCE"),
+    FRAGILITY("FRAGILITY"),
+    UNCERTAINTY("UNCERTAINTY"),
+    UNSUPPORTED_EVIDENCE("EVIDENCE GAP"),
+    PHASE_REPORT("PHASE 8"),
+    UNKNOWN("REPORT")
+  }
+
+  private val wholeLineBracketHeaderRegex = Regex("""^\s*\[([^\[\]\n]{4,160})\]\s*$""")
+  private val findingIdOnlyRegex = Regex("""^(?:R|C|RT|F|EQ|Q|S|E|STAT|M)-?\d+[a-z]?$""", RegexOption.IGNORE_CASE)
+
+  private fun classifyInternalHeader(raw: String): InternalHeaderType? {
+    val trimmed = raw.trim()
+    val match = wholeLineBracketHeaderRegex.matchEntire(trimmed) ?: return null
+    val inner = match.groupValues[1].trim()
+    if (findingIdOnlyRegex.matches(inner)) return null
+    val upper = inner.uppercase(Locale.US)
+    return when {
+      upper.startsWith("STAGE") || upper.startsWith("PRE-FLIGHT") ||
+        upper.startsWith("PHD-SKILLS") || upper.startsWith("PILLAR") -> InternalHeaderType.STAGE
+      upper.startsWith("STUDY IDENTITY CARD") || upper.startsWith("REVIEW IDENTITY CARD") -> InternalHeaderType.IDENTITY
+      upper.startsWith("CLAIM HIERARCHY") || upper.startsWith("PRIMARY-ANALYSIS") -> InternalHeaderType.CLAIM_HIERARCHY
+      upper.startsWith("CLINICAL & PRACTICAL SIGNIFICANCE") ||
+        upper.startsWith("PRACTICAL SIGNIFICANCE") ||
+        upper.startsWith("CLINICAL & POLICY APPLICABILITY") -> InternalHeaderType.PRACTICAL_SIGNIFICANCE
+      upper.startsWith("WHAT WOULD CHANGE") ||
+        upper.startsWith("POSSIBLE REASONS FOR THE RESULT") ||
+        upper.startsWith("MINIMUM EVIDENCE TO OVERTURN") -> InternalHeaderType.FRAGILITY
+      upper.startsWith("EXPLICIT UNCERTAINTY BUDGET") ||
+        upper.startsWith("MULTIPLICITY-FAMILY UNCERTAINTY") ||
+        upper.startsWith("ABSTENTION POLICY") ||
+        upper.startsWith("STOP-AND-ASK") -> InternalHeaderType.UNCERTAINTY
+      upper.startsWith("UNSUPPORTED-TO-ASSESS") ||
+        upper.startsWith("EXTRACTION FAILURE VS") -> InternalHeaderType.UNSUPPORTED_EVIDENCE
+      upper.startsWith("PHASE 8") || upper.startsWith("PHASE 9") -> InternalHeaderType.PHASE_REPORT
+      upper.startsWith("DESIGN-AWARE STATISTICAL") ||
+        upper.startsWith("DOMAIN-SPECIFIC STATISTICAL") ||
+        upper.startsWith("EXECUTABLE NUMERICAL RECONSTRUCTION") ||
+        upper.startsWith("CROSS-SECTION CONSISTENCY") ||
+        upper.startsWith("CROSS-SECTION CONTRADICTION") ||
+        upper.startsWith("DENOMINATOR LEDGER") ||
+        upper.startsWith("DENOMINATOR PROVENANCE") ||
+        upper.startsWith("EVIDENCE-DERIVED SCORE") ||
+        upper.startsWith("STATISTICAL") -> InternalHeaderType.AUDIT
+      inner.any { it.isLetter() } && inner == inner.uppercase(Locale.US) ||
+        inner.contains(" — ") || inner.contains(" - ") ||
+        inner.endsWith("?") || inner.endsWith(")") -> InternalHeaderType.UNKNOWN
+      else -> null
+    }
+  }
+
+  private fun buildSubHeaderFromInternalBracket(raw: String, type: InternalHeaderType): ReportBlock.SubHeader {
+    val inner = raw.trim().removePrefix("[").removeSuffix("]").trim()
+    val cleanedInner = humanizeInternalEnums(inner)
+    val splitParts = cleanedInner.split(Regex("""\s+[—–-]\s+|:\s+"""), limit = 2)
+    return when {
+      type == InternalHeaderType.PHASE_REPORT && splitParts.size == 2 -> {
+        ReportBlock.SubHeader(
+          tag = splitParts[0].trim().uppercase(Locale.US),
+          title = toReadableHeaderTitle(splitParts[1].trim())
+        )
+      }
+      type == InternalHeaderType.STAGE && splitParts.size == 2 -> {
+        ReportBlock.SubHeader(
+          tag = splitParts[0].trim(),
+          title = splitParts[1].trim()
+        )
+      }
+      splitParts.size == 2 && splitParts[0].trim().length <= 24 -> {
+        ReportBlock.SubHeader(
+          tag = splitParts[0].trim().uppercase(Locale.US),
+          title = toReadableHeaderTitle(splitParts[1].trim())
+        )
+      }
+      else -> {
+        ReportBlock.SubHeader(
+          tag = type.defaultTag,
+          title = toReadableHeaderTitle(cleanedInner)
+        )
+      }
+    }
+  }
+
+  private fun toReadableHeaderTitle(raw: String): String {
+    val clean = raw.trim().removePrefix("[").removeSuffix("]").trim()
+    val letters = clean.filter { it.isLetter() }
+    if (letters.isEmpty()) return clean
+    val upperRatio = letters.count { it.isUpperCase() }.toFloat() / letters.length.toFloat()
+    return if (upperRatio >= 0.80f && clean.length > 8) {
+      normalizeTitle(clean.lowercase(Locale.US))
+    } else {
+      clean
+    }
+  }
+
+  fun sanitizeTableCell(value: String): String =
+    humanizeInternalEnums(value)
+      .replace('\r', ' ')
+      .replace('\n', ' ')
+      .replace(Regex("""\s+"""), " ")
+      .replace("|", "/")
+      .trim()
+
+  fun clampCell(value: String, maxChars: Int): String {
+    val sanitized = sanitizeTableCell(value)
+    if (sanitized.length <= maxChars || maxChars <= 2) return sanitized
+    val cut = sanitized.take(maxChars - 1)
+    val lastSpace = cut.lastIndexOf(' ')
+    val bounded = if (lastSpace >= (maxChars * 0.65).toInt()) {
+      cut.substring(0, lastSpace)
+    } else {
+      cut
+    }
+    return bounded.trimEnd(' ', ',', ';', ':') + "…"
+  }
+
+  fun humanizeInternalEnums(raw: String): String {
+    if (raw.isBlank()) return raw
+    val replacements = listOf(
+      "NOT_ASSESSABLE_FROM_SUPPLIED_MATERIAL" to "Not assessable from supplied material",
+      "REPORTED_BUT_INADEQUATE" to "Reported but inadequate",
+      "REPORTED_AND_ADEQUATE" to "Reported and adequate",
+      "DOCUMENTED_AND_ADEQUATE" to "Documented and adequate",
+      "DOCUMENTED_BUT_INADEQUATE" to "Documented but inadequate",
+      "UNSUPPORTED_TO_ASSESS" to "Unsupported to assess (missing inputs)",
+      "IMPRECISION_OR_HIGH_VARIANCE" to "Imprecision / high variance",
+      "FATAL_TO_PRIMARY_CONCLUSION" to "Fatal to primary conclusion",
+      "MATERIALLY_WEAKENS_CONFIDENCE" to "Materially weakens confidence",
+      "REQUIRES_REPORTING_CORRECTION" to "Requires reporting correction",
+      "WORTHWHILE_ENHANCEMENT" to "Worthwhile enhancement",
+      "COSMETIC_OR_EDITORIAL" to "Cosmetic or editorial",
+      "INTERNAL_CONTRADICTION" to "Internal contradiction",
+      "ASSUMPTION_UNCHECKED" to "Assumption unchecked",
+      "REPORTING_OMISSION" to "Reporting omission",
+      "EXTERNAL_VALIDITY_LIMIT" to "External validity limit",
+      "ARITHMETIC_ERROR" to "Arithmetic error",
+      "MODEL_MISMATCH" to "Model / design mismatch",
+      "POSSIBLE_BIAS" to "Possible bias / screening signal",
+      "POTENTIAL_RISK" to "Potential risk",
+      "NOT_APPLICABLE" to "Not applicable",
+      "NOT_ASSESSABLE" to "Not assessable",
+      "NOT_REPORTED" to "Not reported"
+    )
+    var out = raw
+    for ((token, label) in replacements) {
+      if (out.contains(token)) {
+        out = out.replace(Regex("""\b${Regex.escape(token)}\b"""), label)
+      }
+    }
+    return out
+  }
+
   /**
    * Parses sanitized report text into typed semantic blocks for rich rendering in both PDF and Compose UI.
    */
@@ -212,12 +369,11 @@ object DossierFormattingEngine {
     val blocks = mutableListOf<ReportBlock>()
     val lines = clean.lines()
 
-    val stageHeaderRegex = Regex("""^\[((?:STAGE|PRE-FLIGHT|PHD-SKILLS|PILLAR)[^\]]*)\]$""", RegexOption.IGNORE_CASE)
     val severityRegex = Regex(
       """^(?:[-•*]\s*)?\[(CRITICAL|MAJOR|MINOR|DISMISSED|MUST FIX|SHOULD FIX|RECOMMENDED|PASS|WARN|FAIL)(?:[^\]]*)\]\s*(.+)$""",
       RegexOption.IGNORE_CASE
     )
-    val bulletContribRegex = Regex("""^(\[(?:C|RT|F|EQ|Q|STAT|M)-?\d+\])\s*(.+)$""")
+    val bulletContribRegex = Regex("""^(\[(?:C|RT|F|EQ|Q|R|S|E|STAT|M)-?\d+\])\s*(.+)$""")
     val numberedItemRegex = Regex("""^(\d{1,2}\.)\s+(.+)$""")
     val dashBulletRegex = Regex("""^(?:•|-|\*)\s+(.+)$""")
     val calloutRegex = Regex(
@@ -234,22 +390,60 @@ object DossierFormattingEngine {
         continue
       }
 
-      // 0. Pipe-delimited Structured Audit Table (| Col1 | Col2 | Status | Detail |)
-      if (line.startsWith("|") && line.count { it == '|' } >= 3) {
-        val tableLines = mutableListOf<String>()
+      // 0. Pipe-delimited Structured Audit Table (resilient to wrapped multi-line cells)
+      if (line.startsWith("|") && line.count { it == '|' } >= 2) {
+        val rawTableLines = mutableListOf<String>()
+        var expectedPipes = line.count { it == '|' }
+        var openRow = StringBuilder(line)
+        idx++
+
+        fun flushOpenRow() {
+          val built = openRow.toString().trim()
+          if (built.isNotBlank()) {
+            rawTableLines.add(built)
+          }
+          openRow = StringBuilder()
+        }
+
         while (idx < lines.size) {
           val candidate = lines[idx].trim()
-          if (candidate.startsWith("|") && candidate.count { it == '|' } >= 3) {
-            tableLines.add(candidate)
+          if (candidate.isBlank()) {
+            // Look ahead: if current row is clearly incomplete (doesn't end with '|'), swallow single blank inside cell only if next line finishes row
+            if (!openRow.toString().trimEnd().endsWith("|") && idx + 1 < lines.size) {
+              val nextLine = lines[idx + 1].trim()
+              if (nextLine.isNotBlank() && !nextLine.startsWith("|") && nextLine.contains("|")) {
+                idx++
+                continue
+              }
+            }
+            break
+          }
+          val openStr = openRow.toString().trimEnd()
+          val openIsIncomplete = !openStr.endsWith("|") ||
+            (!tableSeparatorRegex.matches(openStr) && openStr.count { it == '|' } < expectedPipes)
+
+          if (candidate.startsWith("|")) {
+            flushOpenRow()
+            openRow.append(candidate)
+            if (rawTableLines.size == 1 && !tableSeparatorRegex.matches(candidate)) {
+              expectedPipes = maxOf(expectedPipes, candidate.count { it == '|' })
+            }
+            idx++
+          } else if (openIsIncomplete && classifyInternalHeader(candidate) == null) {
+            // Wrapped continuation line belonging to the previous table cell
+            openRow.append(' ').append(candidate)
             idx++
           } else {
             break
           }
         }
-        val parsedRows = tableLines
+        flushOpenRow()
+
+        val parsedRows = rawTableLines
           .filterNot { tableSeparatorRegex.matches(it) }
           .map { rowLine ->
-            rowLine.trim('|').split("|").map { it.trim() }
+            val trimmedRow = rowLine.trim().removePrefix("|").removeSuffix("|")
+            trimmedRow.split("|").map { sanitizeTableCell(it) }
           }
           .filter { cells -> cells.any { it.isNotBlank() } }
 
@@ -257,7 +451,15 @@ object DossierFormattingEngine {
           val headers = parsedRows.first()
           val colCount = headers.size
           val normalizedBody = parsedRows.drop(1).map { cells ->
-            List(colCount) { c -> cells.getOrElse(c) { "" } }
+            when {
+              cells.size == colCount -> cells
+              cells.size < colCount -> List(colCount) { c -> cells.getOrElse(c) { "" } }
+              else -> {
+                val head = cells.take(colCount - 1)
+                val mergedTail = cells.drop(colCount - 1).joinToString(" / ")
+                head + mergedTail
+              }
+            }
           }
           blocks.add(ReportBlock.AuditTable(headers = headers, rows = normalizedBody))
         } else if (parsedRows.size == 1) {
@@ -266,16 +468,10 @@ object DossierFormattingEngine {
         continue
       }
 
-      // 1. Stage / Sub-section header: [STAGE 01a — THE BREAKER: ...] or [PILLAR 1 — ...]
-      val stageMatch = stageHeaderRegex.matchEntire(line)
-      if (stageMatch != null) {
-        val inner = stageMatch.groupValues[1].trim()
-        val splitParts = inner.split(Regex("""\s+[—–-]\s+|:\s+"""), limit = 2)
-        if (splitParts.size == 2) {
-          blocks.add(ReportBlock.SubHeader(tag = splitParts[0].trim(), title = splitParts[1].trim()))
-        } else {
-          blocks.add(ReportBlock.SubHeader(tag = "", title = inner))
-        }
+      // 1. Centralized Internal Bracket Header Classifier (NEVER renders outer '[' or ']')
+      val internalHeaderType = classifyInternalHeader(line)
+      if (internalHeaderType != null) {
+        blocks.add(buildSubHeaderFromInternalBracket(line, internalHeaderType))
         idx++
         continue
       }
@@ -284,7 +480,7 @@ object DossierFormattingEngine {
       val sevMatch = severityRegex.matchEntire(line)
       if (sevMatch != null) {
         val tagRaw = sevMatch.groupValues[1].uppercase(Locale.US)
-        val body = sevMatch.groupValues[2].trim()
+        val body = humanizeInternalEnums(sevMatch.groupValues[2].trim())
         val level = when (tagRaw) {
           "CRITICAL" -> SeverityLevel.CRITICAL
           "MAJOR" -> SeverityLevel.MAJOR
@@ -306,7 +502,7 @@ object DossierFormattingEngine {
       val calloutMatch = calloutRegex.matchEntire(line)
       if (calloutMatch != null) {
         val title = calloutMatch.groupValues[1].trim()
-        val inlineBody = calloutMatch.groupValues[2].trim()
+        val inlineBody = humanizeInternalEnums(calloutMatch.groupValues[2].trim())
         val lowerTitle = title.lowercase(Locale.US)
         val tone = when {
           lowerTitle.contains("bottom line") -> CalloutTone.BOTTOM_LINE
@@ -334,13 +530,13 @@ object DossierFormattingEngine {
         continue
       }
 
-      // 4. Tagged contribution or finding bullet ([C1], [RT-1], [EQ1])
+      // 4. Tagged contribution or finding bullet ([C1], [RT-1], [R-01], [EQ1])
       val contribMatch = bulletContribRegex.matchEntire(line)
       if (contribMatch != null) {
         blocks.add(
           ReportBlock.Bullet(
             marker = contribMatch.groupValues[1],
-            body = contribMatch.groupValues[2].trim()
+            body = humanizeInternalEnums(contribMatch.groupValues[2].trim())
           )
         )
         idx++
@@ -353,7 +549,7 @@ object DossierFormattingEngine {
         blocks.add(
           ReportBlock.Bullet(
             marker = numMatch.groupValues[1],
-            body = numMatch.groupValues[2].trim()
+            body = humanizeInternalEnums(numMatch.groupValues[2].trim())
           )
         )
         idx++
@@ -365,18 +561,19 @@ object DossierFormattingEngine {
       if (dashMatch != null) {
         val bulletBody = dashMatch.groupValues[1].trim()
         // Check if bullet itself starts with a severity alert like [PRISMA GAP] or [REPRODUCIBILITY GAP]
-        val innerAlert = Regex("""^\[([A-Z][A-Z0-9 /\-]{2,28})\]\s*(.+)$""").matchEntire(bulletBody)
+        val innerAlert = Regex("""^\[([A-Z][A-Z0-9 /_|\-•]{2,48})\]\s*(.+)$""").matchEntire(bulletBody)
         if (innerAlert != null) {
-          val alertLabel = innerAlert.groupValues[1].trim()
-          val alertBody = innerAlert.groupValues[2].trim()
+          val alertLabel = humanizeInternalEnums(innerAlert.groupValues[1].trim())
+          val alertBody = humanizeInternalEnums(innerAlert.groupValues[2].trim())
+          val upperLabel = innerAlert.groupValues[1].uppercase(Locale.US)
           val level = when {
-            alertLabel.contains("CRITICAL") || alertLabel.contains("LEAKAGE") -> SeverityLevel.CRITICAL
-            alertLabel.contains("GAP") || alertLabel.contains("RISK") || alertLabel.contains("BIAS") -> SeverityLevel.MAJOR
+            upperLabel.contains("CRITICAL") || upperLabel.contains("LEAKAGE") || upperLabel.contains("FATAL") || upperLabel.contains("ARITHMETIC") -> SeverityLevel.CRITICAL
+            upperLabel.contains("GAP") || upperLabel.contains("RISK") || upperLabel.contains("BIAS") || upperLabel.contains("HIGH") || upperLabel.contains("WARN") || upperLabel.contains("UNSUPPORTED") -> SeverityLevel.MAJOR
             else -> SeverityLevel.MINOR
           }
           blocks.add(ReportBlock.SeverityCard(level = level, label = alertLabel, body = alertBody))
         } else {
-          blocks.add(ReportBlock.Bullet(marker = "•", body = bulletBody))
+          blocks.add(ReportBlock.Bullet(marker = "•", body = humanizeInternalEnums(bulletBody)))
         }
         idx++
         continue
@@ -390,7 +587,7 @@ object DossierFormattingEngine {
       }
 
       // 8. Standard prose paragraph
-      blocks.add(ReportBlock.Paragraph(line))
+      blocks.add(ReportBlock.Paragraph(humanizeInternalEnums(line)))
       idx++
     }
 

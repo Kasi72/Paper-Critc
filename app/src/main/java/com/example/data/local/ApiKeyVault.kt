@@ -1,6 +1,8 @@
 package com.example.data.local
 
+import android.os.Build
 import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyInfo
 import android.security.keystore.KeyProperties
 import android.util.Base64
 import android.util.Log
@@ -8,6 +10,7 @@ import java.security.KeyStore
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
+import javax.crypto.SecretKeyFactory
 import javax.crypto.spec.GCMParameterSpec
 
 private const val VAULT_TAG = "ApiKeyVault"
@@ -33,8 +36,12 @@ sealed interface KeyDecryptOutcome {
 }
 
 /**
- * Hardware-backed Android Keystore AES-256-GCM credential vault for protecting user BYOK API keys
+ * Android Keystore AES-256-GCM credential vault for protecting user BYOK API keys
  * before persisting them to Room SQLite.
+ *
+ * Note on hardware backing: Android Keystore uses TEE/StrongBox hardware isolation when supported
+ * by the device, and software-isolated Keystore on devices without secure hardware. Use
+ * [isVerifiedHardwareBacked] to query [KeyInfo] directly rather than assuming physical hardware backing.
  *
  * Security invariant: **FAIL CLOSED**. If Android Keystore is unavailable or encryption fails,
  * [encrypt] throws [CredentialStorageUnavailableException] rather than falling back to plaintext.
@@ -58,7 +65,32 @@ object ApiKeyVault {
 
   fun status(): VaultStatus = if (getOrCreateKey() != null) VaultStatus.AVAILABLE else VaultStatus.UNAVAILABLE
 
-  fun isHardwareVaultAvailable(): Boolean = status() == VaultStatus.AVAILABLE
+  /** Returns true when Android Keystore encryption is available (may be TEE/StrongBox or software Keystore). */
+  fun isKeystoreVaultAvailable(): Boolean = status() == VaultStatus.AVAILABLE
+
+  /** Backward-compatible alias for [isKeystoreVaultAvailable]. */
+  fun isHardwareVaultAvailable(): Boolean = isKeystoreVaultAvailable()
+
+  /**
+   * Inspects Android Keystore [KeyInfo] to verify whether the active AES-256-GCM key is actually
+   * stored inside dedicated secure hardware (TEE or StrongBox). Returns false if software-backed
+   * or running under a JVM test override.
+   */
+  @Suppress("DEPRECATION")
+  fun isVerifiedHardwareBacked(): Boolean {
+    if (keyProviderOverride != null) return false
+    val key = getOrCreateKey() ?: return false
+    return runCatching {
+      val factory = SecretKeyFactory.getInstance(key.algorithm, KEYSTORE_PROVIDER)
+      val info = factory.getKeySpec(key, KeyInfo::class.java) as KeyInfo
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        info.securityLevel == KeyProperties.SECURITY_LEVEL_TRUSTED_ENVIRONMENT ||
+          info.securityLevel == KeyProperties.SECURITY_LEVEL_STRONGBOX
+      } else {
+        info.isInsideSecureHardware
+      }
+    }.getOrDefault(false)
+  }
 
   /**
    * Encrypts [plaintext] with AES-256-GCM. Fails closed by throwing

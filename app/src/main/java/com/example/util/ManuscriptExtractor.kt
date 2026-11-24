@@ -18,6 +18,7 @@ import java.io.InputStream
 import java.io.InputStreamReader
 import java.util.Locale
 import java.util.zip.ZipInputStream
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.xmlpull.v1.XmlPullParser
@@ -39,6 +40,57 @@ data class ExtractedPage(
   val mentionsFiguresOrTables: Boolean
 )
 
+enum class CoverageStatus(val label: String) {
+  COMPLETE("Complete"),
+  PARTIAL("Partial"),
+  UNKNOWN("Unknown")
+}
+
+enum class CoverageLevel(val label: String) {
+  COMPLETE("Complete"),
+  PARTIAL("Partial"),
+  LIMITED("Limited"),
+  NOT_SUPPLIED("Not supplied"),
+  UNKNOWN("Unknown")
+}
+
+data class CoverageMetric(
+  val label: String,
+  val level: CoverageLevel,
+  val detail: String
+)
+
+data class CoverageSummary(
+  val totalPages: Int,
+  val extractedPages: Int,
+  val omittedPages: List<Int>,
+  val textExtractionCoverage: CoverageLevel = CoverageLevel.COMPLETE,
+  val tableFigureCoverage: CoverageLevel = CoverageLevel.COMPLETE,
+  val quantitativeClaimCoverage: CoverageLevel = CoverageLevel.COMPLETE,
+  val supplementCoverage: CoverageLevel = CoverageLevel.NOT_SUPPLIED
+) {
+  fun toFormattedLines(): String = buildString {
+    append("Page coverage: $extractedPages/$totalPages")
+    append(" • Text extraction: ${textExtractionCoverage.label}")
+    append(" • Tables/figures parseability: ${tableFigureCoverage.label}")
+    append(" • Quantitative reconstruction: ${quantitativeClaimCoverage.label}")
+    append(" • Supplementary material: ${supplementCoverage.label}")
+    if (omittedPages.isNotEmpty()) {
+      append(" • Omitted pages: ${omittedPages.joinToString(",") { "P$it" }}")
+    }
+  }
+}
+
+data class ConfidenceSummary(
+  val scientificConfidence: Int,
+  val extractionConfidence: Int,
+  val pageCoverage: CoverageMetric,
+  val textCoverage: CoverageMetric,
+  val quantitativeCoverage: CoverageMetric,
+  val reasons: List<String> = emptyList(),
+  val coverageSummary: CoverageSummary? = null
+)
+
 data class DocumentCoverageReport(
   val totalPages: Int,
   val extractedPages: Int,
@@ -49,13 +101,76 @@ data class DocumentCoverageReport(
   val visionPagesAttached: Int = 0,
   val visionPageNumbers: List<Int> = emptyList(),
   val extractionEngine: String = "PDFBox-Android",
-  val extractionConfidence: Int = 5, // 1–5 scale reflecting fidelity of text & layout extraction
-  val warnings: List<String> = emptyList()
+  val extractionConfidence: Int = 5, // 1–5 scale reflecting fidelity of text & layout extraction; 0 = UNKNOWN
+  val warnings: List<String> = emptyList(),
+  val coverageStatus: CoverageStatus = when {
+    extractionConfidence <= 0 -> CoverageStatus.UNKNOWN
+    omittedPages.isEmpty() && extractionConfidence >= 4 && warnings.isEmpty() -> CoverageStatus.COMPLETE
+    else -> CoverageStatus.PARTIAL
+  }
 ) {
   val isHighCoverage: Boolean
-    get() = extractionConfidence >= 4 && warnings.isEmpty() && omittedPages.isEmpty()
+    get() = coverageStatus == CoverageStatus.COMPLETE && extractionConfidence >= 4 && warnings.isEmpty() && omittedPages.isEmpty()
 
-  fun toDisclosureLine(): String = buildString {
+  val isCoverageUnknown: Boolean
+    get() = coverageStatus == CoverageStatus.UNKNOWN || extractionConfidence == EXTRACTION_CONFIDENCE_UNKNOWN
+
+  fun toCoverageSummary(
+    unsupportedInputCount: Int = 0,
+    reconstructedClaimCount: Int = 0,
+    hasSupplementReference: Boolean = false
+  ): CoverageSummary {
+    if (isCoverageUnknown) {
+      return CoverageSummary(
+        totalPages = totalPages,
+        extractedPages = extractedPages,
+        omittedPages = omittedPages,
+        textExtractionCoverage = CoverageLevel.UNKNOWN,
+        tableFigureCoverage = CoverageLevel.UNKNOWN,
+        quantitativeClaimCoverage = CoverageLevel.UNKNOWN,
+        supplementCoverage = CoverageLevel.UNKNOWN
+      )
+    }
+    val textCov = when {
+      omittedPages.isEmpty() && extractionConfidence >= 4 -> CoverageLevel.COMPLETE
+      extractedPages > 0 -> CoverageLevel.PARTIAL
+      else -> CoverageLevel.LIMITED
+    }
+    val tableFigCov = when {
+      lowTextPages.isNotEmpty() || warnings.any {
+        it.contains("scanned", true) || it.contains("image", true) || it.contains("table", true) || it.contains("figure", true)
+      } -> CoverageLevel.PARTIAL
+      omittedPages.isNotEmpty() -> CoverageLevel.PARTIAL
+      else -> CoverageLevel.COMPLETE
+    }
+    val quantCov = when {
+      unsupportedInputCount > 0 && reconstructedClaimCount == 0 -> CoverageLevel.LIMITED
+      unsupportedInputCount > 0 -> CoverageLevel.PARTIAL
+      omittedPages.isNotEmpty() || lowTextPages.isNotEmpty() -> CoverageLevel.PARTIAL
+      else -> CoverageLevel.COMPLETE
+    }
+    val suppCov = if (hasSupplementReference) CoverageLevel.NOT_SUPPLIED else CoverageLevel.NOT_SUPPLIED
+    return CoverageSummary(
+      totalPages = totalPages,
+      extractedPages = extractedPages,
+      omittedPages = omittedPages,
+      textExtractionCoverage = textCov,
+      tableFigureCoverage = tableFigCov,
+      quantitativeClaimCoverage = quantCov,
+      supplementCoverage = suppCov
+    )
+  }
+
+  fun toDisclosureLine(
+    overrideExtractionConfidence: Int? = null,
+    coverageSummary: CoverageSummary? = null
+  ): String = buildString {
+    val effectiveConf = overrideExtractionConfidence ?: extractionConfidence
+    if (isCoverageUnknown && overrideExtractionConfidence == null) {
+      append("Coverage: Unknown • Extraction Confidence: Unknown (strong conclusions disabled until document coverage is supplied)")
+      if (warnings.isNotEmpty()) append(" • Warnings: ${warnings.joinToString("; ")}")
+      return@buildString
+    }
     append("$extractedPages/$totalPages page(s) extracted")
     append(" • %,d words".format(Locale.US, totalWords))
     append(" • %,d chars".format(Locale.US, totalChars))
@@ -64,7 +179,15 @@ data class DocumentCoverageReport(
       append(" • $visionPagesAttached visual page(s) [$pageList]")
     }
     append(" • Engine: $extractionEngine")
-    append(" • Extraction Confidence: $extractionConfidence/5")
+    append(" • Coverage: ${coverageStatus.label}")
+    append(" • Extraction Confidence: $effectiveConf/5")
+    if (coverageSummary != null) {
+      append(" • Page coverage: ${coverageSummary.extractedPages}/${coverageSummary.totalPages}")
+      append(" • Text extraction: ${coverageSummary.textExtractionCoverage.label}")
+      append(" • Tables/figures parseability: ${coverageSummary.tableFigureCoverage.label}")
+      append(" • Quantitative reconstruction: ${coverageSummary.quantitativeClaimCoverage.label}")
+      append(" • Supplementary material: ${coverageSummary.supplementCoverage.label}")
+    }
     if (omittedPages.isNotEmpty()) {
       append(" • Omitted pages: ${omittedPages.joinToString(",") { "P$it" }}")
     }
@@ -73,6 +196,43 @@ data class DocumentCoverageReport(
     }
     if (warnings.isNotEmpty()) {
       append(" • Warnings: ${warnings.joinToString("; ")}")
+    }
+  }
+
+  companion object {
+    const val EXTRACTION_CONFIDENCE_UNKNOWN: Int = 0
+
+    fun unknown(reason: String = "Coverage metadata was not supplied; strong conclusions disabled."): DocumentCoverageReport =
+      DocumentCoverageReport(
+        totalPages = 0,
+        extractedPages = 0,
+        totalChars = 0,
+        totalWords = 0,
+        extractionEngine = "Unknown",
+        extractionConfidence = EXTRACTION_CONFIDENCE_UNKNOWN,
+        warnings = listOf(reason),
+        coverageStatus = CoverageStatus.UNKNOWN
+      )
+
+    fun forCompleteText(
+      text: String,
+      engine: String = "Direct Text Input"
+    ): DocumentCoverageReport {
+      val pageMarkers = Regex("""\[PAGE\s+(\d+)\]""", RegexOption.IGNORE_CASE).findAll(text).mapNotNull {
+        it.groupValues[1].toIntOrNull()
+      }.toList()
+      val pages = (pageMarkers.maxOrNull() ?: ((text.length / 2200) + 1)).coerceAtLeast(1)
+      val words = if (text.isBlank()) 0 else text.trim().split(Regex("""\s+""")).size
+      return DocumentCoverageReport(
+        totalPages = pages,
+        extractedPages = pages,
+        totalChars = text.length,
+        totalWords = words,
+        extractionEngine = engine,
+        extractionConfidence = 5,
+        warnings = emptyList(),
+        coverageStatus = CoverageStatus.COMPLETE
+      )
     }
   }
 }
@@ -101,6 +261,11 @@ data class ExtractedManuscriptFile(
 object ManuscriptExtractor {
 
   private const val MAX_PDF_INPUT_BYTES = 40_000_000 // 40 MB full journal articles & supplements
+  private const val MAX_TEXT_INPUT_BYTES = 10_000_000 // 10 MB plain text / LaTeX / Markdown cap
+  private const val MAX_ZIP_ENTRIES = 512
+  private const val MAX_DOCX_XML_BYTES = 16_000_000
+  private const val MAX_ZIP_CODE_ENTRY_BYTES = 512_000
+  private const val MAX_ZIP_CODE_TOTAL_BYTES = 4_000_000
   private const val MAX_EXTRACTED_CHARS = 400_000
   private const val MAX_VISION_PAGES = 6
 
@@ -127,13 +292,13 @@ object ManuscriptExtractor {
     uri: Uri,
     renderPdfBitmaps: Boolean = true
   ): Result<ExtractedManuscriptFile> = withContext(Dispatchers.IO) {
-    runCatching {
+    try {
       val contentResolver = context.contentResolver
       val fileName = resolveFileName(context, uri) ?: "manuscript_document"
       val lowerName = fileName.lowercase(Locale.US)
       val mimeType = contentResolver.getType(uri)?.lowercase(Locale.US).orEmpty()
 
-      when {
+      val extracted = when {
         mimeType.contains("pdf") || lowerName.endsWith(".pdf") -> {
           extractPdfContent(context, uri, fileName, renderPdfBitmaps)
         }
@@ -148,6 +313,11 @@ object ManuscriptExtractor {
           extractPlainTextContent(context, uri, fileName)
         }
       }
+      Result.success(extracted)
+    } catch (e: CancellationException) {
+      throw e
+    } catch (e: Throwable) {
+      Result.failure(e)
     }
   }
 
@@ -167,9 +337,10 @@ object ManuscriptExtractor {
     uri: Uri,
     fileName: String
   ): ExtractedManuscriptFile {
-    val rawText = context.contentResolver.openInputStream(uri)?.use { stream ->
-      BufferedReader(InputStreamReader(stream, Charsets.UTF_8)).readText()
+    val rawBytes = context.contentResolver.openInputStream(uri)?.use { stream ->
+      readBytesBounded(stream, MAX_TEXT_INPUT_BYTES)
     } ?: throw IllegalStateException("Unable to read selected text file.")
+    val rawText = rawBytes.toString(Charsets.UTF_8)
 
     return extractPlainTextFromString(
       rawText = rawText,
@@ -247,17 +418,25 @@ object ManuscriptExtractor {
   ): ExtractedManuscriptFile {
     val sb = StringBuilder()
     var foundDocumentXml = false
+    val maxExtractedBuffer = maxOf(maxChars * 4, 1_600_000)
 
     runCatching {
       ZipInputStream(ByteArrayInputStream(rawBytes)).use { zis ->
         var entry = zis.nextEntry
-        while (entry != null) {
-          if (entry.name.equals("word/document.xml", ignoreCase = true)) {
+        var entryCount = 0
+        while (entry != null && entryCount < MAX_ZIP_ENTRIES) {
+          entryCount++
+          val entryName = entry.name.orEmpty()
+          val isSafePath = !entryName.contains("..") && !entryName.startsWith("/") && !entryName.startsWith("\\")
+          if (isSafePath && entryName.equals("word/document.xml", ignoreCase = true)) {
             foundDocumentXml = true
+            val xmlBytes = readBytesBounded(zis, MAX_DOCX_XML_BYTES)
             val parser = Xml.newPullParser()
-            parser.setInput(zis, "UTF-8")
+            runCatching { parser.setFeature(XmlPullParser.FEATURE_PROCESS_DOCDECL, false) }
+            runCatching { parser.setFeature(XmlPullParser.FEATURE_VALIDATION, false) }
+            parser.setInput(ByteArrayInputStream(xmlBytes), "UTF-8")
             var eventType = parser.eventType
-            while (eventType != XmlPullParser.END_DOCUMENT) {
+            while (eventType != XmlPullParser.END_DOCUMENT && sb.length < maxExtractedBuffer) {
               when (eventType) {
                 XmlPullParser.START_TAG -> {
                   val tag = parser.name.substringAfterLast(':')
@@ -283,6 +462,7 @@ object ManuscriptExtractor {
             }
             break
           }
+          zis.closeEntry()
           entry = zis.nextEntry
         }
       }
@@ -834,12 +1014,13 @@ object ManuscriptExtractor {
         }
       }
     } else {
-      val topPage = scored.maxByOrNull { it.third }!!
-      val header = "[PAGE ${topPage.first} — PARTIAL]\n"
-      val remaining = (maxChars - header.length - 4).coerceAtLeast(40)
-      val rawBody = topPage.second.substringAfter('\n')
-      assembled.append(header).append(rawBody.take(remaining)).append("...")
-      partiallyRetained.add(topPage.first)
+      scored.maxByOrNull { it.third }?.let { topPage ->
+        val header = "[PAGE ${topPage.first} — PARTIAL]\n"
+        val remaining = (maxChars - header.length - 4).coerceAtLeast(40)
+        val rawBody = topPage.second.substringAfter('\n')
+        assembled.append(header).append(rawBody.take(remaining)).append("...")
+        partiallyRetained.add(topPage.first)
+      }
     }
 
     val omitted = nonBlank.map { it.pageNumber }
@@ -1045,7 +1226,7 @@ object ManuscriptExtractor {
     context: Context,
     uri: Uri
   ): Result<Pair<String, String>> = withContext(Dispatchers.IO) {
-    runCatching {
+    try {
       val fileName = resolveFileName(context, uri) ?: "replication_code.py"
       val lower = fileName.lowercase(Locale.US)
       val rawBytes = context.contentResolver.openInputStream(uri)?.use {
@@ -1058,12 +1239,23 @@ object ManuscriptExtractor {
         lower.endsWith(".zip") -> {
           val sb = StringBuilder()
           var fileCount = 0
+          var scannedEntries = 0
+          var totalDecompressedBytes = 0
           ZipInputStream(ByteArrayInputStream(rawBytes)).use { zis ->
             var entry = zis.nextEntry
-            while (entry != null && sb.length < 40_000) {
-              val entryName = entry.name
-              if (!entry.isDirectory && codeExtensions.any { entryName.lowercase(Locale.US).endsWith(it) }) {
-                val entryText = zis.readBytes().toString(Charsets.UTF_8)
+            while (entry != null && sb.length < 40_000 && scannedEntries < MAX_ZIP_ENTRIES && totalDecompressedBytes < MAX_ZIP_CODE_TOTAL_BYTES) {
+              scannedEntries++
+              val entryName = entry.name.orEmpty()
+              val isSafeEntry = !entry.isDirectory &&
+                !entryName.contains("..") &&
+                !entryName.startsWith("/") &&
+                !entryName.startsWith("\\") &&
+                !entryName.startsWith("__MACOSX/")
+              if (isSafeEntry && codeExtensions.any { entryName.lowercase(Locale.US).endsWith(it) }) {
+                val remainingBudget = (MAX_ZIP_CODE_TOTAL_BYTES - totalDecompressedBytes).coerceAtLeast(0)
+                val entryBytes = readBytesBounded(zis, minOf(MAX_ZIP_CODE_ENTRY_BYTES, remainingBudget))
+                totalDecompressedBytes += entryBytes.size
+                val entryText = entryBytes.toString(Charsets.UTF_8)
                 sb.appendLine("=== REPLICATION FILE: $entryName ===")
                 sb.appendLine(entryText.take(12_000))
                 sb.appendLine()
@@ -1083,7 +1275,11 @@ object ManuscriptExtractor {
           "=== REPLICATION FILE: $fileName ===\n$text"
         }
       }
-      fileName to extractedCode
+      Result.success(fileName to extractedCode)
+    } catch (e: CancellationException) {
+      throw e
+    } catch (e: Throwable) {
+      Result.failure(e)
     }
   }
 

@@ -1,5 +1,6 @@
 package com.example.data.ai
 
+import com.example.util.DocumentCoverageReport
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.roundToInt
@@ -168,7 +169,8 @@ object ManuscriptForensicEngine {
   fun analyzeManuscript(
     text: String,
     isEmpiricalTrack: Boolean,
-    replicationCode: String = ""
+    replicationCode: String = "",
+    coverageReport: DocumentCoverageReport? = null
   ): ForensicPreFlightReport {
     val cleanText = text.trim()
     val words = if (cleanText.isBlank()) emptyList() else cleanText.split(Regex("""\s+"""))
@@ -534,11 +536,16 @@ object ManuscriptForensicEngine {
       else -> "Empirical & Methodological Research"
     }
 
-    // 10. Deep Deterministic Quantitative & Statistical Forensics
+    // 10. Deep Deterministic Quantitative & Statistical Forensics (explicit coverage propagation)
+    val effectiveCoverage = coverageReport ?: DocumentCoverageReport.unknown(
+      reason = "ManuscriptForensicEngine.analyzeManuscript() invoked without DocumentCoverageReport."
+    )
     val quantForensics = QuantitativeForensicAnalyzer.analyze(
       text = cleanText,
       studyDesign = studyDesign,
-      sampleSizes = numericSampleValues
+      sampleSizes = numericSampleValues,
+      coverageReport = effectiveCoverage,
+      extractionConfidence = effectiveCoverage.extractionConfidence
     )
 
     return ForensicPreFlightReport(

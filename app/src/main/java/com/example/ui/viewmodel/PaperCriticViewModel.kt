@@ -156,7 +156,10 @@ data class WorkbenchFormState(
   val importedWordCount: Int = 240,
   val importedPageCount: Int = 1,
   val pdfPageBitmaps: List<Bitmap> = emptyList(),
-  val coverageReport: DocumentCoverageReport? = null,
+  val coverageReport: DocumentCoverageReport? = DocumentCoverageReport.forCompleteText(
+    text = BenchmarkManuscriptCatalog.samples.first().manuscriptText,
+    engine = "Benchmark Sample Text"
+  ),
   val importedFileBanner: String? = "Ready: Benchmark #1 — Yell at It (reviewer2)",
   val replicationCodeFileName: String? = null,
   val replicationCodeText: String = "",
@@ -239,7 +242,7 @@ class PaperCriticViewModel(
       if (!uid.isNullOrBlank()) {
         repository.observeReviews(uid)
           .onEach { cloudList ->
-            runCatching {
+            runSuspendCatching {
               localRepository.cacheReviewsOffline(cloudList)
             }
           }
@@ -307,15 +310,27 @@ class PaperCriticViewModel(
   // Off-main-thread debounced deterministic pre-flight forensic & quantitative audit
   @OptIn(FlowPreview::class, ExperimentalCoroutinesApi::class)
   val preFlightReport: StateFlow<ForensicPreFlightReport> = _formState
-    .map { Triple(it.manuscriptText, it.options.isEmpirical, it.replicationCodeText) }
+    .map {
+      listOf(it.manuscriptText, it.options.isEmpirical, it.replicationCodeText, it.coverageReport)
+    }
     .distinctUntilChanged()
     .debounce(260L)
-    .mapLatest { (text, isEmpirical, code) ->
+    .mapLatest { tuple ->
+      val text = tuple[0] as String
+      val isEmpirical = tuple[1] as Boolean
+      val code = tuple[2] as String
+      val cov = tuple[3] as DocumentCoverageReport?
+      val resolvedCov = cov ?: if (text.isNotBlank()) {
+        DocumentCoverageReport.forCompleteText(text, engine = "Direct Text Editor")
+      } else {
+        DocumentCoverageReport.unknown("Empty manuscript editor")
+      }
       withContext(Dispatchers.Default) {
         ManuscriptForensicEngine.analyzeManuscript(
           text = text,
           isEmpiricalTrack = isEmpirical,
-          replicationCode = code
+          replicationCode = code,
+          coverageReport = resolvedCov
         )
       }
     }
@@ -325,11 +340,27 @@ class PaperCriticViewModel(
       initialValue = ManuscriptForensicEngine.analyzeManuscript(
         text = BenchmarkManuscriptCatalog.samples.first().manuscriptText,
         isEmpiricalTrack = initialSettings.defaultOptions.isEmpirical,
-        replicationCode = ""
+        replicationCode = "",
+        coverageReport = DocumentCoverageReport.forCompleteText(
+          text = BenchmarkManuscriptCatalog.samples.first().manuscriptText,
+          engine = "Benchmark Sample Text"
+        )
       )
     )
 
   private var activePipelineJob: Job? = null
+  private var activeChatJob: Job? = null
+  private var activeSearchGroundingJob: Job? = null
+  private var activeSyncJob: Job? = null
+
+  private suspend inline fun <T> runSuspendCatching(crossinline block: suspend () -> T): Result<T> =
+    try {
+      Result.success(block())
+    } catch (e: CancellationException) {
+      throw e
+    } catch (e: Throwable) {
+      Result.failure(e)
+    }
 
   private val _pipelineState = MutableStateFlow<PipelineExecutionState>(PipelineExecutionState.Idle)
   val pipelineState: StateFlow<PipelineExecutionState> = _pipelineState.asStateFlow()
@@ -397,7 +428,7 @@ class PaperCriticViewModel(
 
   init {
     viewModelScope.launch {
-      runCatching { localRepository.migratePlaintextApiKeysIfNeeded() }
+      runSuspendCatching { localRepository.migratePlaintextApiKeysIfNeeded() }
         .onSuccess { migrated ->
           if (migrated > 0) {
             Log.i(TAG, "Migrated $migrated legacy API key(s) to Android Keystore AES-256-GCM.")
@@ -414,6 +445,10 @@ class PaperCriticViewModel(
   fun onAuthenticatedUserChanged(newUserId: String?) {
     val previous = _authenticatedUserId.value
     _authenticatedUserId.value = newUserId
+    if (newUserId.isNullOrBlank()) {
+      activeSyncJob?.cancel()
+      activeSyncJob = null
+    }
     val settings = _settingsState.value
     if (!newUserId.isNullOrBlank() &&
       previous != newUserId &&
@@ -433,7 +468,7 @@ class PaperCriticViewModel(
     val settings = _settingsState.value
     if (settings.confidentialLocalOnly) {
       if (!isAutomatic) {
-        _statusBanner.value = "Confidential Local-Only Mode is active. Disable it in Settings → Cloud to sync to Firestore."
+        _statusBanner.value = "Local-Only Report Storage is active. Disable it in Settings → Cloud to sync to Firestore."
       }
       return
     }
@@ -454,7 +489,7 @@ class PaperCriticViewModel(
     }
     if (_isSyncingPortfolio.value) return
 
-    viewModelScope.launch {
+    activeSyncJob = viewModelScope.launch {
       _isSyncingPortfolio.value = true
       try {
         val candidatePool = (_localReviews.value + sqlReviewsFlow.value)
@@ -470,7 +505,7 @@ class PaperCriticViewModel(
             uploadedCount++
             val syncedItem = repository.getReviewById(newCloudId, uid).getOrNull()
               ?: localItem.copy(id = newCloudId, userId = uid)
-            runCatching {
+            runSuspendCatching {
               localRepository.migrateChatHistory(localItem.id, newCloudId)
               localRepository.removeCachedReview(localItem.id)
               localRepository.cacheReviewOffline(syncedItem)
@@ -486,7 +521,7 @@ class PaperCriticViewModel(
         val refreshResult = repository.getUserReviews()
         val cloudList = refreshResult.getOrNull().orEmpty()
         if (cloudList.isNotEmpty()) {
-          runCatching {
+          runSuspendCatching {
             localRepository.cacheReviewsOffline(cloudList)
           }
         }
@@ -503,6 +538,7 @@ class PaperCriticViewModel(
         _statusBanner.value = "Sync error: ${e.localizedMessage ?: "Could not reach Firestore"}"
       } finally {
         _isSyncingPortfolio.value = false
+        activeSyncJob = null
       }
     }
   }
@@ -533,11 +569,21 @@ class PaperCriticViewModel(
 
   fun updateManuscriptText(value: String) {
     val words = if (value.isBlank()) 0 else value.trim().split(Regex("""\s+""")).size
-    _formState.update {
-      it.copy(
+    _formState.update { current ->
+      val updatedCoverage = if (current.importedFormat == ManuscriptInputFormat.TEXT || current.coverageReport == null) {
+        if (value.isBlank()) {
+          DocumentCoverageReport.unknown("Manuscript editor is empty.")
+        } else {
+          DocumentCoverageReport.forCompleteText(value, engine = "Direct Text Editor")
+        }
+      } else {
+        current.coverageReport
+      }
+      current.copy(
         manuscriptText = value,
         importedWordCount = words,
-        importedPageCount = (words / 350).coerceAtLeast(1)
+        importedPageCount = (words / 350).coerceAtLeast(1),
+        coverageReport = updatedCoverage
       )
     }
   }
@@ -576,7 +622,10 @@ class PaperCriticViewModel(
         importedWordCount = words,
         importedPageCount = 1,
         pdfPageBitmaps = emptyList(),
-        coverageReport = null,
+        coverageReport = DocumentCoverageReport.forCompleteText(
+          text = sample.manuscriptText,
+          engine = "Benchmark Sample Text"
+        ),
         importedFileBanner = "Loaded ${sample.badge}",
         options = it.options.copy(isEmpirical = sample.isEmpirical)
       )
@@ -660,7 +709,10 @@ class PaperCriticViewModel(
         importedWordCount = words,
         importedPageCount = (words / 350).coerceAtLeast(1),
         pdfPageBitmaps = emptyList(),
-        coverageReport = null,
+        coverageReport = DocumentCoverageReport.forCompleteText(
+          text = cleaned,
+          engine = "Shared Plain Text"
+        ),
         importedFileBanner = "Imported shared text ($words words)"
       )
     }
@@ -731,7 +783,14 @@ class PaperCriticViewModel(
           manuscriptText = form.manuscriptText,
           replicationCodeText = form.replicationCodeText,
           pdfPageBitmaps = if (settings.enablePdfVisionPages) form.pdfPageBitmaps else emptyList(),
-          coverageReport = form.coverageReport,
+          coverageReport = form.coverageReport ?: if (form.manuscriptText.isNotBlank()) {
+            DocumentCoverageReport.forCompleteText(
+              text = form.manuscriptText,
+              engine = "Direct Text Editor"
+            )
+          } else {
+            DocumentCoverageReport.unknown("No text or file coverage report attached")
+          },
           reviewStrictness = settings.reviewStrictness,
           options = form.options,
           externalProvider = activeExternal,
@@ -746,14 +805,15 @@ class PaperCriticViewModel(
         )
 
         val activeUid = _authenticatedUserId.value
-        val shouldSyncCloud = !settings.confidentialLocalOnly && settings.autoSaveToCloud && !activeUid.isNullOrBlank()
-        val finalReview = if (shouldSyncCloud) {
+        val cloudUid = activeUid?.takeIf { it.isNotBlank() }
+        val shouldSyncCloud = !settings.confidentialLocalOnly && settings.autoSaveToCloud && cloudUid != null
+        val finalReview = if (shouldSyncCloud && cloudUid != null) {
           val saveResult = repository.createReview(generatedReview)
           if (saveResult.isSuccess) {
             val newId = saveResult.getOrThrow()
-            val refreshed = repository.getReviewById(newId, activeUid!!).getOrNull()
+            val refreshed = repository.getReviewById(newId, cloudUid).getOrNull()
             _statusBanner.value = "Analysis complete & saved to Room Offline DB + Cloud Library."
-            refreshed ?: generatedReview.copy(id = newId, userId = activeUid)
+            refreshed ?: generatedReview.copy(id = newId, userId = cloudUid)
           } else {
             val localId = "local_${UUID.randomUUID()}"
             val fallback = generatedReview.copy(id = localId)
@@ -766,7 +826,7 @@ class PaperCriticViewModel(
           val localReview = generatedReview.copy(id = localId)
           _localReviews.update { listOf(localReview) + it }
           _statusBanner.value = if (settings.confidentialLocalOnly) {
-            "Confidential local-only mode: saved strictly to on-device Room DB (not synced to cloud)."
+            "Local-only report storage: saved strictly to on-device Room DB (not synced to cloud)."
           } else {
             "Analysis complete & cached in Room Offline Database!"
           }
@@ -774,13 +834,13 @@ class PaperCriticViewModel(
         }
 
         // Persist to local Room SQL database for offline access
-        runCatching {
+        runSuspendCatching {
           localRepository.cacheReviewOffline(finalReview)
         }
 
         _pipelineState.value = PipelineExecutionState.Completed(
           review = finalReview,
-          savedToCloud = !activeUid.isNullOrBlank() && !finalReview.id.startsWith("local_")
+          savedToCloud = cloudUid != null && !finalReview.id.startsWith("local_")
         )
         _selectedDossier.value = finalReview
         // Automatically switch to the dedicated Output tab (Tab 1)
@@ -808,7 +868,7 @@ class PaperCriticViewModel(
       } else {
         review
       }
-      runCatching {
+      runSuspendCatching {
         localRepository.cacheReviewOffline(ensured)
       }.onSuccess {
         _localReviews.update { list ->
@@ -825,6 +885,21 @@ class PaperCriticViewModel(
   }
 
   fun openDossier(review: PaperReview) {
+    if (_selectedDossier.value?.id != review.id) {
+      activeChatJob?.cancel()
+      activeChatJob = null
+      activeSearchGroundingJob?.cancel()
+      activeSearchGroundingJob = null
+      _chatConfigState.update {
+        it.copy(
+          isStreaming = false,
+          streamingPartialText = "",
+          streamingQueries = emptyList(),
+          streamingSources = emptyList(),
+          errorMessage = null
+        )
+      }
+    }
     _selectedDossier.value = review
     _followUpState.value = FollowUpQaState.Idle
     _searchGroundingState.value = SearchGroundingUiState.Idle
@@ -845,7 +920,7 @@ class PaperCriticViewModel(
       _selectedDossier.value = toggled
     }
     viewModelScope.launch {
-      runCatching { localRepository.cacheReviewOffline(toggled) }
+      runSuspendCatching { localRepository.cacheReviewOffline(toggled) }
     }
     if (activeUid.isNullOrBlank() || review.id.startsWith("local_") || review.id.startsWith("sql_") || review.createdAt == null) {
       _statusBanner.value = if (toggled.bookmarked) "Starred in offline Room cache." else "Removed star from offline Room cache."
@@ -875,7 +950,7 @@ class PaperCriticViewModel(
       _selectedDossier.value = updated
     }
     viewModelScope.launch {
-      runCatching { localRepository.cacheReviewOffline(updated) }
+      runSuspendCatching { localRepository.cacheReviewOffline(updated) }
     }
     if (activeUid.isNullOrBlank() || review.id.startsWith("local_") || review.id.startsWith("sql_") || review.createdAt == null) {
       _statusBanner.value = "Notes saved to Room offline dossier."
@@ -896,10 +971,14 @@ class PaperCriticViewModel(
     if (reviewId.isBlank()) return
     _localReviews.update { list -> list.filterNot { it.id == reviewId } }
     if (_selectedDossier.value?.id == reviewId) {
+      activeChatJob?.cancel()
+      activeChatJob = null
+      activeSearchGroundingJob?.cancel()
+      activeSearchGroundingJob = null
       _selectedDossier.value = null
     }
     viewModelScope.launch {
-      runCatching {
+      runSuspendCatching {
         localRepository.removeCachedReview(reviewId)
       }
     }
@@ -921,8 +1000,8 @@ class PaperCriticViewModel(
   // STAGE 03b: Live Google Search Grounding for Citations & Literature
   // ==========================================================================
   fun runStage03bGoogleSearchVerification(review: PaperReview) {
-    if (_searchGroundingState.value is SearchGroundingUiState.Loading) return
-    viewModelScope.launch {
+    if (activeSearchGroundingJob?.isActive == true || _searchGroundingState.value is SearchGroundingUiState.Loading) return
+    activeSearchGroundingJob = viewModelScope.launch {
       _searchGroundingState.value = SearchGroundingUiState.Loading
       try {
         val claimsBlock = buildString {
@@ -940,7 +1019,7 @@ class PaperCriticViewModel(
           claimsAndSummary = claimsBlock
         )
         _searchGroundingState.value = SearchGroundingUiState.Success(result)
-        runCatching {
+        runSuspendCatching {
           localRepository.cacheReviewOffline(
             review = review,
             searchGroundingReport = result.summaryText
@@ -953,12 +1032,17 @@ class PaperCriticViewModel(
           "Stage 03b Google Search Grounding timed out after 90 seconds."
         )
       } catch (e: CancellationException) {
+        if (_searchGroundingState.value is SearchGroundingUiState.Loading) {
+          _searchGroundingState.value = SearchGroundingUiState.Idle
+        }
         throw e
       } catch (e: Exception) {
         Log.e(TAG, "Google Search Grounding failed", e)
         _searchGroundingState.value = SearchGroundingUiState.Error(
           Reviewer2PipelineService.formatThrowableDetails(e)
         )
+      } finally {
+        activeSearchGroundingJob = null
       }
     }
   }
@@ -985,7 +1069,7 @@ class PaperCriticViewModel(
 
   fun sendMultiTurnChatMessage(review: PaperReview?, userMessage: String) {
     val trimmed = userMessage.trim()
-    if (trimmed.isBlank() || _chatConfigState.value.isStreaming) return
+    if (trimmed.isBlank() || _chatConfigState.value.isStreaming || activeChatJob?.isActive == true) return
 
     val currentConfig = refereeChatState.value
     val reviewKey = review?.id?.ifBlank { "global_workbench_chat" } ?: "global_workbench_chat"
@@ -993,9 +1077,9 @@ class PaperCriticViewModel(
       ChatTurnInput(role = it.role, text = it.text)
     }
 
-    viewModelScope.launch {
+    activeChatJob = viewModelScope.launch {
       // 1. Persist user message to SQLite
-      runCatching {
+      runSuspendCatching {
         localRepository.insertChatMessage(
           SqlChatMessageEntity(
             reviewId = reviewKey,
@@ -1049,7 +1133,7 @@ class PaperCriticViewModel(
         if (finalReply.isNotBlank()) {
           val serializedQueries = finalQueries.joinToString("||")
           val serializedSources = finalSources.joinToString("\n") { "${it.title}|~|${it.url}" }
-          runCatching {
+          runSuspendCatching {
             localRepository.insertChatMessage(
               SqlChatMessageEntity(
                 reviewId = reviewKey,
@@ -1087,6 +1171,14 @@ class PaperCriticViewModel(
           )
         }
       } catch (e: CancellationException) {
+        _chatConfigState.update {
+          it.copy(
+            isStreaming = false,
+            streamingPartialText = "",
+            streamingQueries = emptyList(),
+            streamingSources = emptyList()
+          )
+        }
         throw e
       } catch (e: Exception) {
         Log.e(TAG, "Multi-turn chat stream failed", e)
@@ -1096,14 +1188,18 @@ class PaperCriticViewModel(
             errorMessage = Reviewer2PipelineService.formatThrowableDetails(e)
           )
         }
+      } finally {
+        activeChatJob = null
       }
     }
   }
 
   fun clearMultiTurnChatHistory(review: PaperReview?) {
+    activeChatJob?.cancel()
+    activeChatJob = null
     val reviewKey = review?.id?.ifBlank { "global_workbench_chat" } ?: "global_workbench_chat"
     viewModelScope.launch {
-      runCatching { localRepository.clearChatHistory(reviewKey) }
+      runSuspendCatching { localRepository.clearChatHistory(reviewKey) }
       _chatConfigState.update {
         it.copy(
           isStreaming = false,
@@ -1151,7 +1247,7 @@ class PaperCriticViewModel(
       val updatedEntry = entry.copy(
         enabled = entry.apiKey.isNotBlank() || entry.protocolType == ApiProtocolType.FIREBASE_AI_LOGIC_KEYLESS
       )
-      val saveOutcome = runCatching {
+      val saveOutcome = runSuspendCatching {
         localRepository.upsertApiProvider(updatedEntry)
       }
       if (saveOutcome.isFailure) {
@@ -1215,7 +1311,7 @@ class PaperCriticViewModel(
   fun deleteCustomApiProvider(providerId: String) {
     if (providerId == DefaultAiProviderCatalog.BUILTIN_KEYLESS_ID) return
     viewModelScope.launch {
-      runCatching { localRepository.deleteApiProvider(providerId) }
+      runSuspendCatching { localRepository.deleteApiProvider(providerId) }
       if (_settingsState.value.activeProviderId == providerId) {
         updateSettings {
           it.copy(
@@ -1250,6 +1346,19 @@ class PaperCriticViewModel(
 
   fun dismissStatusBanner() {
     _statusBanner.value = null
+  }
+
+  override fun onCleared() {
+    activePipelineJob?.cancel()
+    activeChatJob?.cancel()
+    activeSearchGroundingJob?.cancel()
+    activeSyncJob?.cancel()
+    activePipelineJob = null
+    activeChatJob = null
+    activeSearchGroundingJob = null
+    activeSyncJob = null
+    _formState.update { it.copy(pdfPageBitmaps = emptyList()) }
+    super.onCleared()
   }
 
   companion object {

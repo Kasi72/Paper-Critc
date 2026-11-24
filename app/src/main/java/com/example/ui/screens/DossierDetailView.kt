@@ -31,6 +31,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Analytics
 import androidx.compose.material.icons.filled.AutoAwesome
@@ -48,7 +49,6 @@ import androidx.compose.material.icons.filled.Functions
 import androidx.compose.material.icons.filled.Gavel
 import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.OfflinePin
-import androidx.compose.material.icons.filled.OpenInNew
 import androidx.compose.material.icons.filled.PictureAsPdf
 import androidx.compose.material.icons.filled.Psychology
 import androidx.compose.material.icons.filled.ReportProblem
@@ -90,6 +90,8 @@ import androidx.compose.ui.unit.sp
 import com.example.data.ai.ChatbotRolePersona
 import com.example.data.ai.GeminiModelTier
 import com.example.data.ai.GroundedWebSource
+import com.example.data.ai.epistemic.FlawSeverityTier
+import com.example.data.ai.epistemic.ReportingStatus
 import com.example.data.model.FindingStatus
 import com.example.data.model.PaperReview
 import com.example.data.model.ReviewFinding
@@ -1238,17 +1240,34 @@ private fun Stage03bGoogleSearchGroundingCard(
             result.sources.forEach { src ->
               GroundedSourceItemRow(
                 source = src,
-                onClick = {
-                  runCatching {
-                    context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(src.url)))
-                  }
-                }
+                onClick = { openSafeExternalUrl(context, src.url) }
               )
             }
           }
         }
       }
     }
+  }
+}
+
+internal fun isSafeExternalWebUrl(rawUrl: String): Boolean {
+  val trimmed = rawUrl.trim()
+  if (trimmed.isBlank()) return false
+  val parsed = runCatching { Uri.parse(trimmed) }.getOrNull() ?: return false
+  val scheme = parsed.scheme?.lowercase() ?: return false
+  val host = parsed.host?.trim().orEmpty()
+  return (scheme == "https" || scheme == "http") && host.isNotBlank()
+}
+
+private fun openSafeExternalUrl(context: Context, rawUrl: String) {
+  if (!isSafeExternalWebUrl(rawUrl)) {
+    Toast.makeText(context, "Blocked unsupported link scheme.", Toast.LENGTH_SHORT).show()
+    return
+  }
+  runCatching {
+    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(rawUrl.trim()))
+      .addCategory(Intent.CATEGORY_BROWSABLE)
+    context.startActivity(intent)
   }
 }
 
@@ -1301,7 +1320,7 @@ private fun GroundedSourceItemRow(
       }
     }
     Icon(
-      imageVector = Icons.Default.OpenInNew,
+      imageVector = Icons.AutoMirrored.Filled.OpenInNew,
       contentDescription = "Open web source",
       tint = CupertinoBlue,
       modifier = Modifier.size(15.dp)
@@ -1454,11 +1473,7 @@ private fun MultiTurnGeminiChatbotCard(
         chatState.messages.forEach { msg ->
           ChatTurnBubble(
             message = msg,
-            onOpenUrl = { url ->
-              runCatching {
-                context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
-              }
-            }
+            onOpenUrl = { url -> openSafeExternalUrl(context, url) }
           )
         }
 
@@ -1475,11 +1490,7 @@ private fun MultiTurnGeminiChatbotCard(
           ChatTurnBubble(
             message = streamingMsg,
             isStreaming = true,
-            onOpenUrl = { url ->
-              runCatching {
-                context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
-              }
-            }
+            onOpenUrl = { url -> openSafeExternalUrl(context, url) }
           )
         }
       }
@@ -2368,6 +2379,24 @@ private fun EvidenceLedgerCard(
                   color = Color.White
                 )
               }
+              if (finding.reportingStatus == "NOT_ASSESSABLE_FROM_SUPPLIED_MATERIAL") {
+                Box(
+                  modifier = Modifier
+                    .clip(SquircleShape(cornerRadius = 4.dp, smoothing = 0.88f))
+                    .background(CupertinoAmber)
+                    .padding(horizontal = 6.dp, vertical = 2.dp)
+                    .testTag("finding_not_assessable_badge_${finding.id}")
+                ) {
+                  Text(
+                    text = "NOT ASSESSABLE",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontFamily = JetBrainsMonoFamily,
+                    fontSize = 9.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = Color.White
+                  )
+                }
+              }
             }
             val pageNum = finding.supportingEvidence.firstOrNull()?.pageNumber ?: 0
             if (pageNum > 0) {
@@ -2400,7 +2429,19 @@ private fun EvidenceLedgerCard(
             color = MaterialTheme.colorScheme.onSurface
           )
 
-          val quote = finding.supportingEvidence.firstOrNull()?.exactQuote?.trim().orEmpty()
+          if (finding.methodologicalJustification.isNotBlank()) {
+            Text(
+              text = "Why it matters: ${finding.methodologicalJustification}",
+              style = MaterialTheme.typography.labelSmall.copy(
+                fontSize = (11.5f * textScale).sp,
+                lineHeight = (16f * textScale).sp
+              ),
+              color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+          }
+
+          val primaryAnchor = finding.supportingEvidence.firstOrNull()
+          val quote = primaryAnchor?.exactQuote?.trim().orEmpty()
           if (quote.isNotBlank()) {
             Box(
               modifier = Modifier
@@ -2410,7 +2451,7 @@ private fun EvidenceLedgerCard(
                 .padding(horizontal = 8.dp, vertical = 6.dp)
             ) {
               Text(
-                text = "Source Quote: \"$quote\"",
+                text = "Evidence: \"$quote\"",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
               )
@@ -2436,53 +2477,92 @@ private fun EvidenceLedgerCard(
 
           if (finding.flawTier.isNotBlank() || finding.reportingStatus.isNotBlank()) {
             val tierText = buildList {
-              if (finding.flawTier.isNotBlank()) add("Tier: ${finding.flawTier.replace('_', ' ')}")
-              if (finding.reportingStatus.isNotBlank()) add("Reporting: ${finding.reportingStatus.replace('_', ' ')}")
+              if (finding.flawTier.isNotBlank()) {
+                add("Severity tier: ${FlawSeverityTier.fromNameOrDefault(finding.flawTier).displayLabel}")
+              }
+              if (finding.reportingStatus.isNotBlank()) {
+                add("Reporting status: ${ReportingStatus.fromNameOrDefault(finding.reportingStatus).displayLabel}")
+              }
             }.joinToString(" • ")
             Text(
               text = tierText,
               style = MaterialTheme.typography.labelSmall,
-              fontFamily = JetBrainsMonoFamily,
-              fontSize = 9.5.sp,
-              fontWeight = FontWeight.SemiBold,
+              fontWeight = FontWeight.Medium,
               color = CupertinoIndigo
-            )
-          }
-
-          if (finding.verificationNotes.isNotBlank()) {
-            Text(
-              text = "Audit: ${finding.verificationNotes}",
-              style = MaterialTheme.typography.labelSmall,
-              fontFamily = JetBrainsMonoFamily,
-              fontSize = 10.sp,
-              color = statusColor
-            )
-          }
-
-          if (finding.overturnEvidence.isNotBlank() && finding.status != FindingStatus.CONTRADICTED) {
-            Text(
-              text = "Overturn Evidence: ${finding.overturnEvidence}",
-              style = MaterialTheme.typography.labelSmall,
-              color = MaterialTheme.colorScheme.onSurfaceVariant
             )
           }
 
           if (finding.recommendedCorrection.isNotBlank() && finding.status != FindingStatus.CONTRADICTED) {
             Text(
-              text = "Action: ${finding.recommendedCorrection}",
+              text = "Required action: ${finding.recommendedCorrection}",
               style = MaterialTheme.typography.labelSmall,
               color = CupertinoBlue
             )
           }
 
-          if (finding.provenanceSummary.isNotBlank()) {
-            Text(
-              text = "Provenance: ${finding.provenanceSummary}",
-              style = MaterialTheme.typography.labelSmall,
-              fontFamily = JetBrainsMonoFamily,
-              fontSize = 9.sp,
-              color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
+          val hasTechnicalProvenance = finding.verificationNotes.isNotBlank() ||
+            finding.overturnEvidence.isNotBlank() ||
+            finding.provenanceSummary.isNotBlank() ||
+            (primaryAnchor?.startOffset != null && primaryAnchor.startOffset > 0)
+          if (hasTechnicalProvenance) {
+            var showProvenance by remember(finding.id) { mutableStateOf(false) }
+            TextButton(
+              onClick = { showProvenance = !showProvenance },
+              modifier = Modifier
+                .testTag("toggle_technical_provenance_${finding.id}")
+            ) {
+              Text(
+                text = if (showProvenance) "Hide technical provenance" else "Technical provenance & defense record",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+              )
+            }
+            if (showProvenance) {
+              Column(
+                modifier = Modifier
+                  .fillMaxWidth()
+                  .clip(SquircleShape(cornerRadius = 6.dp, smoothing = 0.88f))
+                  .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.55f))
+                  .padding(horizontal = 8.dp, vertical = 6.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp)
+              ) {
+                val startOff = primaryAnchor?.startOffset
+                val endOff = primaryAnchor?.endOffset
+                if (primaryAnchor != null && ((startOff != null && startOff > 0) || (endOff != null && endOff > 0))) {
+                  Text(
+                    text = "Source offsets: Page ${primaryAnchor.pageNumber} [${startOff ?: 0}–${endOff ?: 0}]",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontFamily = JetBrainsMonoFamily,
+                    fontSize = 9.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                  )
+                }
+                if (finding.verificationNotes.isNotBlank()) {
+                  Text(
+                    text = "Defense / Audit record: ${finding.verificationNotes}",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontSize = 10.sp,
+                    color = statusColor
+                  )
+                }
+                if (finding.overturnEvidence.isNotBlank() && finding.status != FindingStatus.CONTRADICTED) {
+                  Text(
+                    text = "Minimum overturn evidence: ${finding.overturnEvidence}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                  )
+                }
+                if (finding.provenanceSummary.isNotBlank()) {
+                  Text(
+                    text = "Parser / Rule / Coverage: ${finding.provenanceSummary}",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontFamily = JetBrainsMonoFamily,
+                    fontSize = 9.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                  )
+                }
+              }
+            }
           }
         }
       }

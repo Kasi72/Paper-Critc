@@ -2,6 +2,7 @@ package com.example.data.ai.stats
 
 import com.example.data.ai.QuantFindingStatus
 import com.example.data.ai.QuantitativeForensicAnalyzer
+import com.example.data.ai.semantic.ClaimCompatibilityStatus
 import com.example.data.ai.semantic.SemanticValidityEngine
 import java.util.Locale
 import kotlin.math.abs
@@ -87,6 +88,12 @@ object StatisticalClaimParser {
   // OR 2.10 (1.30–3.40), aHR = 0.74 (95% CI 0.58-0.94), RR = 1.52 (CI: 1.10 to 2.10), SMD = 0.45 (0.12, 0.78)
   private val effectCiFlexibleRegex = Regex(
     """\b(aOR|OR|aRR|RR|aHR|HR|IRR|PR|SMD|MD|WMD|RD|ARR|AUC|AUROC|PR-AUC|AUPRC|C-statistic|beta|β|mean|median|rate|prevalence|pooled(?:\s+\w+)?)\s*(?:of\s*|was\s*|[=:]\s*)?\s*([-−+]?\d+(?:\.\d+)?)\s*\(\s*(?:(?:(\d{2})%\s*)?(?:CI|CrI|UI|PI|confidence\s+interval)\s*[:=]?\s*)?([-−+]?\d+(?:\.\d+)?)\s*(?:to|–|—|-|,)\s*([-−+]?\d+(?:\.\d+)?)\s*\)""",
+    RegexOption.IGNORE_CASE
+  )
+
+  // Narrative comma-separated CIs: "PR = 2.21, 95% CI 0.00 to 4.50", "OR = 1.80, 95% CI 1.10–2.90", "estimate of 9, 95% CI 1.26 to 2.35"
+  private val effectCiNarrativeRegex = Regex(
+    """\b(aOR|OR|aRR|RR|aHR|HR|IRR|PR|SMD|MD|WMD|RD|ARR|AUC|AUROC|beta|β|mean|median|rate|prevalence|estimate|beds?|pooled(?:\s+\w+)?)\s*(?:of\s*|was\s*|[=:]\s*)\s*([-−+]?\d+(?:\.\d+)?)\s*[,;]\s*(?:with\s+(?:a\s+)?)?(?:(\d{2})%\s*)?(?:CI|CrI|UI|PI|confidence\s+interval)\s*(?:of\s*)?[:=]?\s*([-−+]?\d+(?:\.\d+)?)\s*(?:to|–|—|-)\s*([-−+]?\d+(?:\.\d+)?)""",
     RegexOption.IGNORE_CASE
   )
 
@@ -412,8 +419,11 @@ object StatisticalClaimParser {
       )
     }
 
-    // 3. Effect sizes with CIs (OR/RR/HR/IRR/SMD/MD/AUC/etc., with or without "95%")
-    effectCiFlexibleRegex.findAll(clean).take(40).forEach { m ->
+    // 3. Effect sizes with CIs (parenthesized + narrative comma-separated, e.g. PR = 2.21, 95% CI 0.00 to 4.50)
+    val effectCiRanges = mutableListOf<IntRange>()
+    fun recordEffectCiMatch(m: MatchResult, requireExplicitCiLabel: Boolean) {
+      if (effectCiRanges.any { existing -> m.range.first <= existing.last && m.range.last >= existing.first }) return
+      effectCiRanges.add(m.range)
       val label = m.groupValues[1].trim()
       val point = parseSignedDouble(m.groupValues[2])
       val levelPct = m.groupValues[3].toDoubleOrNull()
@@ -424,19 +434,25 @@ object StatisticalClaimParser {
       val afterEnd = (afterStart + 45).coerceAtMost(clean.length)
       val afterText = clean.substring(afterStart, afterEnd)
       val pMatch = standalonePRegex.find(afterText)
-      val isAmbiguousInterval = levelPct == null && !m.value.contains("CI", ignoreCase = true) &&
+      val isAmbiguousInterval = !requireExplicitCiLabel && levelPct == null && !m.value.contains("CI", ignoreCase = true) &&
         !m.value.contains("CrI", ignoreCase = true) && !m.value.contains("UI", ignoreCase = true) &&
         (label.equals("mean", ignoreCase = true) || label.equals("median", ignoreCase = true))
       val parseStatus = when {
         point == null || lowerBound == null || upperBound == null -> ClaimParseStatus.UNSUPPORTED
         isAmbiguousInterval -> ClaimParseStatus.AMBIGUOUS
-        levelPct == null && !m.value.contains("CI", ignoreCase = true) -> ClaimParseStatus.PARTIAL
+        !requireExplicitCiLabel && levelPct == null && !m.value.contains("CI", ignoreCase = true) -> ClaimParseStatus.PARTIAL
         else -> ClaimParseStatus.EXACT
       }
       val adj = when {
         label.startsWith("a", ignoreCase = true) && label.length in 3..4 -> AdjustmentStatus.ADJUSTED
         else -> ctx.adjustment
       }
+      val quoteEnd = if (pMatch != null) {
+        (afterStart + pMatch.range.last + 1).coerceAtMost(clean.length)
+      } else {
+        m.range.last + 1
+      }
+      val fullQuote = clean.substring(m.range.first, quoteEnd).trim()
       claims.add(
         QuantitativeClaim(
           claimId = nextClaimId(),
@@ -456,9 +472,9 @@ object StatisticalClaimParser {
           adjustedOrUnadjusted = adj,
           hierarchy = ctx.hierarchy,
           testingFamily = ctx.family,
-          sourceQuote = m.value.trim(),
+          sourceQuote = fullQuote,
           startOffset = m.range.first,
-          endOffset = m.range.last + 1,
+          endOffset = quoteEnd,
           isFromReferenceOrCitation = ctx.isReferenceOrCitation,
           parseStatus = parseStatus,
           parseNote = if (isAmbiguousInterval) "Parenthesized range lacks explicit CI/IQR/SD label; classified AMBIGUOUS." else "",
@@ -466,6 +482,9 @@ object StatisticalClaimParser {
         )
       )
     }
+
+    effectCiFlexibleRegex.findAll(clean).take(40).forEach { recordEffectCiMatch(it, requireExplicitCiLabel = false) }
+    effectCiNarrativeRegex.findAll(clean).take(30).forEach { recordEffectCiMatch(it, requireExplicitCiLabel = true) }
 
     // 4. Proportions (x / n (pct%))
     proportionRegex.findAll(clean).take(30).forEach { m ->
@@ -1084,35 +1103,54 @@ object StatisticalClaimParser {
     }
 
     // 6. Abstract vs. Results/Tables point-estimate contradiction for the same effect measure
-    // Guarded by Phase 8 CompoundClaimKey so identically named outcomes in DIFFERENT populations,
-    // subgroups, time points, estimators, or adjustment states NEVER trigger a false contradiction!
+    // Revision B strict semantic matching: two claims are compared for FAIL contradiction ONLY when
+    // CompoundClaimKey.evaluateCompatibility(...) == COMPATIBLE (explicitly observed equal fields;
+    // `unspecified == unspecified` returns AMBIGUOUS and NEVER supports a hard contradiction!).
     val abstractEffects = activeEffects.filter { it.section.equals("Abstract", true) && it.ciLower != null && it.ciUpper != null }
     val resultsEffects = activeEffects.filter { it.section in setOf("Results", "Tables") && it.ciLower != null && it.ciUpper != null }
     for (absClaim in abstractEffects.take(4)) {
       val matchingRes = resultsEffects.firstOrNull { r ->
-        val keysCompatible = absClaim.compoundKey == null || r.compoundKey == null ||
-          absClaim.compoundKey.isCompatibleForComparison(r.compoundKey)
-        keysCompatible &&
-          r.effectMeasure.equals(absClaim.effectMeasure, ignoreCase = true) &&
-          r.adjustedOrUnadjusted == absClaim.adjustedOrUnadjusted &&
+        r.effectMeasure.equals(absClaim.effectMeasure, ignoreCase = true) &&
           absClaim.pointEstimate != null && r.pointEstimate != null &&
           absClaim.ciLower != null && r.ciLower != null &&
           abs(absClaim.ciLower - r.ciLower) < 0.02 && abs((absClaim.ciUpper ?: 0.0) - (r.ciUpper ?: 0.0)) < 0.02 &&
-          abs(absClaim.pointEstimate - r.pointEstimate) > 0.05
+          abs(absClaim.pointEstimate - r.pointEstimate) > 0.05 &&
+          (absClaim.compoundKey != null && r.compoundKey != null &&
+            absClaim.compoundKey.evaluateCompatibility(r.compoundKey) != ClaimCompatibilityStatus.INCOMPATIBLE)
       }
-      if (matchingRes != null) {
-        links.add(
-          EvidenceCrossLink(
-            linkId = nextLinkId(),
-            linkType = "CROSS_SECTION_CONTRADICTION",
-            findingType = StatisticalFindingType.INTERNAL_CONTRADICTION,
-            status = QuantFindingStatus.FAIL,
-            pageNumbers = listOf(absClaim.page, matchingRes.page).filter { it > 0 }.distinct(),
-            sectionsInvolved = listOf(absClaim.section, matchingRes.section),
-            description = "Abstract (${absClaim.sourceQuote}) and ${matchingRes.section} (${matchingRes.sourceQuote}) share identical CI bounds and compatible compound claim key (${absClaim.compoundKey?.toKeyLabel() ?: "matched"}) but report conflicting point estimates.",
-            sourceQuotes = listOf(absClaim.sourceQuote, matchingRes.sourceQuote)
+      val absKey = absClaim.compoundKey
+      val resKey = matchingRes?.compoundKey
+      if (matchingRes != null && absKey != null && resKey != null) {
+        val compat = absKey.evaluateCompatibility(resKey)
+        if (compat == ClaimCompatibilityStatus.COMPATIBLE) {
+          links.add(
+            EvidenceCrossLink(
+              linkId = nextLinkId(),
+              linkType = "CROSS_SECTION_CONTRADICTION",
+              findingType = StatisticalFindingType.INTERNAL_CONTRADICTION,
+              status = QuantFindingStatus.FAIL,
+              pageNumbers = listOf(absClaim.page, matchingRes.page).filter { it > 0 }.distinct(),
+              sectionsInvolved = listOf(absClaim.section, matchingRes.section),
+              description = "Abstract (${absClaim.sourceQuote}) and ${matchingRes.section} (${matchingRes.sourceQuote}) share identical CI bounds and strictly compatible compound claim key (${absKey.toKeyLabel()}) but report conflicting point estimates.",
+              sourceQuotes = listOf(absClaim.sourceQuote, matchingRes.sourceQuote)
+            )
           )
-        )
+        } else if (compat == ClaimCompatibilityStatus.AMBIGUOUS) {
+          val missingFields = absKey.unspecifiedComparisonFields(resKey)
+          links.add(
+            EvidenceCrossLink(
+              linkId = nextLinkId(),
+              linkType = "AMBIGUOUS_CROSS_SECTION_SHIFT",
+              findingType = StatisticalFindingType.UNSUPPORTED_TO_ASSESS,
+              status = QuantFindingStatus.WARN,
+              pageNumbers = listOf(absClaim.page, matchingRes.page).filter { it > 0 }.distinct(),
+              sectionsInvolved = listOf(absClaim.section, matchingRes.section),
+              description = "Abstract (${absClaim.sourceQuote}) and ${matchingRes.section} (${matchingRes.sourceQuote}) differ in point estimate with similar CI bounds, but comparison is AMBIGUOUS because critical compound-key field(s) are unspecified (${missingFields.joinToString(", ")}); not escalated to contradiction.",
+              sourceQuotes = listOf(absClaim.sourceQuote, matchingRes.sourceQuote),
+              isScreeningSignal = true
+            )
+          )
+        }
       }
     }
 

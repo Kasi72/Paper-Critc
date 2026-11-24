@@ -44,7 +44,7 @@ data class SqlReviewCacheEntity(
   val extractionConfidence: Int = 4,
   val reviewMode: String = ReviewMode.POST_PUBLICATION_APPRAISAL.name,
   val coverageDisclosure: String = "",
-  val validationStatus: String = "VERIFIED",
+  val validationStatus: String = "LEGACY_UNVALIDATED",
   val structuredFindingsJson: String = "",
   val abstractSummary: String,
   val researchQuestion: String,
@@ -149,7 +149,7 @@ data class SqlReviewCacheEntity(
         extractionConfidence = rubric.extractionConfidence,
         reviewMode = review.reviewMode.ifBlank { ReviewMode.POST_PUBLICATION_APPRAISAL.name },
         coverageDisclosure = review.coverageDisclosure,
-        validationStatus = review.validationStatus.ifBlank { "VERIFIED" },
+        validationStatus = review.validationStatus.ifBlank { "LEGACY_UNVALIDATED" },
         structuredFindingsJson = review.structuredFindingsJson,
         abstractSummary = review.abstractSummary,
         researchQuestion = review.researchQuestion,
@@ -290,7 +290,7 @@ interface PaperCriticSqlDao {
     SqlChatMessageEntity::class,
     SqlApiProviderEntity::class
   ],
-  version = 4,
+  version = 5,
   exportSchema = false
 )
 abstract class PaperCriticSqlDatabase : RoomDatabase() {
@@ -303,6 +303,7 @@ abstract class PaperCriticSqlDatabase : RoomDatabase() {
     /**
      * Explicit non-destructive migration preserving all existing user reviews, chat messages,
      * and provider settings when upgrading from Room schema v3 to v4.
+     * Legacy reviews without a structured evidence ledger MUST NOT be marked VERIFIED.
      */
     val MIGRATION_3_4 = object : Migration(3, 4) {
       override fun migrate(db: SupportSQLiteDatabase) {
@@ -316,8 +317,21 @@ abstract class PaperCriticSqlDatabase : RoomDatabase() {
         db.execSQL("ALTER TABLE sql_review_cache ADD COLUMN extractionConfidence INTEGER NOT NULL DEFAULT 4")
         db.execSQL("ALTER TABLE sql_review_cache ADD COLUMN reviewMode TEXT NOT NULL DEFAULT 'POST_PUBLICATION_APPRAISAL'")
         db.execSQL("ALTER TABLE sql_review_cache ADD COLUMN coverageDisclosure TEXT NOT NULL DEFAULT ''")
-        db.execSQL("ALTER TABLE sql_review_cache ADD COLUMN validationStatus TEXT NOT NULL DEFAULT 'VERIFIED'")
+        db.execSQL("ALTER TABLE sql_review_cache ADD COLUMN validationStatus TEXT NOT NULL DEFAULT 'LEGACY_UNVALIDATED'")
         db.execSQL("ALTER TABLE sql_review_cache ADD COLUMN structuredFindingsJson TEXT NOT NULL DEFAULT ''")
+      }
+    }
+
+    /**
+     * Non-destructive v4 -> v5 data hygiene migration: relabels any legacy migrated rows that
+     * were assigned 'VERIFIED' despite having no structured findings ledger to 'LEGACY_UNVALIDATED'.
+     */
+    val MIGRATION_4_5 = object : Migration(4, 5) {
+      override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL(
+          "UPDATE sql_review_cache SET validationStatus = 'LEGACY_UNVALIDATED' " +
+            "WHERE validationStatus = 'VERIFIED' AND (structuredFindingsJson IS NULL OR TRIM(structuredFindingsJson) = '' OR TRIM(structuredFindingsJson) = '[]')"
+        )
       }
     }
 
@@ -328,7 +342,7 @@ abstract class PaperCriticSqlDatabase : RoomDatabase() {
           PaperCriticSqlDatabase::class.java,
           "paper_critic_sql_database"
         )
-          .addMigrations(MIGRATION_3_4)
+          .addMigrations(MIGRATION_3_4, MIGRATION_4_5)
           .build()
         INSTANCE = instance
         instance

@@ -4,6 +4,7 @@ import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
 import android.util.Log
+import kotlinx.coroutines.CancellationException
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -138,6 +139,8 @@ fun attemptAutoSignIn(
       } else {
         onUnauthenticated()
       }
+    } catch (e: CancellationException) {
+      throw e
     } catch (e: Exception) {
       onUnauthenticated()
     }
@@ -184,6 +187,8 @@ fun onGoogleSignInClicked(
       } else {
         onAuthError("Unexpected credential type returned by Google Sign-In.")
       }
+    } catch (e: CancellationException) {
+      throw e
     } catch (e: GetCredentialCancellationException) {
       Log.w("Auth", "Google Sign-In flow cancelled or dismissed: ${e.message}", e)
       onAuthCancelled()

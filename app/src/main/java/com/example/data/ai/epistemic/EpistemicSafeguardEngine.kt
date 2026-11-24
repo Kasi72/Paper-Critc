@@ -2,9 +2,12 @@ package com.example.data.ai.epistemic
 
 import com.example.data.ai.QuantFindingStatus
 import com.example.data.ai.QuantitativeForensicAnalyzer
+import com.example.data.ai.semantic.MethodologicalAssessmentStatus
+import com.example.data.ai.semantic.SemanticValidityEngine
 import com.example.data.ai.stats.AuditSubDesign
 import com.example.data.ai.stats.StatisticalAuditReport
 import com.example.data.ai.stats.StatisticalFindingType
+import com.example.util.CoverageStatus
 import com.example.util.DocumentCoverageReport
 import java.util.Locale
 import kotlin.math.abs
@@ -13,7 +16,7 @@ import kotlin.math.max
 /**
  * Deterministic Epistemic Safeguard Engine implementing Safeguards #1–#12 and #15.
  * Designed to prevent confident misinterpretation of study designs, missing evidence,
- * denominator shifts, claim overreach, and clinically trivial or underpowered results.
+ * denominator shifts, claim overreach, and clinically uncalibrated or underpowered results.
  */
 object EpistemicSafeguardEngine {
 
@@ -21,8 +24,20 @@ object EpistemicSafeguardEngine {
     text: String,
     statAudit: StatisticalAuditReport,
     coverageReport: DocumentCoverageReport? = null,
-    extractionConfidence: Int = 5
+    extractionConfidence: Int = coverageReport?.extractionConfidence ?: DocumentCoverageReport.EXTRACTION_CONFIDENCE_UNKNOWN
   ): EpistemicSafeguardReport {
+    val effectiveCoverage = coverageReport ?: DocumentCoverageReport.unknown()
+    val effectiveConfidence = if (coverageReport == null && extractionConfidence == DocumentCoverageReport.EXTRACTION_CONFIDENCE_UNKNOWN) {
+      DocumentCoverageReport.EXTRACTION_CONFIDENCE_UNKNOWN
+    } else {
+      extractionConfidence
+    }
+    val effectiveCoverageStatus = when {
+      coverageReport == null -> if (effectiveConfidence > 0) CoverageStatus.PARTIAL else CoverageStatus.UNKNOWN
+      effectiveCoverage.isCoverageUnknown || effectiveConfidence == DocumentCoverageReport.EXTRACTION_CONFIDENCE_UNKNOWN -> CoverageStatus.UNKNOWN
+      else -> effectiveCoverage.coverageStatus
+    }
+
     val clean = text.replace("\r\n", "\n")
     val lower = clean.lowercase(Locale.US)
     val subDesign = statAudit.subDesign
@@ -35,8 +50,27 @@ object EpistemicSafeguardEngine {
     val practicalGate = buildPracticalSignificanceGate(clean, lower, statAudit)
     val altExplanations = buildAlternativeExplanations(clean, lower, subDesign, statAudit, denominatorLedger)
     val fragilityItems = buildConclusionFragility(subDesign, statAudit, denominatorLedger, claimAudit, practicalGate)
-    val stopAndAsk = buildStopAndAskAssessment(clean, lower, identityCard, denominatorLedger, primaryDecl, statAudit, coverageReport, extractionConfidence)
-    val uncertaintyBudget = buildUncertaintyBudget(lower, subDesign, statAudit, denominatorLedger, coverageReport, extractionConfidence, stopAndAsk)
+    val stopAndAsk = buildStopAndAskAssessment(
+      clean,
+      lower,
+      identityCard,
+      denominatorLedger,
+      primaryDecl,
+      statAudit,
+      coverageReport,
+      effectiveConfidence,
+      effectiveCoverageStatus
+    )
+    val uncertaintyBudget = buildUncertaintyBudget(
+      lower,
+      subDesign,
+      statAudit,
+      denominatorLedger,
+      coverageReport,
+      effectiveConfidence,
+      effectiveCoverageStatus,
+      stopAndAsk
+    )
     val overturnConditions = buildOverturnConditions(denominatorLedger, claimAudit, contradictionMap, statAudit)
 
     return EpistemicSafeguardReport(
@@ -50,13 +84,174 @@ object EpistemicSafeguardEngine {
       practicalSignificanceGate = practicalGate,
       uncertaintyBudget = uncertaintyBudget,
       overturnConditions = overturnConditions,
-      stopAndAsk = stopAndAsk
+      stopAndAsk = stopAndAsk,
+      coverageStatus = effectiveCoverageStatus,
+      extractionConfidence = effectiveConfidence,
+      strongConclusionsDisabled = stopAndAsk.strongConclusionsDisabled
     )
   }
 
   // ============================================================================
-  // #1. STUDY IDENTITY CARD (Forced before methodological critique)
+  // #1. STUDY IDENTITY CARD (Design-specific, provenance-ranked, venue/ref-safe)
   // ============================================================================
+  private val affiliationOrVenueLineRegex = Regex(
+    """(?i)(?:\b(?:department\s+of|division\s+of|faculty\s+of|school\s+of|institute\s+of|university\s+of|universit[äa]tsmedizin|charit[eé]|campus\s+\w+|medical\s+center|hospital\b|clinic\b|correspond(?:ence|ing\s+author)|e-?mail\s*:|orcid|doi\s*:|issn\b|©\s*\d{4}|copyright\b|published\s+by|received\s*:|accepted\s*:|available\s+online|open\s+access|funding\s*:|acknowledg(?:e)?ments?|competing\s+interests|conflict\s+of\s+interest)\b|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})"""
+  )
+  private val referenceSectionHeadingRegex = Regex(
+    """(?im)^\s*(?:\d+(?:\.\d+)*\.?\s+)?(references|bibliography|works\s+cited|literature\s+cited)\s*$"""
+  )
+  private val inlineCitationClauseRegex = Regex(
+    """\([^()\n]{0,90}\b(?:19|20)\d{2}[a-z]?\b[^()\n]{0,40}\)"""
+  )
+  private val priorWorkSentenceRegex = Regex(
+    """(?i)\b(?:previously\s+reported|prior\s+stud(?:y|ies)|earlier\s+(?:study|trial|review|meta-analysis)|in\s+contrast\s+to\s+[A-Z][a-z]+|consistent\s+with\s+[A-Z][a-z]+|[A-Z][a-z]+\s+et\s+al\.?\s*\(?\d{4}\)?)"""
+  )
+
+  private data class IdentitySectionCorpus(
+    val methodsText: String,
+    val abstractText: String,
+    val resultsText: String,
+    val cleanBodyText: String
+  )
+
+  private fun buildCleanIdentityCorpus(rawText: String): IdentitySectionCorpus {
+    val refMatch = referenceSectionHeadingRegex.find(rawText)
+    val withoutRefs = if (refMatch != null && refMatch.range.first > 80) {
+      rawText.substring(0, refMatch.range.first)
+    } else {
+      rawText
+    }
+    val filteredLines = withoutRefs.lines().filterNot { line ->
+      val trimmed = line.trim()
+      if (trimmed.isEmpty()) return@filterNot false
+      if (trimmed.startsWith("[PAGE ", ignoreCase = true)) return@filterNot false
+      // Exclude author affiliation, campus/venue headers, publisher boilerplate, and correspondence lines
+      val isAffiliation = affiliationOrVenueLineRegex.containsMatchIn(trimmed) &&
+        !trimmed.contains("Methods", ignoreCase = true) &&
+        !trimmed.contains("Abstract", ignoreCase = true) &&
+        !trimmed.contains("Results", ignoreCase = true) &&
+        trimmed.length < 220
+      val isStandaloneCitation = Regex("""^\s*(?:\[\d+\]|\d+\.\s+[A-Z][a-z]+,\s+[A-Z])""").containsMatchIn(trimmed)
+      isAffiliation || isStandaloneCitation
+    }
+    val cleaned = filteredLines.joinToString("\n")
+      .replace(inlineCitationClauseRegex, " ")
+
+    fun sliceSection(headerPattern: String): String {
+      val headerRegex = Regex("""(?im)^\s*(?:\d+(?:\.\d+)*\.?\s+)?(?:$headerPattern)\b[^\n]*$""")
+      val nextHeaderRegex = Regex(
+        """(?im)^\s*(?:\d+(?:\.\d+)*\.?\s+)?(?:abstract|introduction|background|methods?|materials?\s+and\s+methods?|statistical\s+analysis|results?|findings?|discussion|conclusions?|limitations?|references|bibliography|appendix|supplementary)\b[^\n]*$"""
+      )
+      val startMatch = headerRegex.find(cleaned) ?: return ""
+      val bodyStart = startMatch.range.last + 1
+      if (bodyStart >= cleaned.length) return ""
+      val nextMatch = nextHeaderRegex.find(cleaned, startIndex = bodyStart)
+      val bodyEnd = nextMatch?.range?.first ?: cleaned.length
+      return cleaned.substring(bodyStart, bodyEnd).trim()
+    }
+
+    val methods = sliceSection("""methods?|materials?\s+and\s+methods?|study\s+design|search\s+strategy|statistical\s+analysis""")
+    val abs = sliceSection("""abstract|summary""")
+    val results = sliceSection("""results?|findings?""")
+    return IdentitySectionCorpus(
+      methodsText = methods,
+      abstractText = abs,
+      resultsText = results,
+      cleanBodyText = cleaned
+    )
+  }
+
+  private fun isPriorCitationSentence(source: String, matchStart: Int): Boolean {
+    val lineStart = source.lastIndexOf('.', (matchStart - 1).coerceAtLeast(0)).let { if (it < 0) 0 else it + 1 }
+    val lineEnd = source.indexOf('.', matchStart).let { if (it < 0) source.length else it }
+    val sentence = source.substring(lineStart, lineEnd)
+    return priorWorkSentenceRegex.containsMatchIn(sentence)
+  }
+
+  private fun extractRankedCandidate(
+    corpus: IdentitySectionCorpus,
+    fullRawText: String,
+    regex: Regex,
+    groupIndex: Int = 0,
+    validator: (String) -> Boolean = { true }
+  ): ExtractedField<String> {
+    data class RankedHit(val value: String, val section: String, val page: Int?, val quote: String, val score: Double)
+    val hits = mutableListOf<RankedHit>()
+    val orderedSections = listOf(
+      "Methods" to (corpus.methodsText to 1.0),
+      "Abstract" to (corpus.abstractText to 0.85),
+      "Results" to (corpus.resultsText to 0.72),
+      "Body" to (corpus.cleanBodyText to 0.55)
+    )
+    for ((sectionName, pair) in orderedSections) {
+      val (sectionText, weight) = pair
+      if (sectionText.isBlank()) continue
+      regex.findAll(sectionText).take(6).forEach { m ->
+        if (isPriorCitationSentence(sectionText, m.range.first)) return@forEach
+        val candidate = (if (groupIndex == 0) m.value else m.groupValues.getOrNull(groupIndex).orEmpty())
+          .replace(Regex("""\s+"""), " ")
+          .trim()
+        if (candidate.isBlank() || !validator(candidate)) return@forEach
+        if (affiliationOrVenueLineRegex.containsMatchIn(candidate)) return@forEach
+        val rawOffset = fullRawText.indexOf(candidate)
+        val page = if (rawOffset >= 0) QuantitativeForensicAnalyzer.resolvePageNumberAtOffset(fullRawText, rawOffset).takeIf { it > 0 } else null
+        hits.add(RankedHit(candidate, sectionName, page, m.value.trim().take(120), weight))
+      }
+      if (hits.any { it.section == sectionName }) break
+    }
+    if (hits.isEmpty()) {
+      return ExtractedField(
+        value = null,
+        applicability = FieldApplicability.NOT_REPORTED,
+        sourceSection = null,
+        sourcePage = null,
+        sourceQuote = null,
+        confidence = 0.0
+      )
+    }
+    val best = hits.maxByOrNull { it.score } ?: return ExtractedField(
+      value = null,
+      applicability = FieldApplicability.NOT_REPORTED,
+      sourceSection = null,
+      sourcePage = null,
+      sourceQuote = null,
+      confidence = 0.0
+    )
+    val distinctValues = hits.map { it.value }.distinct()
+    return ExtractedField(
+      value = best.value,
+      applicability = FieldApplicability.APPLICABLE,
+      sourceSection = best.section,
+      sourcePage = best.page,
+      sourceQuote = best.quote,
+      confidence = best.score,
+      ambiguousCandidates = if (distinctValues.size > 1) distinctValues.take(3) else emptyList()
+    )
+  }
+
+  private fun isDescriptiveOrNormativeSynthesis(subDesign: AuditSubDesign, cleanLower: String): Boolean {
+    if (subDesign != AuditSubDesign.META_ANALYSIS && subDesign != AuditSubDesign.SYSTEMATIC_REVIEW) return false
+    val normativeSignals = cleanLower.contains("bed need") ||
+      cleanLower.contains("beds per") ||
+      cleanLower.contains("psychiatric bed") ||
+      cleanLower.contains("inpatient bed") ||
+      cleanLower.contains("capacity") ||
+      cleanLower.contains("prevalence") ||
+      cleanLower.contains("incidence") ||
+      cleanLower.contains("normative") ||
+      cleanLower.contains("benchmark") ||
+      cleanLower.contains("resource planning") ||
+      cleanLower.contains("service planning") ||
+      cleanLower.contains("epidemiological synthesis")
+    val hasExplicitInterventionTrial = cleanLower.contains("randomized controlled trial") ||
+      cleanLower.contains("randomised controlled trial") ||
+      cleanLower.contains("intervention vs") ||
+      cleanLower.contains("versus placebo") ||
+      cleanLower.contains("treatment vs control") ||
+      cleanLower.contains("drug efficacy")
+    return normativeSignals && !hasExplicitInterventionTrial
+  }
+
   private fun buildStudyIdentityCard(
     text: String,
     l: String,
@@ -65,14 +260,23 @@ object EpistemicSafeguardEngine {
     ledger: DenominatorLedger,
     coverage: DocumentCoverageReport?
   ): StudyIdentityCard {
-    val hasExplicitDesignKeyword = l.contains("randomized") || l.contains("randomised") || l.contains("cohort") ||
-      l.contains("case-control") || l.contains("cross-sectional") || l.contains("meta-analysis") ||
-      l.contains("systematic review") || l.contains("difference-in-differences") || l.contains("instrumental variable") ||
-      l.contains("regression discontinuity") || l.contains("diagnostic accuracy") || l.contains("kaplan-meier") ||
-      l.contains("cox proportional") || l.contains("neural network") || l.contains("transformer") ||
-      l.contains("benchmark") || l.contains("theorem") || l.contains("proof") || l.contains("descriptive") || l.contains("survey")
+    val corpus = buildCleanIdentityCorpus(text)
+    val cleanBody = corpus.cleanBodyText
+    val cleanLower = cleanBody.lowercase(Locale.US)
+    val methodsAndAbstractLower = "${corpus.methodsText}\n${corpus.abstractText}".lowercase(Locale.US).ifBlank { cleanLower }
+    val extractedMap = mutableMapOf<String, ExtractedField<String>>()
 
-    val isCrossSectional = l.contains("cross-sectional") || l.contains("cross sectional") || l.contains("prevalence survey")
+    val hasExplicitDesignKeyword = cleanLower.contains("randomized") || cleanLower.contains("randomised") || cleanLower.contains("cohort") ||
+      cleanLower.contains("case-control") || cleanLower.contains("cross-sectional") || cleanLower.contains("meta-analysis") ||
+      cleanLower.contains("systematic review") || cleanLower.contains("difference-in-differences") || cleanLower.contains("instrumental variable") ||
+      cleanLower.contains("regression discontinuity") || cleanLower.contains("diagnostic accuracy") || cleanLower.contains("kaplan-meier") ||
+      cleanLower.contains("cox proportional") || cleanLower.contains("neural network") || cleanLower.contains("transformer") ||
+      cleanLower.contains("benchmark") || cleanLower.contains("theorem") || cleanLower.contains("proof") || cleanLower.contains("descriptive") || cleanLower.contains("survey")
+
+    val isCrossSectional = cleanLower.contains("cross-sectional") || cleanLower.contains("cross sectional") || cleanLower.contains("prevalence survey")
+    val isReviewOrMeta = subDesign == AuditSubDesign.META_ANALYSIS || subDesign == AuditSubDesign.SYSTEMATIC_REVIEW
+    val isNormativeReview = isDescriptiveOrNormativeSynthesis(subDesign, cleanLower)
+
     val designLabel = if (isCrossSectional && subDesign == AuditSubDesign.GENERAL_EMPIRICAL) {
       "Cross-Sectional Observational Survey"
     } else if (hasExplicitDesignKeyword) {
@@ -86,75 +290,198 @@ object EpistemicSafeguardEngine {
     )
 
     val unitOfAnalysis = when {
-      subDesign == AuditSubDesign.META_ANALYSIS || subDesign == AuditSubDesign.SYSTEMATIC_REVIEW ->
-        IdentityField("Published studies / trials (aggregate study-level; NOT independent patient-level rows)", ReportingStatus.REPORTED_AND_ADEQUATE)
+      isReviewOrMeta ->
+        IdentityField(
+          if (cleanLower.contains("estimate")) "Published studies / publications and extracted estimates (study-level synthesis)"
+          else "Published studies / trials (aggregate study-level; NOT independent patient-level rows)",
+          ReportingStatus.REPORTED_AND_ADEQUATE
+        )
       subDesign == AuditSubDesign.FORMAL_THEOREM ->
         IdentityField("Mathematical objects / theorems / formal proofs", ReportingStatus.REPORTED_AND_ADEQUATE)
-      l.contains("state-year") || l.contains("county-year") || l.contains("firm-year") || l.contains("panel") ->
+      cleanLower.contains("state-year") || cleanLower.contains("county-year") || cleanLower.contains("firm-year") || cleanLower.contains("panel") ->
         IdentityField("Clustered panel units (e.g., state/firm/region-time observations)", ReportingStatus.REPORTED_AND_ADEQUATE)
-      l.contains("patient") || l.contains("participant") || l.contains("subject") ->
+      cleanLower.contains("patient") || cleanLower.contains("participant") || cleanLower.contains("subject") ->
         IdentityField(
-          if (l.contains("multiple images per patient") || l.contains("repeated measures") || l.contains("multiple visits"))
+          if (cleanLower.contains("multiple images per patient") || cleanLower.contains("repeated measures") || cleanLower.contains("multiple visits"))
             "Repeated observations nested within patients/subjects"
           else "Individual patients / participants",
           ReportingStatus.REPORTED_AND_ADEQUATE
         )
-      l.contains("image") || l.contains("sample") || l.contains("document") ->
+      cleanLower.contains("image") || cleanLower.contains("sample") || cleanLower.contains("document") ->
         IdentityField("Dataset instances / samples", ReportingStatus.REPORTED_AND_ADEQUATE)
       else -> IdentityField("Uncertain unit of analysis", ReportingStatus.NOT_REPORTED)
     }
 
-    val popMatch = Regex("""(?:patients?|participants?|adults?|children|subjects?|hospitals?|states?|studies|trials|samples?)\s+(?:with|undergoing|diagnosed\s+with|aged|from|across)\s+[^.,;\n]{4,70}""", RegexOption.IGNORE_CASE).find(text)
-    val population = if (popMatch != null) {
-      IdentityField(popMatch.value.trim(), ReportingStatus.REPORTED_AND_ADEQUATE)
+    val popExtracted = extractRankedCandidate(
+      corpus = corpus,
+      fullRawText = text,
+      regex = Regex(
+        """(?:patients?|participants?|adults?|children|adolescents?|subjects?|hospitals?|countries|regions?|states?|populations?|psychiatric\s+(?:services?|inpatient\s+services?|populations?)|studies|publications)\s+(?:with|undergoing|diagnosed\s+with|aged|from|across|in|requiring)\s+[^.,;\n]{4,75}""",
+        RegexOption.IGNORE_CASE
+      )
+    )
+    extractedMap["population"] = popExtracted
+    val population = if (popExtracted.value != null) {
+      IdentityField(popExtracted.value, ReportingStatus.REPORTED_AND_ADEQUATE)
     } else if (subDesign == AuditSubDesign.FORMAL_THEOREM) {
       IdentityField("Formal domain / metric or Hilbert/Banach space", ReportingStatus.REPORTED_AND_ADEQUATE)
-    } else if (l.contains("patient") || l.contains("participant") || l.contains("cohort") || l.contains("studies") || l.contains("dataset")) {
+    } else if (cleanLower.contains("patient") || cleanLower.contains("participant") || cleanLower.contains("cohort") || cleanLower.contains("studies") || cleanLower.contains("population")) {
       IdentityField("Study population referenced generically (exact eligibility criteria limited)", ReportingStatus.REPORTED_BUT_INADEQUATE)
     } else {
       IdentityField("Population not identified", ReportingStatus.NOT_REPORTED)
     }
 
-    val expMatch = Regex("""(?:intervention|treatment|drug|therapy|exposure|policy|minimum[- ]wage|statin|biomarker|classifier|model|algorithm)\s+(?:of|with|using|:)?\s*[^.,;\n]{2,55}""", RegexOption.IGNORE_CASE).find(text)
+    // Exposure / Intervention: STRICTLY exclude venue/affiliation lines and mark NOT_APPLICABLE for descriptive/normative meta-analyses
+    val hasExplicitReviewIntervention = isReviewOrMeta && !isNormativeReview && Regex(
+      """\b(?:intervention\s+group|treatment\s+arm|randomized\s+trials?\s+of|efficacy\s+of|effectiveness\s+of\s+(?:a|an|the)?\s*\w+\s+(?:drug|therapy|intervention|treatment))\b""",
+      RegexOption.IGNORE_CASE
+    ).containsMatchIn(methodsAndAbstractLower)
+
+    val expExtracted = if (isReviewOrMeta && !hasExplicitReviewIntervention) {
+      ExtractedField<String>(
+        value = "Not applicable",
+        applicability = FieldApplicability.NOT_APPLICABLE,
+        sourceSection = null,
+        sourcePage = null,
+        sourceQuote = null,
+        confidence = 1.0
+      )
+    } else {
+      extractRankedCandidate(
+        corpus = corpus,
+        fullRawText = text,
+        regex = Regex(
+          """\b(?:intervention|treatment|drug|pharmacotherapy|exposure|policy|minimum[- ]wage|statin|biomarker|classifier|model|algorithm)\s+(?:of|with|using|:)?\s*[^.,;\n]{3,60}""",
+          RegexOption.IGNORE_CASE
+        ),
+        validator = { cand ->
+          val cl = cand.lowercase(Locale.US)
+          !cl.contains("campus") && !cl.contains("psychotherapy") && !cl.contains("department") && !cl.contains("university")
+        }
+      )
+    }
+    extractedMap["exposureOrIntervention"] = expExtracted
     val exposure = when {
       subDesign == AuditSubDesign.FORMAL_THEOREM -> IdentityField("Formal hypotheses / theorem conditions", ReportingStatus.REPORTED_AND_ADEQUATE)
-      expMatch != null -> IdentityField(expMatch.value.trim(), ReportingStatus.REPORTED_AND_ADEQUATE)
-      l.contains("descriptive") || l.contains("normative") || l.contains("bed need") ->
-        IdentityField("None (descriptive/normative estimation study)", ReportingStatus.REPORTED_AND_ADEQUATE)
+      expExtracted.applicability == FieldApplicability.NOT_APPLICABLE -> IdentityField(
+        value = "Not applicable (descriptive / normative synthesis without treatment intervention)",
+        status = ReportingStatus.REPORTED_AND_ADEQUATE,
+        applicability = FieldApplicability.NOT_APPLICABLE
+      )
+      expExtracted.value != null -> IdentityField(expExtracted.value, ReportingStatus.REPORTED_AND_ADEQUATE)
+      cleanLower.contains("descriptive") || cleanLower.contains("normative") || cleanLower.contains("bed need") ->
+        IdentityField(
+          value = "Not applicable (descriptive/normative estimation study)",
+          status = ReportingStatus.REPORTED_AND_ADEQUATE,
+          applicability = FieldApplicability.NOT_APPLICABLE
+        )
       else -> IdentityField("Exposure / intervention not explicitly specified", ReportingStatus.NOT_REPORTED)
     }
 
-    val compMatch = Regex("""(?:vs\.?|versus|compared\s+(?:with|to)|control\s+group|placebo|standard\s+of\s+care|usual\s+care|baseline\s+model|reference\s+standard)[^.,;\n]{0,50}""", RegexOption.IGNORE_CASE).find(text)
+    // Comparator: NOT_APPLICABLE for descriptive/normative meta-analyses unless explicitly defined
+    val compExtracted = if (isReviewOrMeta && !hasExplicitReviewIntervention) {
+      ExtractedField<String>(
+        value = "Not applicable",
+        applicability = FieldApplicability.NOT_APPLICABLE,
+        sourceSection = null,
+        sourcePage = null,
+        sourceQuote = null,
+        confidence = 1.0
+      )
+    } else {
+      extractRankedCandidate(
+        corpus = corpus,
+        fullRawText = text,
+        regex = Regex(
+          """\b(?:control\s+group|placebo|standard\s+of\s+care|usual\s+care|baseline\s+model|reference\s+standard|compared\s+(?:with|to)\s+[^.,;\n]{3,45}|versus\s+[^.,;\n]{3,45})""",
+          RegexOption.IGNORE_CASE
+        )
+      )
+    }
+    extractedMap["comparator"] = compExtracted
     val comparator = when {
       subDesign == AuditSubDesign.FORMAL_THEOREM -> IdentityField("Prior theorem bounds / counterexample baselines", ReportingStatus.REPORTED_AND_ADEQUATE)
-      compMatch != null -> IdentityField(compMatch.value.trim(), ReportingStatus.REPORTED_AND_ADEQUATE)
-      l.contains("descriptive") || l.contains("prevalence") || l.contains("normative") ->
-        IdentityField("No comparator (single-group descriptive/normative target)", ReportingStatus.REPORTED_AND_ADEQUATE)
+      compExtracted.applicability == FieldApplicability.NOT_APPLICABLE -> IdentityField(
+        value = "Not applicable (single-group / normative review without comparator arm)",
+        status = ReportingStatus.REPORTED_AND_ADEQUATE,
+        applicability = FieldApplicability.NOT_APPLICABLE
+      )
+      compExtracted.value != null -> IdentityField(compExtracted.value, ReportingStatus.REPORTED_AND_ADEQUATE)
+      cleanLower.contains("descriptive") || cleanLower.contains("prevalence") || cleanLower.contains("normative") ->
+        IdentityField(
+          value = "Not applicable (single-group descriptive/normative target)",
+          status = ReportingStatus.REPORTED_AND_ADEQUATE,
+          applicability = FieldApplicability.NOT_APPLICABLE
+        )
       else -> IdentityField("Comparator not reported", ReportingStatus.NOT_REPORTED)
     }
 
-    val outMatch = Regex("""(?:primary\s+(?:outcome|endpoint)|outcome\s+was|mortality|survival|stroke|readmission|hospitalization|auroc|accuracy|sensitivity|bed\s+need|employment|wage|convergence|uniqueness)[^.,;\n]{0,55}""", RegexOption.IGNORE_CASE).find(text)
-    val outcome = if (outMatch != null) {
-      IdentityField(outMatch.value.trim(), ReportingStatus.REPORTED_AND_ADEQUATE)
+    val outExtracted = extractRankedCandidate(
+      corpus = corpus,
+      fullRawText = text,
+      regex = Regex(
+        """\b(?:primary\s+(?:outcome|endpoint)|outcome\s+(?:was|measure)|psychiatric\s+bed\s+need|bed\s+need\s+per\s+[\d,]+|beds?\s+per\s+[\d,]+\s*(?:population|inhabitants)?|mortality|survival|stroke|readmission|hospitalization|auroc|accuracy|sensitivity|prevalence|employment|wage|convergence|uniqueness)[^.,;\n]{0,60}""",
+        RegexOption.IGNORE_CASE
+      )
+    )
+    extractedMap["outcome"] = outExtracted
+    val outcome = if (outExtracted.value != null) {
+      IdentityField(outExtracted.value, ReportingStatus.REPORTED_AND_ADEQUATE)
     } else {
       IdentityField("Primary outcome uncertain / not reported", ReportingStatus.NOT_REPORTED)
     }
 
-    val horizonMatch = Regex("""(?:\b\d+(?:\.\d+)?[- ]?(?:day|week|month|year)s?\b(?:\s+follow-?up)?|\b(?:19|20)\d{2}\s*[-–]\s*(?:19|20)\d{2}\b|median\s+follow-?up[^.,;\n]{0,35})""", RegexOption.IGNORE_CASE).find(text)
+    // Time Horizon / Search Window: prefer explicit year range (e.g. 2000–2023) for systematic reviews, NOT earliest random duration like "7 years"
+    val yearRangeRegex = Regex("""\b(?:from\s+)?(19\d{2}|20\d{2})\s*(?:to|–|—|-|through)\s*(19\d{2}|20\d{2}|present)\b""", RegexOption.IGNORE_CASE)
+    val followUpRegex = Regex("""(?:\bmedian\s+follow-?up[^.,;\n]{0,35}|\bfollow-?up\s+(?:of|period\s+of)?\s*\d+(?:\.\d+)?[- ]?(?:day|week|month|year)s?\b|\b\d+(?:\.\d+)?[- ]?(?:day|week|month|year)s?\s+follow-?up\b)""", RegexOption.IGNORE_CASE)
+    val genericDurationRegex = Regex("""\b\d+(?:\.\d+)?[- ]?(?:day|week|month|year)s?\b""", RegexOption.IGNORE_CASE)
+
+    val horizonExtracted = if (isReviewOrMeta) {
+      extractRankedCandidate(corpus, text, yearRangeRegex).takeIf { it.value != null }
+        ?: extractRankedCandidate(corpus, text, Regex("""\b(?:searched\s+(?:from|up\s+to|until)|inception\s+(?:to|through|until)|published\s+(?:between|from))[^.,;\n]{4,55}""", RegexOption.IGNORE_CASE)).takeIf { it.value != null }
+        ?: extractRankedCandidate(corpus, text, followUpRegex).takeIf { it.value != null }
+        ?: extractRankedCandidate(corpus, text, Regex("""\bover\s+\d+(?:\.\d+)?[- ]?(?:day|week|month|year)s?\b""", RegexOption.IGNORE_CASE))
+    } else {
+      extractRankedCandidate(corpus, text, followUpRegex).takeIf { it.value != null }
+        ?: extractRankedCandidate(corpus, text, yearRangeRegex).takeIf { it.value != null }
+        ?: extractRankedCandidate(corpus, text, genericDurationRegex)
+    }
+    extractedMap["timeHorizon"] = horizonExtracted
     val timeHorizon = when {
       subDesign == AuditSubDesign.FORMAL_THEOREM || subDesign == AuditSubDesign.ML_BENCHMARK ->
-        IdentityField(horizonMatch?.value?.trim() ?: "Not time-horizon dependent (static formal/benchmark evaluation)", ReportingStatus.REPORTED_AND_ADEQUATE)
-      horizonMatch != null -> IdentityField(horizonMatch.value.trim(), ReportingStatus.REPORTED_AND_ADEQUATE)
-      else -> IdentityField("Follow-up / time horizon not reported", ReportingStatus.NOT_REPORTED)
+        IdentityField(horizonExtracted.value ?: "Not time-horizon dependent (static formal/benchmark evaluation)", ReportingStatus.REPORTED_AND_ADEQUATE)
+      horizonExtracted.value != null -> IdentityField(horizonExtracted.value, ReportingStatus.REPORTED_AND_ADEQUATE)
+      else -> IdentityField("Follow-up / search time window not reported", ReportingStatus.NOT_REPORTED)
     }
 
+    // Primary Estimand: NEVER use raw substring matching like contains("att") (which falsely matches "pattern"/"matter"/"attention")!
+    val hasExplicitAtt = Regex("""\b(?:average\s+treatment\s+effect\s+on\s+the\s+treated|ATT)\b""").containsMatchIn(cleanBody) &&
+      (cleanLower.contains("treatment") || cleanLower.contains("difference-in-differences") || cleanLower.contains("propensity") || cleanLower.contains("causal"))
+    val hasExplicitAte = Regex("""\b(?:average\s+treatment\s+effect|ATE)\b""").containsMatchIn(cleanBody) &&
+      (cleanLower.contains("treatment") || cleanLower.contains("causal") || cleanLower.contains("randomized") || cleanLower.contains("randomised"))
+    val hasExplicitLate = Regex("""\b(?:local\s+average\s+treatment\s+effect|LATE)\b""").containsMatchIn(cleanBody) &&
+      (cleanLower.contains("instrumental") || cleanLower.contains("2sls") || cleanLower.contains("complier"))
+
     val estimand = when {
-      l.contains("intention-to-treat") || l.contains("intent-to-treat") -> IdentityField("Intention-to-treat (treatment policy estimand)", ReportingStatus.REPORTED_AND_ADEQUATE)
-      l.contains("per-protocol") -> IdentityField("Per-protocol estimand (vulnerable to post-randomization selection)", ReportingStatus.REPORTED_BUT_INADEQUATE)
-      l.contains("att") || l.contains("average treatment effect on the treated") -> IdentityField("Average Treatment Effect on the Treated (ATT)", ReportingStatus.REPORTED_AND_ADEQUATE)
-      l.contains("ate") || l.contains("average treatment effect") -> IdentityField("Average Treatment Effect (ATE)", ReportingStatus.REPORTED_AND_ADEQUATE)
-      l.contains("late") || l.contains("local average treatment") -> IdentityField("Local Average Treatment Effect (LATE / IV)", ReportingStatus.REPORTED_AND_ADEQUATE)
-      subDesign == AuditSubDesign.META_ANALYSIS -> IdentityField("Pooled summary effect across heterogeneous studies (random/fixed)", ReportingStatus.REPORTED_AND_ADEQUATE)
+      isNormativeReview -> IdentityField(
+        "Descriptive / pooled normative synthesis estimand across included publications (not a causal treatment effect)",
+        ReportingStatus.REPORTED_AND_ADEQUATE
+      )
+      subDesign == AuditSubDesign.META_ANALYSIS -> IdentityField(
+        "Pooled summary effect across included studies (random/fixed-effects synthesis)",
+        ReportingStatus.REPORTED_AND_ADEQUATE
+      )
+      subDesign == AuditSubDesign.SYSTEMATIC_REVIEW -> IdentityField(
+        "Qualitative / narrative synthesis estimand across eligible publications",
+        ReportingStatus.REPORTED_AND_ADEQUATE
+      )
+      cleanLower.contains("intention-to-treat") || cleanLower.contains("intent-to-treat") ->
+        IdentityField("Intention-to-treat (treatment policy estimand)", ReportingStatus.REPORTED_AND_ADEQUATE)
+      cleanLower.contains("per-protocol") ->
+        IdentityField("Per-protocol estimand (vulnerable to post-randomization selection)", ReportingStatus.REPORTED_BUT_INADEQUATE)
+      hasExplicitAtt -> IdentityField("Average Treatment Effect on the Treated (ATT)", ReportingStatus.REPORTED_AND_ADEQUATE)
+      hasExplicitAte -> IdentityField("Average Treatment Effect (ATE)", ReportingStatus.REPORTED_AND_ADEQUATE)
+      hasExplicitLate -> IdentityField("Local Average Treatment Effect (LATE / IV)", ReportingStatus.REPORTED_AND_ADEQUATE)
       subDesign == AuditSubDesign.DIAGNOSTIC_ACCURACY -> IdentityField("Diagnostic accuracy (sensitivity, specificity, likelihood ratios)", ReportingStatus.REPORTED_AND_ADEQUATE)
       subDesign == AuditSubDesign.ML_BENCHMARK -> IdentityField("Out-of-sample predictive performance (AUROC / PR-AUC / calibration)", ReportingStatus.REPORTED_AND_ADEQUATE)
       subDesign == AuditSubDesign.FORMAL_THEOREM -> IdentityField("Deductive mathematical truth under stated regularity assumptions", ReportingStatus.REPORTED_AND_ADEQUATE)
@@ -162,16 +489,86 @@ object EpistemicSafeguardEngine {
       else -> IdentityField("Primary estimand not explicitly declared", ReportingStatus.NOT_REPORTED)
     }
 
-    val analysisMatch = Regex("""(?:cox\s+proportional\s+hazards|logistic\s+regression|linear\s+regression|two-way\s+fixed\s+effects|difference-in-differences|2sls|random-effects\s+meta-analysis|fixed-effect\s+meta-analysis|kaplan-meier|mixed-effects|gee|transformer|neural\s+network|random\s+forest|xgboost|anova|chi-square|t-test|proof\s+by\s+contradiction)""", RegexOption.IGNORE_CASE).find(text)
-    val primaryAnalysis = if (analysisMatch != null) {
-      IdentityField(analysisMatch.value.trim(), ReportingStatus.REPORTED_AND_ADEQUATE)
+    val analysisExtracted = extractRankedCandidate(
+      corpus = corpus,
+      fullRawText = text,
+      regex = Regex(
+        """\b(?:(?:dersimonian[- ]laird\s+|reml\s+|inverse[- ]variance\s+)?(?:random-?effects|fixed-?effect)\s+meta-?analysis|dersimonian[- ]laird|restricted\s+maximum\s+likelihood|reml|inverse[- ]variance|meta-?regression|cox\s+proportional\s+hazards|logistic\s+regression|linear\s+regression|two-way\s+fixed\s+effects|difference-in-differences|2sls|kaplan-meier|mixed-effects|gee|transformer|neural\s+network|random\s+forest|xgboost|anova|chi-square|t-test|proof\s+by\s+contradiction)\b""",
+        RegexOption.IGNORE_CASE
+      )
+    )
+    extractedMap["primaryAnalysis"] = analysisExtracted
+    val primaryAnalysis = if (analysisExtracted.value != null) {
+      IdentityField(analysisExtracted.value, ReportingStatus.REPORTED_AND_ADEQUATE)
     } else if (statAudit.claims.any { !it.isFromReferenceOrCitation && it.analysisType.isNotBlank() }) {
       IdentityField(statAudit.claims.first { !it.isFromReferenceOrCitation && it.analysisType.isNotBlank() }.analysisType, ReportingStatus.REPORTED_AND_ADEQUATE)
     } else {
       IdentityField("Primary statistical/analytical model not explicitly identified", ReportingStatus.NOT_REPORTED)
     }
 
-    val denomField = if (ledger.entries.isNotEmpty()) {
+    // Systematic Review / Meta-Analysis counts: extract included publications/studies (k) and estimates (not first raw N= match!)
+    val includedStudyCount = if (isReviewOrMeta) {
+      val studyCountRegex = Regex(
+        """\b(?:(\d{1,4})\s+(?:included\s+|eligible\s+|unique\s+)?(?:publications?|studies|articles|reports|papers|trials)\s+(?:were\s+)?(?:included|synthesized|identified\s+for\s+inclusion|met\s+inclusion|analyzed|analysed)|included\s+(\d{1,4})\s+(?:publications?|studies|articles|reports|papers|trials)|k\s*=\s*(\d{1,4}))\b""",
+        RegexOption.IGNORE_CASE
+      )
+      val m = studyCountRegex.find(corpus.methodsText)
+        ?: studyCountRegex.find(corpus.abstractText)
+        ?: studyCountRegex.find(corpus.resultsText)
+        ?: studyCountRegex.find(cleanBody)
+      m?.groupValues?.drop(1)?.firstOrNull { it.isNotBlank() }?.toIntOrNull()
+    } else null
+
+    val includedEstimateCount = if (isReviewOrMeta) {
+      val estCountRegex = Regex(
+        """\b(\d{1,5})\s+(?:bed[- ]?need\s+|effect\s+|data\s+|independent\s+|extracted\s+)?estimates?\b""",
+        RegexOption.IGNORE_CASE
+      )
+      val m = estCountRegex.find(corpus.resultsText)
+        ?: estCountRegex.find(corpus.abstractText)
+        ?: estCountRegex.find(corpus.methodsText)
+        ?: estCountRegex.find(cleanBody)
+      m?.groupValues?.getOrNull(1)?.toIntOrNull()
+    } else null
+
+    val geographicScope = extractRankedCandidate(
+      corpus = corpus,
+      fullRawText = text,
+      regex = Regex(
+        """\b(?:global|worldwide|international|\d+\s+countries|high[- ]income\s+countries|low[- ]and\s+middle[- ]income\s+countries|oecd\s+countries|europe(?:an)?|north\s+america|germany|united\s+kingdom|united\s+states)\b""",
+        RegexOption.IGNORE_CASE
+      )
+    ).value
+
+    val reviewCard = if (isReviewOrMeta) {
+      ReviewIdentityCard(
+        designType = designLabel,
+        synthesisUnit = unitOfAnalysis.value,
+        includedStudyCount = includedStudyCount,
+        includedEstimateCount = includedEstimateCount,
+        outcomeMetric = outExtracted.value,
+        populationOrSetting = popExtracted.value,
+        geographicScope = geographicScope,
+        timeWindow = horizonExtracted.value,
+        synthesisMethod = analysisExtracted.value,
+        estimand = estimand.value,
+        interventionOrExposure = if (expExtracted.applicability == FieldApplicability.NOT_APPLICABLE) null else expExtracted.value,
+        comparator = if (compExtracted.applicability == FieldApplicability.NOT_APPLICABLE) null else compExtracted.value,
+        interventionApplicability = expExtracted.applicability,
+        comparatorApplicability = compExtracted.applicability
+      )
+    } else null
+
+    val denomField = if (isReviewOrMeta && (includedStudyCount != null || includedEstimateCount != null)) {
+      val parts = buildList {
+        if (includedStudyCount != null) add("$includedStudyCount publications/studies (k = $includedStudyCount)")
+        if (includedEstimateCount != null) add("$includedEstimateCount extracted estimates")
+      }
+      IdentityField(
+        value = parts.joinToString("; "),
+        status = ReportingStatus.REPORTED_AND_ADEQUATE
+      )
+    } else if (ledger.entries.isNotEmpty()) {
       val summary = ledger.entries.groupBy { it.category }.entries.take(4)
         .joinToString("; ") { (cat, list) -> "${cat.label}: N=${list.maxOf { it.n }}" }
       IdentityField(
@@ -180,7 +577,7 @@ object EpistemicSafeguardEngine {
           ReportingStatus.REPORTED_BUT_INADEQUATE else ReportingStatus.REPORTED_AND_ADEQUATE
       )
     } else if (subDesign == AuditSubDesign.FORMAL_THEOREM) {
-      IdentityField("Not applicable (deductive theorem proof)", ReportingStatus.REPORTED_AND_ADEQUATE)
+      IdentityField("Not applicable (deductive theorem proof)", ReportingStatus.REPORTED_AND_ADEQUATE, applicability = FieldApplicability.NOT_APPLICABLE)
     } else if (coverage != null && coverage.omittedPages.isNotEmpty()) {
       IdentityField("Denominator not reconstructable from partial extract", ReportingStatus.NOT_ASSESSABLE_FROM_SUPPLIED_MATERIAL)
     } else {
@@ -191,13 +588,15 @@ object EpistemicSafeguardEngine {
       if (designField.status != ReportingStatus.REPORTED_AND_ADEQUATE) add("Study design")
       if (unitOfAnalysis.status != ReportingStatus.REPORTED_AND_ADEQUATE) add("Unit of analysis")
       if (population.status == ReportingStatus.NOT_REPORTED || population.status == ReportingStatus.NOT_ASSESSABLE_FROM_SUPPLIED_MATERIAL) add("Population")
-      if (exposure.status == ReportingStatus.NOT_REPORTED) add("Exposure/Intervention")
-      if (comparator.status == ReportingStatus.NOT_REPORTED) add("Comparator")
+      if (exposure.applicability != FieldApplicability.NOT_APPLICABLE && exposure.status == ReportingStatus.NOT_REPORTED) add("Exposure/Intervention")
+      if (comparator.applicability != FieldApplicability.NOT_APPLICABLE && comparator.status == ReportingStatus.NOT_REPORTED) add("Comparator")
       if (outcome.status == ReportingStatus.NOT_REPORTED) add("Primary outcome")
       if (timeHorizon.status == ReportingStatus.NOT_REPORTED) add("Time horizon")
       if (estimand.status == ReportingStatus.NOT_REPORTED) add("Primary estimand")
       if (primaryAnalysis.status == ReportingStatus.NOT_REPORTED) add("Primary analysis")
-      if (denomField.status == ReportingStatus.NOT_REPORTED || denomField.status == ReportingStatus.NOT_ASSESSABLE_FROM_SUPPLIED_MATERIAL) add("Sample size / denominator")
+      if (denomField.applicability != FieldApplicability.NOT_APPLICABLE &&
+        (denomField.status == ReportingStatus.NOT_REPORTED || denomField.status == ReportingStatus.NOT_ASSESSABLE_FROM_SUPPLIED_MATERIAL)
+      ) add("Sample size / denominator")
     }
 
     return StudyIdentityCard(
@@ -212,7 +611,9 @@ object EpistemicSafeguardEngine {
       primaryEstimand = estimand,
       primaryAnalysis = primaryAnalysis,
       sampleSizeAndDenominator = denomField,
-      uncertainFields = uncertain
+      uncertainFields = uncertain,
+      reviewIdentityCard = reviewCard,
+      extractedFields = extractedMap
     )
   }
 
@@ -397,10 +798,12 @@ object EpistemicSafeguardEngine {
     l: String,
     subDesign: AuditSubDesign
   ): ClaimHierarchyAudit {
-    val isCrossSectional = l.contains("cross-sectional") || l.contains("cross sectional") || l.contains("prevalence survey")
-    val hasCausalIdentification = l.contains("randomized") || l.contains("randomised") ||
-      l.contains("instrumental variable") || l.contains("2sls") || l.contains("regression discontinuity") ||
-      l.contains("difference-in-differences") || l.contains("target trial emulation") || l.contains("mendelian randomization")
+    val activeBody = SemanticValidityEngine.extractActiveDesignClassificationText(text)
+    val activeL = activeBody.lowercase(Locale.US)
+    val isCrossSectional = activeL.contains("cross-sectional") || activeL.contains("cross sectional") || activeL.contains("prevalence survey")
+    val hasCausalIdentification = activeL.contains("randomized") || activeL.contains("randomised") ||
+      activeL.contains("instrumental variable") || activeL.contains("2sls") || activeL.contains("regression discontinuity") ||
+      activeL.contains("difference-in-differences") || activeL.contains("target trial emulation") || activeL.contains("mendelian randomization")
 
     val maxSupported = when {
       isCrossSectional -> ClaimLevel.ASSOCIATIONAL
@@ -415,20 +818,20 @@ object EpistemicSafeguardEngine {
       else -> ClaimLevel.ASSOCIATIONAL
     }
 
-    val policyRegex = Regex("""(?:clinicians?\s+should|we\s+recommend\s+(?:routine|initiating|adopting|implementing)|policy\s*makers?\s+should|should\s+be\s+(?:adopted|prescribed|implemented)\s+as\s+standard|mandates?\s+immediate\s+(?:clinical|policy)\s+change)""", RegexOption.IGNORE_CASE)
+    val policyRegex = Regex("""(?:clinicians?\s+should|we\s+recommend\s+(?:routine|initiating|adopting|implementing)|policy\s*makers?\s+should|should\s+be\s+(?:adopted|prescribed|implemented)\s+as\s+standard|mandates?\s+(?:immediate|universal|routine|widespread)?\s*(?:clinical|policy|practice)(?:\s+policy)?\s+(?:change|adoption|implementation))""", RegexOption.IGNORE_CASE)
     val causalRegex = Regex("""(?:\bproves?\s+that\b|\bcauses?\s+(?:a|an|the|higher|lower|increased|decreased)\b|\bdirectly\s+reduces?\b|\bprevents?\s+(?:mortality|death|stroke|disease)\b|\beffectively\s+treats?\b|\bcausal\s+effect\s+(?:of|on)\b)""", RegexOption.IGNORE_CASE)
     val mechanisticRegex = Regex("""(?:\bmediates?\s+the\s+pathway\b|\bmechanism\s+by\s+which\b|\bdrives?\s+the\s+biological\b)""", RegexOption.IGNORE_CASE)
     val predictiveRegex = Regex("""(?:\bpredicts?\b|\bdiscriminates?\b|\bauroc\b|\bforecast(?:s|ing)?\b)""", RegexOption.IGNORE_CASE)
     val assocRegex = Regex("""(?:\bassociated\s+with\b|\bcorrelated\s+with\b|\bcorrelation\b|\bodds\s+ratio\b|\brisk\s+ratio\b|\bhazard\s+ratio\b)""", RegexOption.IGNORE_CASE)
 
-    val policyHits = policyRegex.findAll(text).map { it.value.trim() }.toList()
-    val causalHits = causalRegex.findAll(text).map { it.value.trim() }.toList()
-    val mechHits = mechanisticRegex.findAll(text).map { it.value.trim() }.toList()
+    val policyHits = policyRegex.findAll(activeBody).map { it.value.trim() }.toList()
+    val causalHits = causalRegex.findAll(activeBody).map { it.value.trim() }.toList()
+    val mechHits = mechanisticRegex.findAll(activeBody).map { it.value.trim() }.toList()
 
     // Exclude negated causal caveats ("cannot prove causality", "does not establish a causal effect")
     val unhedgedCausalHits = causalHits.filter { hit ->
-      val idx = text.indexOf(hit)
-      val prefix = if (idx > 0) text.substring((idx - 35).coerceAtLeast(0), idx).lowercase(Locale.US) else ""
+      val idx = activeBody.indexOf(hit)
+      val prefix = if (idx > 0) activeBody.substring((idx - 35).coerceAtLeast(0), idx).lowercase(Locale.US) else ""
       !prefix.contains("cannot") && !prefix.contains("not ") && !prefix.contains("unable to") && !prefix.contains("does not") && !prefix.contains("no ")
     }
 
@@ -436,8 +839,8 @@ object EpistemicSafeguardEngine {
       policyHits.isNotEmpty() -> ClaimLevel.POLICY_OR_CLINICAL_RECOMMENDATION
       mechHits.isNotEmpty() -> ClaimLevel.MECHANISTIC
       unhedgedCausalHits.isNotEmpty() -> ClaimLevel.CAUSAL
-      predictiveRegex.containsMatchIn(text) -> ClaimLevel.PREDICTIVE
-      assocRegex.containsMatchIn(text) -> ClaimLevel.ASSOCIATIONAL
+      predictiveRegex.containsMatchIn(activeBody) -> ClaimLevel.PREDICTIVE
+      assocRegex.containsMatchIn(activeBody) -> ClaimLevel.ASSOCIATIONAL
       else -> ClaimLevel.DESCRIPTIVE
     }
 
@@ -446,6 +849,8 @@ object EpistemicSafeguardEngine {
     val severity = when {
       !isOverclaimed -> FlawSeverityTier.WORTHWHILE_ENHANCEMENT
       isCrossSectional && claimedLevel.level >= ClaimLevel.CAUSAL.level -> FlawSeverityTier.FATAL_TO_PRIMARY_CONCLUSION
+      !hasCausalIdentification && maxSupported.level <= ClaimLevel.ASSOCIATIONAL.level && claimedLevel == ClaimLevel.POLICY_OR_CLINICAL_RECOMMENDATION ->
+        FlawSeverityTier.FATAL_TO_PRIMARY_CONCLUSION
       claimedLevel.level - maxSupported.level >= 2 -> FlawSeverityTier.MATERIALLY_WEAKENS_CONFIDENCE
       else -> FlawSeverityTier.REQUIRES_REPORTING_CORRECTION
     }
@@ -690,10 +1095,38 @@ object EpistemicSafeguardEngine {
     l: String,
     statAudit: StatisticalAuditReport
   ): PracticalSignificanceAssessment {
+    val cleanLower = buildCleanIdentityCorpus(text).cleanBodyText.lowercase(Locale.US)
+    val isNormativeReview = isDescriptiveOrNormativeSynthesis(statAudit.subDesign, cleanLower)
     val active = statAudit.claims.filter { !it.isFromReferenceOrCitation }
     val hasSig = active.any { it.pValue != null && it.pValue < it.alphaThreshold }
     val hasNonSig = active.any { it.pValue != null && it.pValue >= it.alphaThreshold }
     val maxN = statAudit.sampleFlowRecords.maxOfOrNull { it.n } ?: 0
+
+    if (isNormativeReview) {
+      val hasPI = cleanLower.contains("prediction interval")
+      val hasUnitNote = cleanLower.contains("per 100,000") || cleanLower.contains("per 100 000") || cleanLower.contains("harmoniz") || cleanLower.contains("standardiz")
+      return PracticalSignificanceAssessment(
+        statisticalSignificanceStatus = "Normative / descriptive synthesis (pooled capacity/prevalence estimand)",
+        effectMagnitudeNote = "Interpret pooled estimates in policy/service-capacity units rather than clinical treatment effect sizes.",
+        precisionNote = if (hasPI) "Prediction interval reported alongside pooled confidence interval." else "Report 95% prediction intervals alongside pooled CIs to convey cross-setting dispersion.",
+        minimalImportantDifferenceStatus = ReportingStatus.REPORTED_AND_ADEQUATE,
+        absoluteAndBaselineRiskStatus = ReportingStatus.REPORTED_AND_ADEQUATE,
+        tinyButSignificantFlag = false,
+        wideNonSignificantSpunAsNoEffectFlag = false,
+        clinicalOrPolicyUtilitySummary = "Clinical MID, baseline risk, ARR/NNT, and clinical benefit-risk are not applicable to this review's estimand. Evaluate policy utility via prediction intervals, unit harmonization, geographic transportability, and need-versus-utilization distinction.",
+        practicalImportanceStatus = if (hasPI && hasUnitNote) MethodologicalAssessmentStatus.DOCUMENTED_AND_ADEQUATE else MethodologicalAssessmentStatus.NOT_ASSESSABLE,
+        requiredContextNote = "Applicable normative dimensions: prediction interval, unit harmonization, geographic transportability, and need-versus-utilization distinction. Clinical MID/ARR/NNT are not applicable to this review's estimand.",
+        isNormativeOrServiceCapacityReview = true,
+        midApplicability = CheckApplicability.NOT_APPLICABLE,
+        baselineRiskApplicability = CheckApplicability.NOT_APPLICABLE,
+        arrNntApplicability = CheckApplicability.NOT_APPLICABLE,
+        clinicalBenefitRiskApplicability = CheckApplicability.NOT_APPLICABLE,
+        predictionIntervalApplicability = CheckApplicability.APPLICABLE,
+        unitHarmonizationApplicability = CheckApplicability.APPLICABLE,
+        geographicTransportabilityApplicability = CheckApplicability.APPLICABLE,
+        needVsUtilizationApplicability = CheckApplicability.APPLICABLE
+      )
+    }
 
     // Check for tiny-but-statistically-significant effect (huge N >= 10,000 with tiny ratio near 1.0 or tiny ARR < 0.5% or tiny d < 0.1)
     val tinyEffectClaim = active.firstOrNull { c ->
@@ -721,14 +1154,37 @@ object EpistemicSafeguardEngine {
     ).containsMatchIn(text)
     val wideNonSigSpun = wideNonSigClaim != null && claimsNoEffectOrEquivalence
 
-    val hasMid = l.contains("minimal important difference") || l.contains("minimally important") || l.contains("mcid") || l.contains("clinical significance threshold")
+    val hasMid = l.contains("minimal important difference") || l.contains("minimally important") || l.contains("mcid") || l.contains("clinical significance threshold") || Regex("""\bmid\b""").containsMatchIn(l)
     val hasAbsRisk = l.contains("absolute risk") || l.contains("arr") || l.contains("nnt") || l.contains("baseline risk") || l.contains("risk difference") || statAudit.twoByTwoTables.isNotEmpty()
+    val hasHarmsOrCost = l.contains("adverse event") || l.contains("harms") || l.contains("cost-effectiveness") || l.contains("number needed to harm") || l.contains("nnh")
+
+    val practicalImportanceStatus = when {
+      wideNonSigSpun -> MethodologicalAssessmentStatus.DOCUMENTED_BUT_INADEQUATE
+      tinyButSig && hasMid && hasAbsRisk -> MethodologicalAssessmentStatus.DOCUMENTED_BUT_INADEQUATE
+      tinyButSig -> MethodologicalAssessmentStatus.NOT_ASSESSABLE
+      !hasAbsRisk && active.any { it.effectMeasure.uppercase(Locale.US) in setOf("OR", "AOR", "RR", "ARR", "HR", "AHR") } ->
+        MethodologicalAssessmentStatus.NOT_ASSESSABLE
+      hasMid && hasAbsRisk -> MethodologicalAssessmentStatus.DOCUMENTED_AND_ADEQUATE
+      else -> MethodologicalAssessmentStatus.NOT_REPORTED
+    }
+
+    val requiredContextBase = "Baseline risk / outcome prevalence, time horizon, absolute risk difference (ARR/NNT), domain Minimal Important Difference (MID), and harms/resource context" +
+      if (!hasHarmsOrCost) " (harms/cost balance not reported)." else "."
+    val requiredContext = if (tinyButSig && !(hasMid && hasAbsRisk)) {
+      "Small relative effect detected; absolute and domain-specific importance cannot be assessed without baseline risk/MID. Required context: $requiredContextBase"
+    } else {
+      requiredContextBase
+    }
 
     val utilitySummary = when {
-      tinyButSig -> "FLAG (Tiny-but-Significant): Effect (${tinyEffectClaim?.sourceQuote ?: "near-null estimate"}) is statistically significant under very large N (N=$maxN) but clinically/practically trivial; evaluate against Minimal Important Difference (MID) and absolute risk."
-      wideNonSigSpun -> "FLAG (Absence of Evidence ≠ Evidence of Absence): Wide non-significant CI (${wideNonSigClaim?.sourceQuote}) is compatible with both substantial benefit and harm; claiming 'no effect' or equivalence is unjustified."
+      tinyButSig && !(hasMid && hasAbsRisk) ->
+        "Small relative effect detected; absolute and domain-specific importance cannot be assessed without baseline risk/MID (${tinyEffectClaim?.sourceQuote ?: "near-null estimate"}, N=$maxN)."
+      tinyButSig ->
+        "Small relative effect detected (${tinyEffectClaim?.sourceQuote ?: "near-null estimate"}, N=$maxN); evaluate reported absolute difference against explicit Minimal Important Difference (MID) and harms/costs."
+      wideNonSigSpun ->
+        "FLAG (Absence of Evidence ≠ Evidence of Absence): Wide non-significant CI (${wideNonSigClaim?.sourceQuote}) is compatible with both substantial benefit and harm; claiming 'no effect' or equivalence is unjustified."
       !hasAbsRisk && active.any { it.effectMeasure.uppercase(Locale.US) in setOf("OR", "AOR", "RR", "ARR", "HR", "AHR") } ->
-        "Relative ratio metrics reported without baseline/absolute risk (ARR/NNT) or MID; clinical/policy utility remains uncalibrated."
+        "Relative ratio metrics reported without baseline/absolute risk (ARR/NNT) or MID; clinical/policy importance is NOT ASSESSABLE without baseline risk/MID."
       else -> "Statistical significance, effect magnitude, and precision evaluated; verify against domain-specific Minimal Important Difference."
     }
 
@@ -739,13 +1195,17 @@ object EpistemicSafeguardEngine {
         hasNonSig -> "Non-significant reported claim(s)"
         else -> "Not assessable from supplied material"
       },
-      effectMagnitudeNote = tinyEffectClaim?.let { "Near-null magnitude detected (${it.sourceQuote})" } ?: "Verify practical magnitude against domain benchmarks",
+      effectMagnitudeNote = tinyEffectClaim?.let { "Small relative magnitude detected (${it.sourceQuote}); requires baseline risk & MID for practical interpretation" }
+        ?: "Verify practical magnitude against domain benchmarks",
       precisionNote = wideNonSigClaim?.let { "Wide CI (${it.sourceQuote}) spans clinically important benefit and harm" } ?: "Check CI width against MID bounds",
       minimalImportantDifferenceStatus = if (hasMid) ReportingStatus.REPORTED_AND_ADEQUATE else ReportingStatus.NOT_REPORTED,
       absoluteAndBaselineRiskStatus = if (hasAbsRisk) ReportingStatus.REPORTED_AND_ADEQUATE else ReportingStatus.NOT_REPORTED,
       tinyButSignificantFlag = tinyButSig,
       wideNonSignificantSpunAsNoEffectFlag = wideNonSigSpun,
-      clinicalOrPolicyUtilitySummary = utilitySummary
+      clinicalOrPolicyUtilitySummary = utilitySummary,
+      practicalImportanceStatus = practicalImportanceStatus,
+      requiredContextNote = requiredContext,
+      isNormativeOrServiceCapacityReview = false
     )
   }
 
@@ -935,9 +1395,12 @@ object EpistemicSafeguardEngine {
     primaryDecl: PrimaryAnalysisDeclaration,
     statAudit: StatisticalAuditReport,
     coverage: DocumentCoverageReport?,
-    extractionConfidence: Int
+    extractionConfidence: Int,
+    coverageStatus: CoverageStatus
   ): StopAndAskAssessment {
     val triggers = mutableListOf<StopAndAskTrigger>()
+    val isUnknownCoverage = coverageStatus == CoverageStatus.UNKNOWN ||
+      extractionConfidence == DocumentCoverageReport.EXTRACTION_CONFIDENCE_UNKNOWN
 
     // 1. Missing pages from PDF extraction or prompt truncation
     if (coverage != null && coverage.omittedPages.isNotEmpty()) {
@@ -1018,7 +1481,7 @@ object EpistemicSafeguardEngine {
       statAudit.subDesign != AuditSubDesign.FORMAL_THEOREM &&
       statAudit.twoByTwoTables.isEmpty() &&
       statAudit.metaStudyEffects.isEmpty() &&
-      (extractionConfidence <= 2 || text.length < 350 || triggers.isNotEmpty())
+      ((extractionConfidence in 1..2) || text.length < 350 || triggers.isNotEmpty())
     ) {
       triggers.add(
         StopAndAskTrigger(
@@ -1034,22 +1497,28 @@ object EpistemicSafeguardEngine {
     val hasVerifiedDeterministicEvidence = statAudit.verifiedArithmeticErrorCount > 0 ||
       statAudit.verifiedModelMismatchCount > 0 ||
       statAudit.reconstructions.any { it.status == QuantFindingStatus.FAIL }
-    val hasSevereExtractionGap = extractionConfidence <= 2 ||
+    val hasSevereExtractionGap = (extractionConfidence in 1..2) ||
       triggers.any { it.triggerCode in setOf("MISSING_PAGES", "IMAGE_ONLY_TABLES", "TRUNCATED_EQUATIONS") }
-    val shouldStop = (hasSevereExtractionGap && (triggers.size >= 2 || extractionConfidence <= 1)) ||
+    val shouldStop = (hasSevereExtractionGap && (triggers.size >= 2 || extractionConfidence == 1)) ||
       (!hasVerifiedDeterministicEvidence && triggers.size >= 3)
+    val strongConclusionsDisabled = shouldStop || isUnknownCoverage
 
-    val banner = if (shouldStop) {
-      "INSUFFICIENT EVIDENCE FOR ASSESSMENT (${triggers.size} completeness trigger(s)): Strong methodological or statistical rulings are suspended to prevent filling missing evidence with assumptions."
-    } else {
-      "Completeness gate passed (${triggers.size} minor caveat(s)); sufficient supplied evidence for structured appraisal."
+    val banner = when {
+      shouldStop ->
+        "INSUFFICIENT EVIDENCE FOR ASSESSMENT (${triggers.size} completeness trigger(s)): Strong methodological or statistical rulings are suspended to prevent filling missing evidence with assumptions."
+      isUnknownCoverage ->
+        "COVERAGE UNKNOWN: Document coverage metadata was not supplied; strong methodological conclusions are disabled until coverage is verified."
+      else ->
+        "Completeness gate passed (${triggers.size} minor caveat(s)); sufficient supplied evidence for structured appraisal."
     }
 
     return StopAndAskAssessment(
       shouldStopAndAsk = shouldStop,
       verdictOverride = if (shouldStop) "INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT" else null,
       triggers = triggers,
-      disclosureBanner = banner
+      disclosureBanner = banner,
+      coverageStatus = coverageStatus,
+      strongConclusionsDisabled = strongConclusionsDisabled
     )
   }
 
@@ -1063,6 +1532,7 @@ object EpistemicSafeguardEngine {
     ledger: DenominatorLedger,
     coverage: DocumentCoverageReport?,
     extractionConfidence: Int,
+    coverageStatus: CoverageStatus,
     stopAndAsk: StopAndAskAssessment
   ): UncertaintyBudget {
     val active = statAudit.claims.filter { !it.isFromReferenceOrCitation }
@@ -1070,6 +1540,8 @@ object EpistemicSafeguardEngine {
     val hasModelFail = statAudit.verifiedModelMismatchCount > 0
     val hasMissingFail = ledger.discrepancies.any { it.discrepancyType in setOf("IMPOSSIBLE_ATTRITION", "TABLE_DENOMINATOR_DRIFT", "PROTOCOL_POPULATION_MISMATCH") }
     val hasProtocol = l.contains("preregist") || l.contains("pre-regist") || l.contains("protocol") || l.contains("prospero") || l.contains("nct")
+    val isUnknownCoverage = coverageStatus == CoverageStatus.UNKNOWN ||
+      extractionConfidence == DocumentCoverageReport.EXTRACTION_CONFIDENCE_UNKNOWN
 
     val items = listOf(
       UncertaintyBudgetItem(
@@ -1105,12 +1577,17 @@ object EpistemicSafeguardEngine {
       UncertaintyBudgetItem(
         UncertaintySource.EXTRACTION_QUALITY,
         level = when {
-          stopAndAsk.shouldStopAndAsk || extractionConfidence <= 2 -> "HIGH"
+          isUnknownCoverage -> "UNASSESSABLE"
+          stopAndAsk.shouldStopAndAsk || extractionConfidence in 1..2 -> "HIGH"
           extractionConfidence == 3 || statAudit.unsupportedDisclosures.isNotEmpty() || (coverage?.omittedPages?.isNotEmpty() == true) -> "MODERATE"
           else -> "LOW"
         },
-        reportingStatus = if (stopAndAsk.shouldStopAndAsk) ReportingStatus.NOT_ASSESSABLE_FROM_SUPPLIED_MATERIAL else ReportingStatus.REPORTED_AND_ADEQUATE,
-        note = "Extraction confidence $extractionConfidence/5; ${statAudit.unsupportedDisclosures.size} unsupported-input disclosure(s)."
+        reportingStatus = if (isUnknownCoverage || stopAndAsk.shouldStopAndAsk) ReportingStatus.NOT_ASSESSABLE_FROM_SUPPLIED_MATERIAL else ReportingStatus.REPORTED_AND_ADEQUATE,
+        note = if (isUnknownCoverage) {
+          "Coverage UNKNOWN; extraction confidence UNKNOWN — strong conclusions disabled."
+        } else {
+          "Extraction confidence $extractionConfidence/5 (${coverageStatus.label}); ${statAudit.unsupportedDisclosures.size} unsupported-input disclosure(s)."
+        }
       ),
       UncertaintyBudgetItem(
         UncertaintySource.EXTERNAL_VALIDITY,

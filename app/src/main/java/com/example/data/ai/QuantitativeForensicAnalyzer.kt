@@ -4,6 +4,9 @@ import com.example.data.ai.epistemic.EpistemicSafeguardEngine
 import com.example.data.ai.epistemic.EpistemicSafeguardReport
 import com.example.data.ai.stats.StatisticalAuditOrchestrator
 import com.example.data.ai.stats.StatisticalAuditReport
+import com.example.util.DocumentCoverageReport
+import com.example.util.DossierFormattingEngine
+import com.example.util.ReportBlock
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.exp
@@ -180,9 +183,9 @@ data class QuantitativeForensicReport(
       appendLine("|---|---|---|---|")
       diagnosticTable.take(12).forEach { row ->
         val pg = if (row.pageNumber > 0) " (P${row.pageNumber})" else ""
-        val safeCat = (row.category + pg).replace("|", "/")
-        val safeEv = row.reportedEvidence.replace("|", "/").take(76)
-        val safeDetail = row.diagnosticDetail.replace("|", "/").take(220)
+        val safeCat = DossierFormattingEngine.clampCell(DossierFormattingEngine.sanitizeTableCell(row.category + pg), 48)
+        val safeEv = DossierFormattingEngine.clampCell(DossierFormattingEngine.sanitizeTableCell(row.reportedEvidence), 76)
+        val safeDetail = DossierFormattingEngine.clampCell(DossierFormattingEngine.sanitizeTableCell(row.diagnosticDetail), 220)
         appendLine("| $safeCat | $safeEv | ${row.status.name} | $safeDetail |")
       }
     }
@@ -201,6 +204,53 @@ data class QuantitativeForensicReport(
       }
     }
   }.trim()
+
+  /**
+   * Direct typed [ReportBlock] builder for PDF export so deterministic audit tables never suffer
+   * Markdown round-trip corruption from embedded newlines or pipe characters.
+   */
+  fun toDeterministicAuditBlocks(): List<ReportBlock> {
+    val blocks = mutableListOf<ReportBlock>()
+    if (diagnosticTable.isNotEmpty()) {
+      blocks.add(
+        ReportBlock.SubHeader(
+          tag = "PRE-FLIGHT",
+          title = "Deterministic Statistical Forensics (${diagnosticTable.size} Automated Checks)"
+        )
+      )
+      blocks.add(
+        ReportBlock.AuditTable(
+          headers = listOf("Check Domain", "Reported Evidence", "Status", "Exact Mathematical Finding"),
+          rows = diagnosticTable.take(12).map { row ->
+            val pg = if (row.pageNumber > 0) " (P${row.pageNumber})" else ""
+            listOf(
+              DossierFormattingEngine.clampCell(DossierFormattingEngine.sanitizeTableCell(row.category + pg), 48),
+              DossierFormattingEngine.clampCell(DossierFormattingEngine.sanitizeTableCell(row.reportedEvidence), 76),
+              row.status.name,
+              DossierFormattingEngine.clampCell(DossierFormattingEngine.sanitizeTableCell(row.diagnosticDetail), 220)
+            )
+          }
+        )
+      )
+    }
+    val secondaryMarkdown = buildString {
+      if (epistemicSafeguards != null) {
+        val epiMd = epistemicSafeguards.toAuditMarkdown()
+        if (epiMd.isNotBlank()) appendLine(epiMd)
+      }
+      if (statisticalAudit != null) {
+        val trail = statisticalAudit.toAuditTrailMarkdown()
+        if (trail.isNotBlank()) {
+          if (isNotEmpty()) appendLine()
+          appendLine(trail)
+        }
+      }
+    }.trim()
+    if (secondaryMarkdown.isNotBlank()) {
+      blocks.addAll(DossierFormattingEngine.parseStructuredBlocks(secondaryMarkdown))
+    }
+    return blocks
+  }
 }
 
 /**
@@ -239,14 +289,14 @@ object QuantitativeForensicAnalyzer {
 
   // Standard parenthesized CI: "OR = 2.40 (95% CI 0.90–1.80)" or "9 (95% CI 3–15)"
   private val ciParenRegex = Regex(
-    """\b(OR|aOR|RR|aRR|HR|aHR|IRR|SMD|MD|WMD|beta|β|mean|median|rate|estimate|pooled)?\s*(?:of\s*|was\s*|[=:]\s*)?([-+]?\d+(?:\.\d+)?)\s*\(\s*(?:95%\s*)?(?:CI|CrI|UI|confidence\s+interval)\s*(?:of\s*)?[:=]?\s*([-+]?\d+(?:\.\d+)?)\s*(?:to|–|—|-|,)\s*([-+]?\d+(?:\.\d+)?)\s*\)""",
+    """\b(OR|aOR|RR|aRR|HR|aHR|IRR|PR|SMD|MD|WMD|beta|β|mean|median|rate|estimate|pooled)?\s*(?:of\s*|was\s*|[=:]\s*)?([-+]?\d+(?:\.\d+)?)\s*\(\s*(?:95%\s*)?(?:CI|CrI|UI|confidence\s+interval)\s*(?:of\s*)?[:=]?\s*([-+]?\d+(?:\.\d+)?)\s*(?:to|–|—|-|,)\s*([-+]?\d+(?:\.\d+)?)\s*\)""",
     RegexOption.IGNORE_CASE
   )
 
   // Narrative / comma-separated CI: "pooled long-stay bed estimate of 9, 95% CI 1.26 to 2.35"
-  // or "estimate of 9, with a 95% CI of 1.26–2.35"
+  // or "PR = 2.21, 95% CI 0.00 to 4.50"
   private val ciNarrativeRegex = Regex(
-    """\b(OR|aOR|RR|aRR|HR|aHR|IRR|SMD|MD|WMD|beta|β|mean|median|rate|estimate|beds?)\s*(?:of\s*|was\s*|[=:]\s*)\s*([-+]?\d+(?:\.\d+)?)\s*[,;]\s*(?:with\s+(?:a\s+)?)?(?:95%\s*)?(?:CI|CrI|UI|confidence\s+interval)\s*(?:of\s*)?[:=]?\s*([-+]?\d+(?:\.\d+)?)\s*(?:to|–|—|-)\s*([-+]?\d+(?:\.\d+)?)""",
+    """\b(OR|aOR|RR|aRR|HR|aHR|IRR|PR|SMD|MD|WMD|beta|β|mean|median|rate|estimate|beds?)\s*(?:of\s*|was\s*|[=:]\s*)\s*([-+]?\d+(?:\.\d+)?)\s*[,;]\s*(?:with\s+(?:a\s+)?)?(?:95%\s*)?(?:CI|CrI|UI|confidence\s+interval)\s*(?:of\s*)?[:=]?\s*([-+]?\d+(?:\.\d+)?)\s*(?:to|–|—|-)\s*([-+]?\d+(?:\.\d+)?)""",
     RegexOption.IGNORE_CASE
   )
 
@@ -278,20 +328,51 @@ object QuantitativeForensicAnalyzer {
     return lastMatch?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
   }
 
+  @Deprecated(
+    message = "Provide explicit DocumentCoverageReport and extractionConfidence to prevent silent assumption of complete extraction.",
+    replaceWith = ReplaceWith(
+      "analyze(text, studyDesign, sampleSizes, DocumentCoverageReport.unknown(), DocumentCoverageReport.EXTRACTION_CONFIDENCE_UNKNOWN)"
+    )
+  )
   fun analyze(
     text: String,
     studyDesign: StudyDesignArchetype,
     sampleSizes: List<Int>
   ): QuantitativeForensicReport {
-    val clean = text.trim()
-    val lower = clean.lowercase(Locale.US)
+    val unknownCoverage = DocumentCoverageReport.unknown(
+      reason = "QuantitativeForensicAnalyzer.analyze() invoked without explicit DocumentCoverageReport; coverage status is UNKNOWN and strong conclusions are disabled."
+    )
+    return analyze(
+      text = text,
+      studyDesign = studyDesign,
+      sampleSizes = sampleSizes,
+      coverageReport = unknownCoverage,
+      extractionConfidence = DocumentCoverageReport.EXTRACTION_CONFIDENCE_UNKNOWN
+    )
+  }
 
-    val statchecks = runStatcheckAudit(clean)
-    val ciChecks = runConfidenceIntervalAudit(clean)
-    val iqrChecks = runMedianIqrAudit(clean)
-    val heterogeneitySignals = runHeterogeneityAndSynthesisAudit(clean, lower, studyDesign)
-    val powerAlerts = runPowerAndMultiplicityAudit(clean, lower, studyDesign, sampleSizes)
-    val metricAlerts = runAlgebraicAndMetricBoundsAudit(clean, lower)
+  fun analyze(
+    text: String,
+    studyDesign: StudyDesignArchetype,
+    sampleSizes: List<Int>,
+    coverageReport: DocumentCoverageReport,
+    extractionConfidence: Int = coverageReport.extractionConfidence
+  ): QuantitativeForensicReport {
+    val clean = text.trim()
+    val refHeaderMatch = Regex("""(?im)^\s*(?:\d+(?:\.\d+)*\.?\s+)?(references|bibliography|works\s+cited|literature\s+cited)\s*$""").find(clean)
+    val bodyWithoutRefs = if (refHeaderMatch != null && refHeaderMatch.range.first > 120) {
+      clean.substring(0, refHeaderMatch.range.first).trimEnd()
+    } else {
+      clean
+    }
+    val lower = bodyWithoutRefs.lowercase(Locale.US)
+
+    val statchecks = runStatcheckAudit(bodyWithoutRefs)
+    val ciChecks = runConfidenceIntervalAudit(bodyWithoutRefs)
+    val iqrChecks = runMedianIqrAudit(bodyWithoutRefs)
+    val heterogeneitySignals = runHeterogeneityAndSynthesisAudit(bodyWithoutRefs, lower, studyDesign)
+    val powerAlerts = runPowerAndMultiplicityAudit(bodyWithoutRefs, lower, studyDesign, sampleSizes)
+    val metricAlerts = runAlgebraicAndMetricBoundsAudit(bodyWithoutRefs, lower)
 
     val diagnosticTable = mutableListOf<QuantDiagnosticFinding>()
 
@@ -400,12 +481,22 @@ object QuantitativeForensicAnalyzer {
       iqrChecks.take(4).forEach { add(it.rawClaim) }
     }
 
-    val statisticalAudit = StatisticalAuditOrchestrator.audit(clean, studyDesign)
+    val effectiveConfidence = if (coverageReport.isCoverageUnknown) {
+      DocumentCoverageReport.EXTRACTION_CONFIDENCE_UNKNOWN
+    } else {
+      extractionConfidence.coerceIn(0, 5)
+    }
+    val statisticalAudit = StatisticalAuditOrchestrator.audit(
+      text = clean,
+      parentArchetype = studyDesign,
+      coverageReport = coverageReport,
+      extractionConfidence = effectiveConfidence
+    )
     val epistemicSafeguards = EpistemicSafeguardEngine.evaluate(
       text = clean,
       statAudit = statisticalAudit,
-      coverageReport = null,
-      extractionConfidence = 5
+      coverageReport = coverageReport,
+      extractionConfidence = effectiveConfidence
     )
 
     return QuantitativeForensicReport(
@@ -568,7 +659,7 @@ object QuantitativeForensicAnalyzer {
   )
 
   private fun runConfidenceIntervalAudit(text: String): List<ConfidenceIntervalCheck> {
-    val ratioMetrics = setOf("or", "aor", "rr", "arr", "hr", "ahr", "irr")
+    val ratioMetrics = setOf("or", "aor", "rr", "arr", "hr", "ahr", "irr", "pr")
     val candidates = mutableListOf<RawCiCandidate>()
 
     fun collectMatch(m: MatchResult) {
@@ -623,8 +714,6 @@ object QuantitativeForensicAnalyzer {
       }
 
       if (pt < low - 1e-6 || pt > high + 1e-6) {
-        // Cross-reference search: look for another valid CI in the same manuscript for the same point estimate
-        // (e.g., Page 8 narrative "9, 95% CI 1.26 to 2.35" vs. Page 9 Figure 2 "9 (95% CI 3–15)")
         val matchingAlternate = deduped.firstOrNull { other ->
           other !== cand &&
             abs(other.point - pt) <= 0.05 &&
@@ -659,6 +748,25 @@ object QuantitativeForensicAnalyzer {
       }
 
       val isRatio = label.lowercase(Locale.US) in ratioMetrics
+      if (isRatio && low == 0.0 && pt > 0.0 && high >= pt) {
+        val width = high - low
+        val impliedSe = width / (2.0 * 1.95996)
+        checks.add(
+          ConfidenceIntervalCheck(
+            rawClaim = cand.raw,
+            metricLabel = label,
+            pointEstimate = pt,
+            lower = low,
+            upper = high,
+            impliedSe = impliedSe,
+            status = QuantFindingStatus.WARN,
+            note = "Imprecision / high variance: geometrically valid interval spans 0.00 to $high around $pt (not a confirmed arithmetic error). Report prediction intervals, influence diagnostics, leave-one-out analysis, and sensitivity analyses under prespecified outlier rules.",
+            pageNumber = cand.pageNumber
+          )
+        )
+        continue
+      }
+
       if (isRatio && low > 0.0 && pt > 0.0 && high > 0.0) {
         val lnPt = ln(pt)
         val lnLow = ln(low)
@@ -668,21 +776,28 @@ object QuantitativeForensicAnalyzer {
         val seLn = (lnHigh - lnLow) / (2.0 * 1.95996)
         val maxHalf = maxOf(halfLow, halfHigh, 1e-6)
         val asymRatio = abs(halfHigh - halfLow) / maxHalf
+        val isExtremeWide = (high / low >= 10.0) || (high / pt >= 2.0 && (high - low) >= 2.0)
 
-        val status = if (asymRatio > 0.28 && (lnHigh - lnLow) > 0.05) {
+        val status = if (isExtremeWide || (asymRatio > 0.28 && (lnHigh - lnLow) > 0.05)) {
           QuantFindingStatus.WARN
         } else {
           QuantFindingStatus.PASS
         }
-        val note = if (status == QuantFindingStatus.WARN) {
-          String.format(
+        val note = when {
+          isExtremeWide -> String.format(
+            Locale.US,
+            "Imprecision / high variance in %s 95%% CI [%.2f, %.2f] (not an arithmetic error). Report prediction intervals, influence diagnostics, leave-one-out analysis, and sensitivity analyses under prespecified outlier rules.",
+            label.uppercase(Locale.US),
+            low,
+            high
+          )
+          status == QuantFindingStatus.WARN -> String.format(
             Locale.US,
             "Log-scale asymmetry (%.0f%%) in %s 95%% CI; verify exact profile-likelihood method or rounding.",
             asymRatio * 100.0,
             label.uppercase(Locale.US)
           )
-        } else {
-          String.format(Locale.US, "Log-symmetric ratio CI (implied SE[ln]=%.3f).", seLn)
+          else -> String.format(Locale.US, "Log-symmetric ratio CI (implied SE[ln]=%.3f).", seLn)
         }
         checks.add(ConfidenceIntervalCheck(cand.raw, label, pt, low, high, seLn, status, note, cand.pageNumber))
       } else {

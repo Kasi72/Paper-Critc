@@ -6,6 +6,7 @@ import com.example.data.ai.semantic.CalculatorAssumptionContract
 import com.example.data.ai.semantic.CompoundClaimKey
 import com.example.data.ai.semantic.DesignClassificationResult
 import com.example.data.ai.semantic.SemanticValidityReport
+import com.example.util.DossierFormattingEngine
 import java.util.Locale
 
 /**
@@ -30,6 +31,7 @@ enum class StatisticalFindingType(val label: String, val isConfirmedError: Boole
   ASSUMPTION_UNCHECKED("Assumption Unchecked", false),
   REPORTING_OMISSION("Reporting Omission", false),
   LOW_POWER("Low Power / Precision", false),
+  IMPRECISION_OR_HIGH_VARIANCE("Imprecision / High Variance", false),
   POSSIBLE_BIAS("Possible Bias / Screening Signal", false),
   EXTERNAL_VALIDITY_LIMIT("External Validity Limit", false),
   UNSUPPORTED_TO_ASSESS("Unsupported to Assess (Missing Inputs)", false),
@@ -278,7 +280,12 @@ data class ScoreCalculationBreakdown(
       appendLine("|---|---|---|")
       allItems.forEach { item ->
         val sign = if (item.delta >= 0) "+${item.delta}" else "${item.delta}"
-        appendLine("| ${item.category} | $sign | ${item.reason.replace("|", "/")} |")
+        val catLabel = DossierFormattingEngine.sanitizeTableCell(item.category)
+        val reasonCell = DossierFormattingEngine.clampCell(
+          DossierFormattingEngine.sanitizeTableCell(item.reason),
+          220
+        )
+        appendLine("| $catLabel | $sign | $reasonCell |")
       }
     }
   }.trim()
@@ -420,12 +427,16 @@ data class StatisticalAuditReport(
       appendLine("| Calculator | Taxonomy | Reported | Recomputed | Status | Consequence & Assumptions |")
       appendLine("|---|---|---|---|---|---|")
       reconstructions.take(16).forEach { r ->
-        val calc = r.calculatorName.replace("|", "/")
-        val tax = (if (r.isScreeningSignal) "${r.findingType.name} (Signal)" else r.findingType.name).replace("|", "/")
-        val rep = r.reportedValue.replace("|", "/").take(42)
-        val rec = r.recomputedValue.replace("|", "/").take(48)
+        val calc = DossierFormattingEngine.clampCell(DossierFormattingEngine.sanitizeTableCell(r.calculatorName), 54)
+        val taxBase = if (r.isScreeningSignal) "${r.findingType.label} (Signal)" else r.findingType.label
+        val tax = DossierFormattingEngine.sanitizeTableCell(taxBase)
+        val rep = DossierFormattingEngine.clampCell(DossierFormattingEngine.sanitizeTableCell(r.reportedValue), 52)
+        val rec = DossierFormattingEngine.clampCell(DossierFormattingEngine.sanitizeTableCell(r.recomputedValue), 58)
         val contractNote = r.assumptionContract?.toCompactString()?.takeIf { it.isNotBlank() }?.let { " [$it]" }.orEmpty()
-        val cons = "${r.detail} ${r.scientificConsequence}$contractNote".replace("|", "/").take(220)
+        val cons = DossierFormattingEngine.clampCell(
+          DossierFormattingEngine.sanitizeTableCell("${r.detail} ${r.scientificConsequence}$contractNote"),
+          240
+        )
         appendLine("| $calc | $tax | $rep | $rec | ${r.status.name} | $cons |")
       }
     }
@@ -435,7 +446,9 @@ data class StatisticalAuditReport(
       appendLine("[CROSS-SECTION CONSISTENCY & SAMPLE-FLOW AUDIT]")
       crossLinks.forEach { link ->
         val pg = if (link.pageNumbers.isNotEmpty()) " (Pages ${link.pageNumbers.joinToString(",")})" else ""
-        appendLine("• [${link.findingType.name} | ${link.status.name}] ${link.linkType}$pg: ${link.description}")
+        val typeLabel = link.linkType.replace('_', ' ').lowercase(Locale.US)
+          .replaceFirstChar { it.titlecase(Locale.US) }
+        appendLine("• [${link.findingType.label} | ${link.status.name}] $typeLabel$pg: ${DossierFormattingEngine.sanitizeTableCell(link.description)}")
       }
     }
 
@@ -445,9 +458,13 @@ data class StatisticalAuditReport(
       appendLine("| Criterion | Taxonomy | Status | Audit Finding & Remedy |")
       appendLine("|---|---|---|---|")
       domainFindings.take(16).forEach { d ->
-        val crit = d.criterion.replace("|", "/")
-        val tax = (if (d.isScreeningSignal) "${d.findingType.name} (Signal)" else d.findingType.name).replace("|", "/")
-        val body = "${d.detail} Remedy: ${d.recommendedAction}".replace("|", "/").take(210)
+        val crit = DossierFormattingEngine.clampCell(DossierFormattingEngine.sanitizeTableCell(d.criterion), 60)
+        val taxBase = if (d.isScreeningSignal) "${d.findingType.label} (Signal)" else d.findingType.label
+        val tax = DossierFormattingEngine.sanitizeTableCell(taxBase)
+        val body = DossierFormattingEngine.clampCell(
+          DossierFormattingEngine.sanitizeTableCell("${d.detail} Remedy: ${d.recommendedAction}"),
+          230
+        )
         appendLine("| $crit | $tax | ${d.status.name} | $body |")
       }
     }
@@ -456,7 +473,7 @@ data class StatisticalAuditReport(
       appendLine()
       appendLine("[UNSUPPORTED-TO-ASSESS INPUT DISCLOSURES]")
       unsupportedDisclosures.distinct().take(8).forEach { d ->
-        appendLine("• [UNSUPPORTED_TO_ASSESS] $d")
+        appendLine("• Not assessable from available text: ${DossierFormattingEngine.sanitizeTableCell(d)}")
       }
     }
 

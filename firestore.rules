@@ -33,9 +33,9 @@ service cloud.firestore {
     }
 
     function isModeAlignedVerdict(mode, verdict) {
-      return (verdict == 'INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT' && mode in ['POST_PUBLICATION_APPRAISAL', 'JOURNAL_REFEREE', 'CLINICAL_EVIDENCE_APPRAISAL']) ||
+      return (verdict in ['INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT', 'PROVISIONAL_APPRAISAL_DESIGN_UNCERTAIN'] && mode in ['POST_PUBLICATION_APPRAISAL', 'JOURNAL_REFEREE', 'CLINICAL_EVIDENCE_APPRAISAL']) ||
              (mode == 'POST_PUBLICATION_APPRAISAL' && verdict in ['HIGH_CREDIBILITY', 'SOUND_WITH_CAVEATS', 'REQUIRES_CORRECTION', 'MAJOR_CONCERNS', 'LOW_CREDIBILITY']) ||
-             (mode == 'JOURNAL_REFEREE' && verdict in ['ACCEPT', 'MINOR_REVISION', 'MAJOR_REVISION', 'REJECT_AND_RESUBMIT', 'REJECT']) ||
+             (mode == 'JOURNAL_REFEREE' && verdict in ['ACCEPT', 'MINOR_REVISION', 'MINOR_REVISION_WITH_CAVEATS', 'MAJOR_REVISION', 'REJECT_AND_RESUBMIT', 'REJECT']) ||
              (mode == 'CLINICAL_EVIDENCE_APPRAISAL' && verdict in ['HIGH_CERTAINTY', 'MODERATE_CERTAINTY', 'LOW_CERTAINTY', 'VERY_LOW_CERTAINTY']);
     }
 
@@ -99,7 +99,7 @@ service cloud.firestore {
              data.get('refereeConfidence', 3) is int && data.get('refereeConfidence', 3) >= 1 && data.get('refereeConfidence', 3) <= 5 &&
              data.get('extractionConfidence', 3) is int && data.get('extractionConfidence', 3) >= 1 && data.get('extractionConfidence', 3) <= 5 &&
              data.get('coverageDisclosure', '') is string && data.get('coverageDisclosure', '').size() <= 2000 &&
-             data.get('validationStatus', 'PARTIALLY_VALIDATED') in ['VERIFIED', 'ADJUDICATED_WITH_CAVEATS', 'PARTIALLY_VALIDATED', 'UNVERIFIED'] &&
+             data.get('validationStatus', 'PARTIALLY_VALIDATED') in ['VERIFIED', 'ADJUDICATED_WITH_CAVEATS', 'PARTIALLY_VALIDATED', 'PROVISIONAL', 'UNVERIFIED', 'LEGACY_UNVALIDATED', 'REQUIRES_REANALYSIS'] &&
              data.get('structuredFindingsJson', '') is string && data.get('structuredFindingsJson', '').size() <= 60000;
     }
 

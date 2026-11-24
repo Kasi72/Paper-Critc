@@ -180,10 +180,19 @@ test("Round-trip preservation: Firestore read-back preserves every v4 provenance
   await assertSucceeds(
     reviewRef.update({
       reviewMode: "JOURNAL_REFEREE",
-      verdict: "MAJOR_REVISION",
+      verdict: "MINOR_REVISION_WITH_CAVEATS",
+      validationStatus: "PROVISIONAL",
       bookmarked: true,
       personalNotes: "Verified after erratum.",
       updatedAt: new Date(Date.now() - 250),
+    })
+  );
+  await assertSucceeds(
+    reviewRef.update({
+      reviewMode: "POST_PUBLICATION_APPRAISAL",
+      verdict: "PROVISIONAL_APPRAISAL_DESIGN_UNCERTAIN",
+      validationStatus: "LEGACY_UNVALIDATED",
+      updatedAt: new Date(Date.now() - 100),
     })
   );
 

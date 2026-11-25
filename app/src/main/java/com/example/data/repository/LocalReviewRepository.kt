@@ -50,9 +50,10 @@ class LocalReviewRepository(private val sqlDao: PaperCriticSqlDao) {
     val scope = normalizeOwnerScope(ownerScope)
     val existing = sqlDao.getReviewByIdForOwner(review.id, scope)
     val preservedGrounding = searchGroundingReport.ifBlank { existing?.searchGroundingReport.orEmpty() }
+    val safeReview = preserveIntactLocalChunkedFindings(review, existing)
     sqlDao.upsertReview(
       SqlReviewCacheEntity.fromPaperReview(
-        review = review,
+        review = safeReview,
         ownerScope = scope,
         searchGroundingReport = preservedGrounding
       )
@@ -67,13 +68,73 @@ class LocalReviewRepository(private val sqlDao: PaperCriticSqlDao) {
     val scope = normalizeOwnerScope(ownerScope)
     val entities = reviews.map { review ->
       val existing = sqlDao.getReviewByIdForOwner(review.id, scope)
+      val safeReview = preserveIntactLocalChunkedFindings(review, existing)
       SqlReviewCacheEntity.fromPaperReview(
-        review = review,
+        review = safeReview,
         ownerScope = scope,
         searchGroundingReport = existing?.searchGroundingReport.orEmpty()
       )
     }
     sqlDao.upsertReviews(entities)
+  }
+
+  /**
+   * Field-level Room update for [bookmarked] so concurrent local personalNotes edits
+   * can never be clobbered by a full-row REPLACE from a stale snapshot.
+   */
+  suspend fun updateBookmark(
+    review: PaperReview,
+    bookmarked: Boolean,
+    ownerScope: String = normalizeOwnerScope(review.userId)
+  ) {
+    val scope = normalizeOwnerScope(ownerScope)
+    val updatedRows = sqlDao.updateBookmarkForOwner(
+      reviewId = review.id,
+      ownerScope = scope,
+      bookmarked = bookmarked,
+      updatedAtEpochMs = System.currentTimeMillis()
+    )
+    if (updatedRows == 0) {
+      cacheReviewOffline(review.copy(bookmarked = bookmarked), ownerScope = scope)
+    }
+  }
+
+  /**
+   * Field-level Room update for [personalNotes] so concurrent local bookmark toggles
+   * can never be clobbered by a full-row REPLACE from a stale snapshot.
+   */
+  suspend fun updatePersonalNotes(
+    review: PaperReview,
+    personalNotes: String,
+    ownerScope: String = normalizeOwnerScope(review.userId)
+  ) {
+    val scope = normalizeOwnerScope(ownerScope)
+    val updatedRows = sqlDao.updatePersonalNotesForOwner(
+      reviewId = review.id,
+      ownerScope = scope,
+      personalNotes = personalNotes,
+      updatedAtEpochMs = System.currentTimeMillis()
+    )
+    if (updatedRows == 0) {
+      cacheReviewOffline(review.copy(personalNotes = personalNotes), ownerScope = scope)
+    }
+  }
+
+  private fun preserveIntactLocalChunkedFindings(
+    incoming: PaperReview,
+    existing: SqlReviewCacheEntity?
+  ): PaperReview {
+    if (incoming.findingsChunkCount > 0 &&
+      incoming.structuredFindingsJson.isBlank() &&
+      existing != null &&
+      existing.structuredFindingsJson.isNotBlank() &&
+      (incoming.findingsChecksum.isBlank() ||
+        existing.findingsChecksum.isBlank() ||
+        incoming.findingsChecksum == existing.findingsChecksum)
+    ) {
+      return incoming.copy(structuredFindingsJson = existing.structuredFindingsJson)
+    }
+    return incoming
   }
 
   suspend fun removeCachedReview(reviewId: String, ownerScope: String) {

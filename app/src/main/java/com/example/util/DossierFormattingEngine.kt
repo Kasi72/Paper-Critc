@@ -211,6 +211,7 @@ object DossierFormattingEngine {
     FRAGILITY("FRAGILITY"),
     UNCERTAINTY("UNCERTAINTY"),
     UNSUPPORTED_EVIDENCE("EVIDENCE GAP"),
+    OPEN_QUESTIONS("OPEN QUESTIONS"),
     PHASE_REPORT("PHASE 8"),
     UNKNOWN("REPORT")
   }
@@ -241,6 +242,7 @@ object DossierFormattingEngine {
         upper.startsWith("STOP-AND-ASK") -> InternalHeaderType.UNCERTAINTY
       upper.startsWith("UNSUPPORTED-TO-ASSESS") ||
         upper.startsWith("EXTRACTION FAILURE VS") -> InternalHeaderType.UNSUPPORTED_EVIDENCE
+      upper.startsWith("QUESTIONS REQUIRING FURTHER INVESTIGATION") -> InternalHeaderType.OPEN_QUESTIONS
       upper.startsWith("PHASE 8") || upper.startsWith("PHASE 9") -> InternalHeaderType.PHASE_REPORT
       upper.startsWith("DESIGN-AWARE STATISTICAL") ||
         upper.startsWith("DOMAIN-SPECIFIC STATISTICAL") ||

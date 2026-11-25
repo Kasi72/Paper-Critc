@@ -703,19 +703,18 @@ class PaperCriticViewModel(
   fun updateManuscriptText(value: String) {
     val words = if (value.isBlank()) 0 else value.trim().split(Regex("""\s+""")).size
     _formState.update { current ->
-      val updatedCoverage = if (current.importedFormat == ManuscriptInputFormat.TEXT || current.coverageReport == null) {
-        if (value.isBlank()) {
-          DocumentCoverageReport.unknown("Manuscript editor is empty.")
-        } else {
-          DocumentCoverageReport.forDirectPastedText(value, engine = "Direct Text Editor")
-        }
+      if (value == current.manuscriptText) return@update current
+      val updatedCoverage = if (value.isBlank()) {
+        DocumentCoverageReport.unknown("Manuscript editor is empty.")
       } else {
-        current.coverageReport
+        DocumentCoverageReport.forDirectPastedText(value, engine = "Direct Text Editor")
       }
       current.copy(
         manuscriptText = value,
+        importedFormat = ManuscriptInputFormat.TEXT,
         importedWordCount = words,
         importedPageCount = (words / 350).coerceAtLeast(1),
+        pdfPageBitmaps = emptyList(),
         coverageReport = updatedCoverage
       )
     }
@@ -1083,27 +1082,29 @@ class PaperCriticViewModel(
   fun toggleBookmark(review: PaperReview) {
     val activeUid = _authenticatedUserId.value
     val ownerScope = currentOwnerScope()
-    val toggled = review.copy(bookmarked = !review.bookmarked)
+    val newBookmarked = !review.bookmarked
     _localReviews.update { list ->
-      list.map { if (it.id == review.id) toggled else it }
+      list.map { if (it.id == review.id) it.copy(bookmarked = newBookmarked) else it }
     }
-    if (_selectedDossier.value?.id == review.id) {
-      _selectedDossier.value = toggled
+    _selectedDossier.update { current ->
+      if (current?.id == review.id) current.copy(bookmarked = newBookmarked) else current
     }
     viewModelScope.launch {
-      runSuspendCatching { localRepository.cacheReviewOffline(toggled, ownerScope = ownerScope) }
+      runSuspendCatching {
+        localRepository.updateBookmark(review, bookmarked = newBookmarked, ownerScope = ownerScope)
+      }
     }
     if (activeUid.isNullOrBlank() || review.id.startsWith("local_") || review.id.startsWith("sql_") || review.createdAt == null) {
-      _statusBanner.value = if (toggled.bookmarked) "Starred in offline Room cache." else "Removed star from offline Room cache."
+      _statusBanner.value = if (newBookmarked) "Starred in offline Room cache." else "Removed star from offline Room cache."
       return
     }
     viewModelScope.launch {
       // Field-level partial update so concurrent note edits never overwrite bookmark state
-      val result = repository.updateBookmark(review.id, toggled.bookmarked)
+      val result = repository.updateBookmark(review.id, newBookmarked)
       result.onSuccess {
-        _statusBanner.value = if (toggled.bookmarked) "Added to starred dossiers." else "Removed from starred dossiers."
+        _statusBanner.value = if (newBookmarked) "Added to starred dossiers." else "Removed from starred dossiers."
       }.onFailure {
-        _statusBanner.value = if (toggled.bookmarked) {
+        _statusBanner.value = if (newBookmarked) {
           "Starred locally in Room cache (cloud sync pending)."
         } else {
           "Unstarred locally in Room cache (cloud sync pending)."
@@ -1115,15 +1116,16 @@ class PaperCriticViewModel(
   fun savePersonalNotes(review: PaperReview, notes: String) {
     val activeUid = _authenticatedUserId.value
     val ownerScope = currentOwnerScope()
-    val updated = review.copy(personalNotes = notes)
     _localReviews.update { list ->
-      list.map { if (it.id == review.id) updated else it }
+      list.map { if (it.id == review.id) it.copy(personalNotes = notes) else it }
     }
-    if (_selectedDossier.value?.id == review.id) {
-      _selectedDossier.value = updated
+    _selectedDossier.update { current ->
+      if (current?.id == review.id) current.copy(personalNotes = notes) else current
     }
     viewModelScope.launch {
-      runSuspendCatching { localRepository.cacheReviewOffline(updated, ownerScope = ownerScope) }
+      runSuspendCatching {
+        localRepository.updatePersonalNotes(review, personalNotes = notes, ownerScope = ownerScope)
+      }
     }
     if (activeUid.isNullOrBlank() || review.id.startsWith("local_") || review.id.startsWith("sql_") || review.createdAt == null) {
       _statusBanner.value = "Notes saved to Room offline dossier."
@@ -1209,19 +1211,25 @@ class PaperCriticViewModel(
         _statusBanner.value = "Stage 03b Google Search Grounding complete (${result.sources.size} web source(s))."
       } catch (e: TimeoutCancellationException) {
         Log.e(TAG, "Google Search Grounding timed out", e)
-        _searchGroundingState.value = SearchGroundingUiState.Error(
-          "Stage 03b Google Search Grounding timed out after 90 seconds."
-        )
+        if (canCommitInferenceResult(initiatingOwnerScope, initiatingSessionGen, currentOwnerScope(), sessionGeneration.get())) {
+          _searchGroundingState.value = SearchGroundingUiState.Error(
+            "Stage 03b Google Search Grounding timed out after 90 seconds."
+          )
+        }
       } catch (e: CancellationException) {
-        if (_searchGroundingState.value is SearchGroundingUiState.Loading) {
+        if (canCommitInferenceResult(initiatingOwnerScope, initiatingSessionGen, currentOwnerScope(), sessionGeneration.get()) &&
+          _searchGroundingState.value is SearchGroundingUiState.Loading
+        ) {
           _searchGroundingState.value = SearchGroundingUiState.Idle
         }
         throw e
       } catch (e: Exception) {
         Log.e(TAG, "Google Search Grounding failed", e)
-        _searchGroundingState.value = SearchGroundingUiState.Error(
-          Reviewer2PipelineService.formatThrowableDetails(e)
-        )
+        if (canCommitInferenceResult(initiatingOwnerScope, initiatingSessionGen, currentOwnerScope(), sessionGeneration.get())) {
+          _searchGroundingState.value = SearchGroundingUiState.Error(
+            Reviewer2PipelineService.formatThrowableDetails(e)
+          )
+        }
       } finally {
         activeSearchGroundingJob = null
       }
@@ -1367,29 +1375,35 @@ class PaperCriticViewModel(
         }
       } catch (e: TimeoutCancellationException) {
         Log.e(TAG, "Multi-turn chat stream timed out", e)
-        _chatConfigState.update {
-          it.copy(
-            isStreaming = false,
-            errorMessage = "Gemini chat response timed out after 90 seconds."
-          )
+        if (canCommitInferenceResult(initiatingOwnerScope, initiatingSessionGen, currentOwnerScope(), sessionGeneration.get())) {
+          _chatConfigState.update {
+            it.copy(
+              isStreaming = false,
+              errorMessage = "Gemini chat response timed out after 90 seconds."
+            )
+          }
         }
       } catch (e: CancellationException) {
-        _chatConfigState.update {
-          it.copy(
-            isStreaming = false,
-            streamingPartialText = "",
-            streamingQueries = emptyList(),
-            streamingSources = emptyList()
-          )
+        if (canCommitInferenceResult(initiatingOwnerScope, initiatingSessionGen, currentOwnerScope(), sessionGeneration.get())) {
+          _chatConfigState.update {
+            it.copy(
+              isStreaming = false,
+              streamingPartialText = "",
+              streamingQueries = emptyList(),
+              streamingSources = emptyList()
+            )
+          }
         }
         throw e
       } catch (e: Exception) {
         Log.e(TAG, "Multi-turn chat stream failed", e)
-        _chatConfigState.update {
-          it.copy(
-            isStreaming = false,
-            errorMessage = Reviewer2PipelineService.formatThrowableDetails(e)
-          )
+        if (canCommitInferenceResult(initiatingOwnerScope, initiatingSessionGen, currentOwnerScope(), sessionGeneration.get())) {
+          _chatConfigState.update {
+            it.copy(
+              isStreaming = false,
+              errorMessage = Reviewer2PipelineService.formatThrowableDetails(e)
+            )
+          }
         }
       } finally {
         activeChatJob = null

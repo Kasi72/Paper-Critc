@@ -22,9 +22,12 @@ const val ANONYMOUS_OWNER_SCOPE: String = "__local_anonymous__"
 fun normalizeOwnerScope(userId: String?): String =
   userId?.trim()?.takeIf { it.isNotBlank() } ?: ANONYMOUS_OWNER_SCOPE
 
-@Entity(tableName = "sql_review_cache")
+@Entity(
+  tableName = "sql_review_cache",
+  primaryKeys = ["ownerScope", "id"]
+)
 data class SqlReviewCacheEntity(
-  @PrimaryKey val id: String,
+  val id: String,
   val userId: String,
   val ownerScope: String = ANONYMOUS_OWNER_SCOPE,
   val title: String,
@@ -52,7 +55,7 @@ data class SqlReviewCacheEntity(
   val coverageDisclosure: String = "",
   val validationStatus: String = "LEGACY_UNVALIDATED",
   val structuredFindingsJson: String = "",
-  val schemaVersion: Int = 5,
+  val schemaVersion: Int = 1,
   val findingsChunkCount: Int = 0,
   val findingsChecksum: String = "",
   val abstractSummary: String,
@@ -138,7 +141,7 @@ data class SqlReviewCacheEntity(
       searchGroundingReport: String = ""
     ): SqlReviewCacheEntity {
       val rubric = review.toRubric()
-      val stableId = review.id.ifBlank { "sql_${review.title.hashCode()}" }
+      val stableId = review.id.ifBlank { "sql_${java.util.UUID.randomUUID()}" }
       val normalizedScope = normalizeOwnerScope(ownerScope)
       return SqlReviewCacheEntity(
         id = stableId,
@@ -283,6 +286,28 @@ interface PaperCriticSqlDao {
   @Insert(onConflict = OnConflictStrategy.REPLACE)
   suspend fun upsertReviews(entities: List<SqlReviewCacheEntity>)
 
+  @Query(
+    "UPDATE sql_review_cache SET bookmarked = :bookmarked, updatedAtEpochMs = :updatedAtEpochMs " +
+      "WHERE id = :reviewId AND ownerScope = :ownerScope"
+  )
+  suspend fun updateBookmarkForOwner(
+    reviewId: String,
+    ownerScope: String,
+    bookmarked: Boolean,
+    updatedAtEpochMs: Long = System.currentTimeMillis()
+  ): Int
+
+  @Query(
+    "UPDATE sql_review_cache SET personalNotes = :personalNotes, updatedAtEpochMs = :updatedAtEpochMs " +
+      "WHERE id = :reviewId AND ownerScope = :ownerScope"
+  )
+  suspend fun updatePersonalNotesForOwner(
+    reviewId: String,
+    ownerScope: String,
+    personalNotes: String,
+    updatedAtEpochMs: Long = System.currentTimeMillis()
+  ): Int
+
   @Query("DELETE FROM sql_review_cache WHERE id = :reviewId AND ownerScope = :ownerScope")
   suspend fun deleteReviewByIdForOwner(reviewId: String, ownerScope: String)
 
@@ -347,7 +372,7 @@ interface PaperCriticSqlDao {
     SqlChatMessageEntity::class,
     SqlApiProviderEntity::class
   ],
-  version = 6,
+  version = 7,
   exportSchema = false
 )
 abstract class PaperCriticSqlDatabase : RoomDatabase() {
@@ -444,6 +469,106 @@ abstract class PaperCriticSqlDatabase : RoomDatabase() {
       }
     }
 
+    /**
+     * Non-destructive v6 -> v7 hardening: rebuilds sql_review_cache with composite
+     * PRIMARY KEY(ownerScope, id) so identical review IDs across different accounts on a shared
+     * device can never collide or overwrite each other via OnConflictStrategy.REPLACE.
+     */
+    val MIGRATION_6_7 = object : Migration(6, 7) {
+      override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL(
+          """
+          CREATE TABLE IF NOT EXISTS sql_review_cache_v7 (
+            id TEXT NOT NULL,
+            userId TEXT NOT NULL,
+            ownerScope TEXT NOT NULL,
+            title TEXT NOT NULL,
+            authors TEXT NOT NULL,
+            publicationYear TEXT NOT NULL,
+            venueOrCitation TEXT NOT NULL,
+            isEmpirical INTEGER NOT NULL,
+            credibilityScore INTEGER NOT NULL,
+            verdict TEXT NOT NULL,
+            methodologyScore INTEGER NOT NULL,
+            clarityScore INTEGER NOT NULL,
+            significanceScore INTEGER NOT NULL,
+            originalityScore INTEGER NOT NULL,
+            mathRigorScore INTEGER NOT NULL,
+            reproducibilityScore INTEGER NOT NULL,
+            methodologyJustification TEXT NOT NULL,
+            clarityJustification TEXT NOT NULL,
+            significanceJustification TEXT NOT NULL,
+            originalityJustification TEXT NOT NULL,
+            mathRigorJustification TEXT NOT NULL,
+            reproducibilityJustification TEXT NOT NULL,
+            refereeConfidence INTEGER NOT NULL,
+            extractionConfidence INTEGER NOT NULL,
+            reviewMode TEXT NOT NULL,
+            coverageDisclosure TEXT NOT NULL,
+            validationStatus TEXT NOT NULL,
+            structuredFindingsJson TEXT NOT NULL,
+            schemaVersion INTEGER NOT NULL,
+            findingsChunkCount INTEGER NOT NULL,
+            findingsChecksum TEXT NOT NULL,
+            abstractSummary TEXT NOT NULL,
+            researchQuestion TEXT NOT NULL,
+            keyMethodology TEXT NOT NULL,
+            coreContributions TEXT NOT NULL,
+            redTeamCritique TEXT NOT NULL,
+            blueTeamVerification TEXT NOT NULL,
+            mathAuditReport TEXT NOT NULL,
+            codeAuditReport TEXT NOT NULL,
+            editorNote TEXT NOT NULL,
+            copyeditSuggestions TEXT NOT NULL,
+            reviewerQuestions TEXT NOT NULL,
+            formattedDossier TEXT NOT NULL,
+            bookmarked INTEGER NOT NULL,
+            personalNotes TEXT NOT NULL,
+            searchGroundingReport TEXT NOT NULL,
+            createdAtSeconds INTEGER NOT NULL,
+            createdAtNanos INTEGER NOT NULL,
+            updatedAtEpochMs INTEGER NOT NULL,
+            PRIMARY KEY(ownerScope, id)
+          )
+          """.trimIndent()
+        )
+        db.execSQL(
+          """
+          INSERT OR REPLACE INTO sql_review_cache_v7 (
+            id, userId, ownerScope, title, authors, publicationYear, venueOrCitation,
+            isEmpirical, credibilityScore, verdict,
+            methodologyScore, clarityScore, significanceScore, originalityScore, mathRigorScore, reproducibilityScore,
+            methodologyJustification, clarityJustification, significanceJustification,
+            originalityJustification, mathRigorJustification, reproducibilityJustification,
+            refereeConfidence, extractionConfidence, reviewMode, coverageDisclosure, validationStatus,
+            structuredFindingsJson, schemaVersion, findingsChunkCount, findingsChecksum,
+            abstractSummary, researchQuestion, keyMethodology, coreContributions,
+            redTeamCritique, blueTeamVerification, mathAuditReport, codeAuditReport,
+            editorNote, copyeditSuggestions, reviewerQuestions, formattedDossier,
+            bookmarked, personalNotes, searchGroundingReport,
+            createdAtSeconds, createdAtNanos, updatedAtEpochMs
+          )
+          SELECT
+            id, userId, ownerScope, title, authors, publicationYear, venueOrCitation,
+            isEmpirical, credibilityScore, verdict,
+            methodologyScore, clarityScore, significanceScore, originalityScore, mathRigorScore, reproducibilityScore,
+            methodologyJustification, clarityJustification, significanceJustification,
+            originalityJustification, mathRigorJustification, reproducibilityJustification,
+            refereeConfidence, extractionConfidence, reviewMode, coverageDisclosure, validationStatus,
+            structuredFindingsJson, schemaVersion, findingsChunkCount, findingsChecksum,
+            abstractSummary, researchQuestion, keyMethodology, coreContributions,
+            redTeamCritique, blueTeamVerification, mathAuditReport, codeAuditReport,
+            editorNote, copyeditSuggestions, reviewerQuestions, formattedDossier,
+            bookmarked, personalNotes, searchGroundingReport,
+            createdAtSeconds, createdAtNanos, updatedAtEpochMs
+          FROM sql_review_cache
+          """.trimIndent()
+        )
+        db.execSQL("DROP TABLE sql_review_cache")
+        db.execSQL("ALTER TABLE sql_review_cache_v7 RENAME TO sql_review_cache")
+      }
+    }
+
     fun getDatabase(context: Context): PaperCriticSqlDatabase {
       return INSTANCE ?: synchronized(this) {
         val instance = Room.databaseBuilder(
@@ -451,7 +576,7 @@ abstract class PaperCriticSqlDatabase : RoomDatabase() {
           PaperCriticSqlDatabase::class.java,
           "paper_critic_sql_database"
         )
-          .addMigrations(MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6)
+          .addMigrations(MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7)
           .build()
         INSTANCE = instance
         instance

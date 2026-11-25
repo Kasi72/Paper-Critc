@@ -39,6 +39,7 @@ import com.example.ui.viewmodel.AiProviderRoute
 import com.example.ui.viewmodel.AppSettingsState
 import com.example.ui.viewmodel.PaperCriticViewModel
 import com.example.util.DocumentCoverageReport
+import com.example.util.DossierFormattingEngine
 import com.example.util.ManuscriptExtractor
 import com.example.util.PdfExportScope
 import com.example.util.PdfReportExporter
@@ -1161,5 +1162,105 @@ class EnterpriseAndScientificTruthGateTest {
     assertEquals(8, gatedNoVerified.finalMathScore)
     assertEquals(8, gatedNoVerified.finalMethodologyScore)
     assertEquals(null, gatedNoVerified.verdictCapReason)
+  }
+
+  @Test
+  fun audit13_downstreamRegressionFixes_roomPkIsolationChunkPreservationFieldUpdatesAndFormatting() = runBlocking {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val db = Room.inMemoryDatabaseBuilder(context, PaperCriticSqlDatabase::class.java)
+      .allowMainThreadQueries()
+      .build()
+    try {
+      val localRepo = LocalReviewRepository(db.sqlDao())
+
+      // 1. Composite PRIMARY KEY(ownerScope, id) prevents cross-account collision on identical IDs
+      val reviewA = PaperReview(
+        id = "shared_review_id",
+        userId = "uid_alpha",
+        title = "Account Alpha Private Paper",
+        structuredFindingsJson = """[{"id":"R-01","title":"Alpha Finding","status":"VERIFIED"}]""",
+        findingsChunkCount = 2,
+        findingsChecksum = "abc123"
+      )
+      val reviewB = PaperReview(
+        id = "shared_review_id",
+        userId = "uid_beta",
+        title = "Account Beta Private Paper",
+        structuredFindingsJson = """[{"id":"R-01","title":"Beta Finding","status":"VERIFIED"}]"""
+      )
+      localRepo.cacheReviewOffline(reviewA, ownerScope = "uid_alpha")
+      localRepo.cacheReviewOffline(reviewB, ownerScope = "uid_beta")
+
+      val alphaCached = localRepo.getCachedReviewsOnce("uid_alpha")
+      val betaCached = localRepo.getCachedReviewsOnce("uid_beta")
+      assertEquals(1, alphaCached.size)
+      assertEquals(1, betaCached.size)
+      assertEquals("Account Alpha Private Paper", alphaCached.first().title)
+      assertEquals("Account Beta Private Paper", betaCached.first().title)
+
+      // 2. Transient cloud chunk-hydration failure (blank structuredFindingsJson + findingsChunkCount > 0)
+      //    must NEVER clobber intact local Room structuredFindingsJson
+      val failedHydrationSnapshot = reviewA.copy(structuredFindingsJson = "")
+      localRepo.cacheReviewsOffline(listOf(failedHydrationSnapshot), ownerScope = "uid_alpha")
+      val preserved = localRepo.getCachedReviewsOnce("uid_alpha").first()
+      assertEquals(
+        "Intact local structuredFindingsJson must survive transient chunk hydration failure",
+        reviewA.structuredFindingsJson,
+        preserved.structuredFindingsJson
+      )
+
+      // 3. Field-level Room updates for bookmark & personalNotes must not clobber each other
+      val staleSnapshot = preserved
+      localRepo.updateBookmark(staleSnapshot, bookmarked = true, ownerScope = "uid_alpha")
+      localRepo.updatePersonalNotes(staleSnapshot, personalNotes = "Check sensitivity Table S2", ownerScope = "uid_alpha")
+      val afterBoth = localRepo.getCachedReviewsOnce("uid_alpha").first()
+      assertTrue("Bookmark must remain true after concurrent notes update from stale snapshot", afterBoth.bookmarked)
+      assertEquals("Check sensitivity Table S2", afterBoth.personalNotes)
+
+      // 4. Legacy PaperReview default schemaVersion is 1, while cloud payload stamps v5
+      val legacyDefault = PaperReview(title = "Legacy Record")
+      assertEquals(1, legacyDefault.schemaVersion)
+      val payload = ReviewRepository.buildFirestorePayload(
+        review = legacyDefault,
+        uid = "uid_alpha",
+        createdAtValue = "ts",
+        updatedAtValue = "ts"
+      )
+      assertEquals(5, payload["schemaVersion"])
+
+      // 5. Plain-text dossier must render "Year not verified" instead of empty "()"
+      val plainDossier = Reviewer2PipelineService.renderPlainTextDossier(
+        title = "Undated Preprint",
+        authors = "Doe, J.",
+        year = "",
+        venueOrCitation = "Preprint",
+        isEmpirical = true,
+        credibilityScore = 70L,
+        verdict = "MINOR_REVISION",
+        abstractSummary = "Summary",
+        researchQuestion = "RQ",
+        keyMethodology = "Methods",
+        coreContributions = "Contributions",
+        redTeamCritique = "",
+        blueTeamVerification = "",
+        mathAuditReport = "",
+        codeAuditReport = "",
+        editorNote = "",
+        copyeditSuggestions = "",
+        reviewerQuestions = ""
+      )
+      assertFalse("Plain dossier must never render empty '()'", plainDossier.contains("()"))
+      assertTrue("Plain dossier should explicitly state Year not verified", plainDossier.contains("Year not verified"))
+
+      // 6. [QUESTIONS REQUIRING FURTHER INVESTIGATION (UNVERIFIED)] parses to typed OPEN QUESTIONS SubHeader
+      val blocks = DossierFormattingEngine.parseStructuredBlocks(
+        "[QUESTIONS REQUIRING FURTHER INVESTIGATION (UNVERIFIED)]\n• Confirm blinding protocol."
+      )
+      val header = blocks.filterIsInstance<ReportBlock.SubHeader>().firstOrNull()
+      assertTrue("Header must parse into OPEN QUESTIONS SubHeader", header != null && header.tag == "OPEN QUESTIONS")
+      assertFalse("Header title must have no outer brackets", header!!.title.contains("[") || header.title.contains("]"))
+    } finally {
+      db.close()
+    }
   }
 }

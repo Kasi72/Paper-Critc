@@ -1381,18 +1381,36 @@ class Reviewer2PipelineService {
       adjudicated.adjudicatedFindings
     )
 
-    val methodologyJustification = parsedRationales["methodology"]
-      ?: "Evaluated design rigor, bias controls, and synthesis alignment (${forensicReport.studyDesign.riskOfBiasInstrument})."
-    val significanceJustification = parsedRationales["significance"]
-      ?: "Evaluated scientific contribution, generalizability, and clinical/policy utility."
-    val clarityJustification = parsedRationales["clarity"]
-      ?: "Evaluated reporting completeness (${forensicReport.studyDesign.reportingGuideline}), structure, and table/text precision."
-    val originalityJustification = parsedRationales["originality"]
-      ?: "Evaluated originality of the research question, dataset scope, and analytical contribution."
-    val mathRigorJustification = parsedRationales["math"]
-      ?: "Evaluated statistical estimation, CI geometry, heterogeneity/variance reporting, and numerical consistency."
-    val reproducibilityJustification = parsedRationales["reproducibility"]
-      ?: "Evaluated protocol transparency, search/code provenance, and replication readiness."
+    val methodologyJustification = sanitizeProseAgainstDismissedFindings(
+      parsedRationales["methodology"]
+        ?: "Evaluated design rigor, bias controls, and synthesis alignment (${forensicReport.studyDesign.riskOfBiasInstrument}).",
+      adjudicated.adjudicatedFindings
+    )
+    val significanceJustification = sanitizeProseAgainstDismissedFindings(
+      parsedRationales["significance"]
+        ?: "Evaluated scientific contribution, generalizability, and clinical/policy utility.",
+      adjudicated.adjudicatedFindings
+    )
+    val clarityJustification = sanitizeProseAgainstDismissedFindings(
+      parsedRationales["clarity"]
+        ?: "Evaluated reporting completeness (${forensicReport.studyDesign.reportingGuideline}), structure, and table/text precision.",
+      adjudicated.adjudicatedFindings
+    )
+    val originalityJustification = sanitizeProseAgainstDismissedFindings(
+      parsedRationales["originality"]
+        ?: "Evaluated originality of the research question, dataset scope, and analytical contribution.",
+      adjudicated.adjudicatedFindings
+    )
+    val mathRigorJustification = sanitizeProseAgainstDismissedFindings(
+      parsedRationales["math"]
+        ?: "Evaluated statistical estimation, CI geometry, heterogeneity/variance reporting, and numerical consistency.",
+      adjudicated.adjudicatedFindings
+    )
+    val reproducibilityJustification = sanitizeProseAgainstDismissedFindings(
+      parsedRationales["reproducibility"]
+        ?: "Evaluated protocol transparency, search/code provenance, and replication readiness.",
+      adjudicated.adjudicatedFindings
+    )
 
     // P0-01 Single-Source-of-Truth Reporting:
     // Generate the adjudicated findings matrix exclusively from adjudicated.adjudicatedFindings.
@@ -1583,6 +1601,7 @@ class Reviewer2PipelineService {
       coverageDisclosure = coverageDisclosure,
       validationStatus = validationStatus,
       structuredFindingsJson = structuredFindingsJson,
+      schemaVersion = 5,
       abstractSummary = abstractSummary,
       researchQuestion = researchQuestion,
       keyMethodology = keyMethodology,
@@ -1607,7 +1626,7 @@ class Reviewer2PipelineService {
       You are the Lead Referee, Stage 08a Alchemist, and Stage 02c Blue Team Mentor from the 'isitcredible/reviewer2' and 'phd-skills' peer-review engine.
       You are advising the author/researcher on the following audited manuscript:
       Title: ${review.title}
-      Authors: ${review.authors} (${review.publicationYear})
+      Authors: ${review.authors} (${review.publicationYear.ifBlank { "Year not verified" }})
       Verdict: ${review.verdict} (Credibility Score: ${review.credibilityScore}/100)
       Abstract Summary: ${review.abstractSummary}
       Red Team Critique (01a Breaker / 01b Butcher / 01c Shredder / 01g Void):
@@ -1667,7 +1686,7 @@ class Reviewer2PipelineService {
     val prompt = """
       Execute Stage 03b External Literature & Citation Grounding for:
       - Title: ${title.ifBlank { "Untitled Manuscript" }}
-      - Authors: ${authors.ifBlank { "Anonymous" }} ($year)
+      - Authors: ${authors.ifBlank { "Anonymous" }} (${year.ifBlank { "Year not verified" }})
       - Venue / Citation: $venue
       - Claims, Summary & Methodology:
       $claimsAndSummary
@@ -1709,10 +1728,18 @@ class Reviewer2PipelineService {
   ): Flow<MultiTurnStreamChunk> = flow {
     val systemPrompt = buildSystemInstructionForPersona(persona, review, enableSearchGrounding)
 
-    val useExternalProvider = externalProvider != null &&
+    val isCustomByokProvider = externalProvider != null &&
       externalProvider.protocolType != com.example.data.model.ApiProtocolType.FIREBASE_AI_LOGIC_KEYLESS &&
-      externalProvider.apiKey.isNotBlank() &&
-      !enableSearchGrounding
+      externalProvider.apiKey.isNotBlank()
+    val requiresGoogleSearch = enableSearchGrounding || persona == ChatbotRolePersona.SEARCH_FACT_CHECKER
+    if (isCustomByokProvider && requiresGoogleSearch && !autoFallbackToKeylessFirebase) {
+      throw IllegalStateException(
+        "Google Search Grounding requires Firebase AI Logic, but automatic Firebase fallback is disabled while '${externalProvider?.serviceName}' is active. " +
+          "Disable Web Search Grounding, switch provider to Firebase AI Logic, or explicitly enable Firebase fallback in API Settings."
+      )
+    }
+
+    val useExternalProvider = isCustomByokProvider && !requiresGoogleSearch
 
     if (useExternalProvider) {
       val transcriptPrompt = buildString {
@@ -1869,7 +1896,7 @@ class Reviewer2PipelineService {
       """
       ACTIVE AUDITED MANUSCRIPT DOSSIER CONTEXT:
       - Title: ${review.title}
-      - Authors: ${review.authors} (${review.publicationYear}) • Venue: ${review.venueOrCitation}
+      - Authors: ${review.authors} (${review.publicationYear.ifBlank { "Year not verified" }}) • Venue: ${review.venueOrCitation}
       - Verdict: ${review.verdict} (Credibility Score: ${review.credibilityScore}/100)
       - Abstract & Setup: ${review.abstractSummary}
       - Research Question: ${review.researchQuestion}
@@ -4371,7 +4398,7 @@ class Reviewer2PipelineService {
         appendLine("MANUSCRIPT CITATION & 6-AXIS SCORECARD (STAGE 00a–00b)")
         appendLine(subDivider)
         appendLine("Title          : $title")
-        appendLine("Authors        : $authors ($year)")
+        appendLine("Authors        : $authors (${year.ifBlank { "Year not verified" }})")
         appendLine("Venue/Ref      : $venueOrCitation")
         appendLine("Track          : ${if (isEmpirical) "Empirical (01a Breaker / 01b Butcher / 01c Shredder)" else "Theoretical / Non-Empirical (01a + 01a_2)"}")
         appendLine("Date           : $dateStr")

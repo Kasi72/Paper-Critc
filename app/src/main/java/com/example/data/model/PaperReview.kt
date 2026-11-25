@@ -597,7 +597,7 @@ data class PaperReview(
   val coverageDisclosure: String = "",
   val validationStatus: String = "LEGACY_UNVALIDATED",
   val structuredFindingsJson: String = "",
-  val schemaVersion: Int = 5,
+  val schemaVersion: Int = 1,
   val findingsChunkCount: Int = 0,
   val findingsChecksum: String = "",
   // Narrative dossier sections

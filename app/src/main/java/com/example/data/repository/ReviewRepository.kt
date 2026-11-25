@@ -82,6 +82,21 @@ class ReviewRepository(private val db: FirebaseFirestore) {
     cleanupPreviousChunks: Boolean
   ) {
     val packaged = ReviewFindingCodec.packageForCloud(review.structuredFindingsJson)
+    if (packaged.chunks.isNotEmpty()) {
+      val verifiedJson = ReviewFindingCodec.reassembleAndVerify(
+        chunks = packaged.chunks,
+        expectedChecksumSha256 = packaged.checksumSha256
+      ).getOrThrow()
+      val originalDecoded = ReviewFindingCodec.decode(review.structuredFindingsJson)
+      val verifiedDecoded = ReviewFindingCodec.decode(verifiedJson)
+      if (originalDecoded.size != verifiedDecoded.size ||
+        originalDecoded.map { it.id } != verifiedDecoded.map { it.id }
+      ) {
+        throw IllegalStateException(
+          "Pre-commit lossless chunk verification failed: finding ledger count/IDs diverged (${originalDecoded.size} vs ${verifiedDecoded.size})."
+        )
+      }
+    }
     val payload = buildFirestorePayload(
       review = review,
       uid = uid,

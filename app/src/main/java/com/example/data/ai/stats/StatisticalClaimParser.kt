@@ -29,8 +29,12 @@ object StatisticalClaimParser {
     val unsupportedDisclosures: List<String>,
     val globalTailSpec: TailSpecification,
     val globalAlpha: Double,
-    val sanitizedResult: SemanticValidityEngine.SanitizedTextResult? = null
+    val sanitizedResult: SemanticValidityEngine.SanitizedTextResult? = null,
+    val totalDiscoveredClaims: Int = claims.size,
+    val truncatedClaimCount: Int = 0
   )
+
+  private const val MAX_PER_FAMILY_DISCOVERY = 500
 
   private val sectionHeaderRegex = Regex(
     """(?im)^\s*(?:\d+(?:\.\d+)*\.?\s+)?(abstract|introduction|background|methods?|materials?\s+and\s+methods?|statistical\s+analysis|results?|findings?|discussion|conclusions?|limitations?|references|bibliography|works\s+cited|supplementary(?:\s+\w+)?|appendix|protocol)\b.*$"""
@@ -84,18 +88,33 @@ object StatisticalClaimParser {
     RegexOption.IGNORE_CASE
   )
 
-  // Effect sizes with CIs (with or without explicit "95%" label):
-  // OR 2.10 (1.30–3.40), aHR = 0.74 (95% CI 0.58-0.94), RR = 1.52 (CI: 1.10 to 2.10), SMD = 0.45 (0.12, 0.78)
+  // Effect sizes with CIs (with or without explicit "95%" label), capturing exact interval type (CI/CrI/UI/PI):
+  // OR 2.10 (1.30–3.40), aHR = 0.74 (95% CI 0.58-0.94), OR = 1.40 (95% CrI 0.95–2.10)
   private val effectCiFlexibleRegex = Regex(
-    """\b(aOR|OR|aRR|RR|aHR|HR|IRR|PR|SMD|MD|WMD|RD|ARR|AUC|AUROC|PR-AUC|AUPRC|C-statistic|beta|β|mean|median|rate|prevalence|pooled(?:\s+\w+)?)\s*(?:of\s*|was\s*|[=:]\s*)?\s*([-−+]?\d+(?:\.\d+)?)\s*\(\s*(?:(?:(\d{2})%\s*)?(?:CI|CrI|UI|PI|confidence\s+interval)\s*[:=]?\s*)?([-−+]?\d+(?:\.\d+)?)\s*(?:to|–|—|-|,)\s*([-−+]?\d+(?:\.\d+)?)\s*\)""",
+    """\b(aOR|OR|aRR|RR|aHR|HR|IRR|PR|SMD|MD|WMD|RD|ARR|AUC|AUROC|PR-AUC|AUPRC|C-statistic|beta|β|mean|median|rate|prevalence|pooled(?:\s+\w+)?)\s*(?:of\s*|was\s*|[=:]\s*)?\s*([-−+]?\d+(?:\.\d+)?)\s*\(\s*(?:(?:(\d{2})%\s*)?(CI|CrI|UI|PI|confidence\s+interval|credible\s+interval|uncertainty\s+interval|prediction\s+interval)\s*[:=]?\s*)?([-−+]?\d+(?:\.\d+)?)\s*(?:to|–|—|-|,)\s*([-−+]?\d+(?:\.\d+)?)\s*\)""",
     RegexOption.IGNORE_CASE
   )
 
-  // Narrative comma-separated CIs: "PR = 2.21, 95% CI 0.00 to 4.50", "OR = 1.80, 95% CI 1.10–2.90", "estimate of 9, 95% CI 1.26 to 2.35"
+  // Narrative comma-separated CIs: "PR = 2.21, 95% CI 0.00 to 4.50", "OR = 1.80, 95% CrI 1.10–2.90"
   private val effectCiNarrativeRegex = Regex(
-    """\b(aOR|OR|aRR|RR|aHR|HR|IRR|PR|SMD|MD|WMD|RD|ARR|AUC|AUROC|beta|β|mean|median|rate|prevalence|estimate|beds?|pooled(?:\s+\w+)?)\s*(?:of\s*|was\s*|[=:]\s*)\s*([-−+]?\d+(?:\.\d+)?)\s*[,;]\s*(?:with\s+(?:a\s+)?)?(?:(\d{2})%\s*)?(?:CI|CrI|UI|PI|confidence\s+interval)\s*(?:of\s*)?[:=]?\s*([-−+]?\d+(?:\.\d+)?)\s*(?:to|–|—|-)\s*([-−+]?\d+(?:\.\d+)?)""",
+    """\b(aOR|OR|aRR|RR|aHR|HR|IRR|PR|SMD|MD|WMD|RD|ARR|AUC|AUROC|beta|β|mean|median|rate|prevalence|estimate|beds?|pooled(?:\s+\w+)?)\s*(?:of\s*|was\s*|[=:]\s*)\s*([-−+]?\d+(?:\.\d+)?)\s*[,;]\s*(?:with\s+(?:a\s+)?)?(?:(\d{2})%\s*)?(CI|CrI|UI|PI|confidence\s+interval|credible\s+interval|uncertainty\s+interval|prediction\s+interval)\s*(?:of\s*)?[:=]?\s*([-−+]?\d+(?:\.\d+)?)\s*(?:to|–|—|-)\s*([-−+]?\d+(?:\.\d+)?)""",
     RegexOption.IGNORE_CASE
   )
+
+  private fun parseIntervalType(rawToken: String, fullMatch: String): IntervalType {
+    val norm = rawToken.trim().lowercase(Locale.US)
+    return when {
+      norm == "cri" || norm.contains("credible") -> IntervalType.CREDIBLE_INTERVAL
+      norm == "ui" || norm.contains("uncertainty") -> IntervalType.UNCERTAINTY_INTERVAL
+      norm == "pi" || norm.contains("prediction") -> IntervalType.PREDICTION_INTERVAL
+      norm == "ci" || norm.contains("confidence") -> IntervalType.CONFIDENCE_INTERVAL
+      Regex("""\bCrI\b|credible\s+interval""", RegexOption.IGNORE_CASE).containsMatchIn(fullMatch) -> IntervalType.CREDIBLE_INTERVAL
+      Regex("""\bUI\b|uncertainty\s+interval""", RegexOption.IGNORE_CASE).containsMatchIn(fullMatch) -> IntervalType.UNCERTAINTY_INTERVAL
+      Regex("""\bPI\b|prediction\s+interval""", RegexOption.IGNORE_CASE).containsMatchIn(fullMatch) -> IntervalType.PREDICTION_INTERVAL
+      Regex("""\bCI\b|confidence\s+interval""", RegexOption.IGNORE_CASE).containsMatchIn(fullMatch) -> IntervalType.CONFIDENCE_INTERVAL
+      else -> IntervalType.UNSPECIFIED
+    }
+  }
 
   // Proportions: 18/120 (15.0%) or 18 of 120 (15%)
   private val proportionRegex = Regex(
@@ -207,7 +226,7 @@ object StatisticalClaimParser {
     }
 
     // 1. Flexible Test-Statistic Claims (t, z, chi2, F, r)
-    tStatFlexibleRegex.findAll(clean).take(25).forEach { m ->
+    tStatFlexibleRegex.findAll(clean).take(MAX_PER_FAMILY_DISCOVERY).forEach { m ->
       val dfStr = m.groupValues[1].ifBlank { m.groupValues[2] }
       val df = dfStr.toDoubleOrNull()
       val statVal = parseSignedDouble(m.groupValues[3])
@@ -243,7 +262,7 @@ object StatisticalClaimParser {
       )
     }
 
-    zStatFlexibleRegex.findAll(clean).take(25).forEach { m ->
+    zStatFlexibleRegex.findAll(clean).take(MAX_PER_FAMILY_DISCOVERY).forEach { m ->
       val statVal = parseSignedDouble(m.groupValues[1])
       val op = m.groupValues[2]
       val pVal = parseScientificDouble(m.groupValues[3])
@@ -275,7 +294,7 @@ object StatisticalClaimParser {
       )
     }
 
-    chiSqFlexibleRegex.findAll(clean).take(25).forEach { m ->
+    chiSqFlexibleRegex.findAll(clean).take(MAX_PER_FAMILY_DISCOVERY).forEach { m ->
       val df = m.groupValues[1].ifBlank { m.groupValues[2] }.toDoubleOrNull()
       val statVal = parseSignedDouble(m.groupValues[3])
       val op = m.groupValues[4]
@@ -309,7 +328,7 @@ object StatisticalClaimParser {
       )
     }
 
-    fStatFlexibleRegex.findAll(clean).take(25).forEach { m ->
+    fStatFlexibleRegex.findAll(clean).take(MAX_PER_FAMILY_DISCOVERY).forEach { m ->
       val df1 = m.groupValues[1].ifBlank { m.groupValues[3] }.toDoubleOrNull()
       val df2 = m.groupValues[2].ifBlank { m.groupValues[4] }.toDoubleOrNull()
       val statVal = parseSignedDouble(m.groupValues[5])
@@ -344,7 +363,7 @@ object StatisticalClaimParser {
       )
     }
 
-    rStatFlexibleRegex.findAll(clean).take(20).forEach { m ->
+    rStatFlexibleRegex.findAll(clean).take(MAX_PER_FAMILY_DISCOVERY).forEach { m ->
       val df = m.groupValues[1].toDoubleOrNull()
       val rVal = parseSignedDouble(m.groupValues[2])
       val op = m.groupValues[3]
@@ -380,7 +399,7 @@ object StatisticalClaimParser {
     }
 
     // 2. Regression β + SE (+ optional CI / p)
-    regressionBetaSeRegex.findAll(clean).take(25).forEach { m ->
+    regressionBetaSeRegex.findAll(clean).take(MAX_PER_FAMILY_DISCOVERY).forEach { m ->
       val beta = parseSignedDouble(m.groupValues[2])
       val se = parseSignedDouble(m.groupValues[3])
       val ctx = contextAt(m.range.first)
@@ -427,20 +446,22 @@ object StatisticalClaimParser {
       val label = m.groupValues[1].trim()
       val point = parseSignedDouble(m.groupValues[2])
       val levelPct = m.groupValues[3].toDoubleOrNull()
-      val lowerBound = parseSignedDouble(m.groupValues[4])
-      val upperBound = parseSignedDouble(m.groupValues[5])
+      val intervalToken = m.groupValues[4]
+      val lowerBound = parseSignedDouble(m.groupValues[5])
+      val upperBound = parseSignedDouble(m.groupValues[6])
+      val intervalType = parseIntervalType(intervalToken, m.value)
       val ctx = contextAt(m.range.first)
       val afterStart = m.range.last + 1
       val afterEnd = (afterStart + 45).coerceAtMost(clean.length)
       val afterText = clean.substring(afterStart, afterEnd)
       val pMatch = standalonePRegex.find(afterText)
-      val isAmbiguousInterval = !requireExplicitCiLabel && levelPct == null && !m.value.contains("CI", ignoreCase = true) &&
-        !m.value.contains("CrI", ignoreCase = true) && !m.value.contains("UI", ignoreCase = true) &&
+      val hasExplicitIntervalLabel = intervalType != IntervalType.UNSPECIFIED
+      val isAmbiguousInterval = !requireExplicitCiLabel && levelPct == null && !hasExplicitIntervalLabel &&
         (label.equals("mean", ignoreCase = true) || label.equals("median", ignoreCase = true))
       val parseStatus = when {
         point == null || lowerBound == null || upperBound == null -> ClaimParseStatus.UNSUPPORTED
         isAmbiguousInterval -> ClaimParseStatus.AMBIGUOUS
-        !requireExplicitCiLabel && levelPct == null && !m.value.contains("CI", ignoreCase = true) -> ClaimParseStatus.PARTIAL
+        !requireExplicitCiLabel && levelPct == null && !hasExplicitIntervalLabel -> ClaimParseStatus.PARTIAL
         else -> ClaimParseStatus.EXACT
       }
       val adj = when {
@@ -464,6 +485,7 @@ object StatisticalClaimParser {
           ciLower = lowerBound,
           ciUpper = upperBound,
           ciLevel = (levelPct ?: 95.0) / 100.0,
+          intervalType = intervalType,
           pValueOperator = pMatch?.groupValues?.getOrNull(1).orEmpty(),
           pValue = pMatch?.groupValues?.getOrNull(2)?.let { parseScientificDouble(it) },
           tailSpec = ctx.tail,
@@ -483,11 +505,11 @@ object StatisticalClaimParser {
       )
     }
 
-    effectCiFlexibleRegex.findAll(clean).take(40).forEach { recordEffectCiMatch(it, requireExplicitCiLabel = false) }
-    effectCiNarrativeRegex.findAll(clean).take(30).forEach { recordEffectCiMatch(it, requireExplicitCiLabel = true) }
+    effectCiFlexibleRegex.findAll(clean).take(MAX_PER_FAMILY_DISCOVERY).forEach { recordEffectCiMatch(it, requireExplicitCiLabel = false) }
+    effectCiNarrativeRegex.findAll(clean).take(MAX_PER_FAMILY_DISCOVERY).forEach { recordEffectCiMatch(it, requireExplicitCiLabel = true) }
 
     // 4. Proportions (x / n (pct%))
-    proportionRegex.findAll(clean).take(30).forEach { m ->
+    proportionRegex.findAll(clean).take(MAX_PER_FAMILY_DISCOVERY).forEach { m ->
       val num = m.groupValues[1].toDoubleOrNull()
       val den = m.groupValues[2].toDoubleOrNull()
       val pct = m.groupValues[3].toDoubleOrNull()
@@ -519,7 +541,7 @@ object StatisticalClaimParser {
     }
 
     // 5. Mean ± SD claims
-    meanSdRegex.findAll(clean).take(20).forEach { m ->
+    meanSdRegex.findAll(clean).take(MAX_PER_FAMILY_DISCOVERY).forEach { m ->
       val mean = parseSignedDouble(m.groupValues[1])
       val sd = parseSignedDouble(m.groupValues[2])
       val ctx = contextAt(m.range.first)
@@ -550,7 +572,7 @@ object StatisticalClaimParser {
 
     // 7. Narrative 2x2 contingency pairs & explicit a,b,c,d cells
     var tblIdx = twoByTwoTables.size + 1
-    twoByTwoPairRegex.findAll(clean).take(12).forEach { m ->
+    twoByTwoPairRegex.findAll(clean).take(120).forEach { m ->
       val e1 = m.groupValues[1].toIntOrNull() ?: return@forEach
       val n1 = m.groupValues[2].toIntOrNull() ?: return@forEach
       val e2 = m.groupValues[3].toIntOrNull() ?: return@forEach
@@ -569,7 +591,7 @@ object StatisticalClaimParser {
         }
       }
     }
-    explicit2x2CellsRegex.findAll(clean).take(8).forEach { m ->
+    explicit2x2CellsRegex.findAll(clean).take(60).forEach { m ->
       val a = m.groupValues[1].toIntOrNull() ?: return@forEach
       val b = m.groupValues[2].toIntOrNull() ?: return@forEach
       val c = m.groupValues[3].toIntOrNull() ?: return@forEach
@@ -582,7 +604,7 @@ object StatisticalClaimParser {
     }
 
     // 8. Individual study effects for Meta-Analysis pooling & LOO diagnostics
-    metaStudyCiRegex.findAll(clean).take(40).forEach { m ->
+    metaStudyCiRegex.findAll(clean).take(250).forEach { m ->
       val studyLabel = m.groupValues[1].trim()
       val measure = m.groupValues[2].trim().uppercase(Locale.US)
       val est = parseSignedDouble(m.groupValues[3]) ?: return@forEach
@@ -620,7 +642,7 @@ object StatisticalClaimParser {
 
     // 9. Standalone p-values not already captured by test-statistic claims (for family-scoped FDR/FWER)
     val capturedOffsets = claims.map { it.startOffset..it.endOffset }
-    standalonePRegex.findAll(clean).take(60).forEach { m ->
+    standalonePRegex.findAll(clean).take(MAX_PER_FAMILY_DISCOVERY).forEach { m ->
       if (capturedOffsets.any { m.range.first in it }) return@forEach
       val op = m.groupValues[1]
       val pVal = parseScientificDouble(m.groupValues[2]) ?: return@forEach

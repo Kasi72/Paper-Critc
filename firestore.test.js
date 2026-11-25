@@ -344,3 +344,65 @@ test("Strict schema integrity: rejects zero rubric scores, cross-mode verdicts, 
     })
   );
 });
+
+test("v5 lossless chunked findings, unverified empty publicationYear, and concurrent field-level bookmark/notes updates", async () => {
+  const aliceDb = testEnv.authenticatedContext(ALICE_UID).firestore();
+  const bobDb = testEnv.authenticatedContext(BOB_UID).firestore();
+  const created = new Date(Date.now() - 3000);
+  const reviewRef = aliceDb.collection("users").doc(ALICE_UID).collection("reviews").doc("review_chunked_01");
+
+  await assertSucceeds(
+    reviewRef.set(
+      buildFullV4ReviewPayload(ALICE_UID, created, {
+        publicationYear: "",
+        structuredFindingsJson: "",
+        schemaVersion: 5,
+        findingsChunkCount: 2,
+        findingsChecksum: "abc123def456",
+      })
+    )
+  );
+
+  const chunk0Ref = reviewRef.collection("findings_chunks").doc("chunk_0");
+  await assertSucceeds(
+    chunk0Ref.set({
+      userId: ALICE_UID,
+      chunkIndex: 0,
+      totalChunks: 2,
+      payload: "[{\"id\":\"F-01\"}]",
+      checksum: "deadbeef",
+    })
+  );
+
+  // Cross-user access to findings_chunks MUST fail
+  await assertFails(
+    bobDb
+      .collection("users")
+      .doc(ALICE_UID)
+      .collection("reviews")
+      .doc("review_chunked_01")
+      .collection("findings_chunks")
+      .doc("chunk_0")
+      .get()
+  );
+
+  // Field-level partial updates for bookmark and personalNotes succeed independently
+  await assertSucceeds(
+    reviewRef.update({
+      bookmarked: true,
+      updatedAt: new Date(Date.now() - 200),
+    })
+  );
+  await assertSucceeds(
+    reviewRef.update({
+      personalNotes: "Verified independently without clobbering bookmark.",
+      updatedAt: new Date(Date.now() - 100),
+    })
+  );
+
+  const updatedSnap = await assertSucceeds(reviewRef.get());
+  assert.equal(updatedSnap.data().bookmarked, true);
+  assert.equal(updatedSnap.data().personalNotes, "Verified independently without clobbering bookmark.");
+  assert.equal(updatedSnap.data().publicationYear, "");
+});
+

@@ -1,6 +1,7 @@
 package com.example.data.ai.stats
 
 import com.example.data.ai.QuantFindingStatus
+import com.example.data.ai.QuantitativeForensicAnalyzer
 import com.example.data.ai.StudyDesignArchetype
 import com.example.data.ai.semantic.SemanticValidityEngine
 import com.example.util.DocumentCoverageReport
@@ -717,11 +718,14 @@ object DomainStatisticalAuditModules {
     fun id() = "ML-%02d".format(Locale.US, idx++)
 
     // 1. Preprocessing / SMOTE / Normalization / Imputation leakage BEFORE train-test split
-    val preprocessingBeforeSplit = Regex(
+    val preprocessingMatch = Regex(
       """(?:normaliz\w+|standardiz\w+|z-?scor\w+|imput\w+|smote|oversampl\w+|feature\s+selection|pca)\s+(?:(?:was|were)\s+)?(?:(?:performed|applied|fitted|computed|conducted|done)\s+)?(?:on\s+the\s+(?:entire|full|whole|complete)\s+dataset|before\s+(?:the\s+)?(?:train|split|cross-?validation)|prior\s+to\s+splitting)""",
       RegexOption.IGNORE_CASE
-    ).containsMatchIn(text)
-    if (preprocessingBeforeSplit) {
+    ).find(text)
+    if (preprocessingMatch != null) {
+      val sStart = text.lastIndexOfAny(charArrayOf('.', '\n'), preprocessingMatch.range.first).let { if (it < 0) 0 else it + 1 }
+      val sEnd = text.indexOfAny(charArrayOf('.', '\n'), preprocessingMatch.range.last).let { if (it < 0) text.length else it + 1 }
+      val quote = text.substring(sStart, sEnd).trim().ifBlank { preprocessingMatch.value }
       out.add(
         DomainAuditFinding(
           findingId = id(),
@@ -731,18 +735,30 @@ object DomainStatisticalAuditModules {
           status = QuantFindingStatus.FAIL,
           detail = "Preprocessing, imputation, feature selection, or SMOTE resampling was executed on the full dataset BEFORE train/test splitting.",
           consequence = "Test-set distributional information leaks into training, inflating reported AUROC/accuracy/F1.",
-          recommendedAction = "Fit all scalers, imputers, SMOTE, and feature selectors strictly inside each training fold (e.g., sklearn Pipeline + nested CV)."
+          recommendedAction = "Fit all scalers, imputers, SMOTE, and feature selectors strictly inside each training fold (e.g., sklearn Pipeline + nested CV).",
+          evidenceQuote = quote,
+          pageNumber = QuantitativeForensicAnalyzer.resolvePageNumberAtOffset(text, preprocessingMatch.range.first)
         )
       )
     }
 
     // 2. Subject-level / repeated-patient / temporal leakage
-    val repeatedPatientRandomSplit = (l.contains("multiple images per patient") || l.contains("multiple visits per patient") ||
-      l.contains("repeated measurements") || l.contains("slices per patient") || l.contains("records per subject") || l.contains("multiple scans per patient")) &&
-      (l.contains("randomly split") || l.contains("random split") || l.contains("random 80/20") || l.contains("image-level split") || l.contains("slice-level")) &&
+    val repeatedPatientCue = listOf(
+      "multiple images per patient", "multiple visits per patient", "repeated measurements",
+      "slices per patient", "records per subject", "multiple scans per patient"
+    ).firstOrNull { l.contains(it) }
+    val randomSplitCue = listOf(
+      "randomly split", "random split", "random 80/20", "image-level split", "slice-level"
+    ).firstOrNull { l.contains(it) }
+    val repeatedPatientRandomSplit = repeatedPatientCue != null && randomSplitCue != null &&
       !l.contains("patient-level split") && !l.contains("subject-level split") && !l.contains("grouped") && !l.contains("groupkfold") &&
       !l.contains("split subjects") && !l.contains("split patients") && !l.contains("patient-disjoint") && !l.contains("subject-disjoint")
     if (repeatedPatientRandomSplit) {
+      val cueOffset = text.indexOf(randomSplitCue!!, ignoreCase = true).takeIf { it >= 0 }
+        ?: text.indexOf(repeatedPatientCue!!, ignoreCase = true).coerceAtLeast(0)
+      val sStart = text.lastIndexOfAny(charArrayOf('.', '\n'), cueOffset).let { if (it < 0) 0 else it + 1 }
+      val sEnd = text.indexOfAny(charArrayOf('.', '\n'), cueOffset).let { if (it < 0) text.length else it + 1 }
+      val quote = text.substring(sStart, sEnd).trim().ifBlank { randomSplitCue }
       out.add(
         DomainAuditFinding(
           findingId = id(),
@@ -752,16 +768,21 @@ object DomainStatisticalAuditModules {
           status = QuantFindingStatus.FAIL,
           detail = "Dataset contains multiple records/scans per patient, yet train/test partitioning was performed randomly at the record/image level instead of patient/subject level.",
           consequence = "Models memorize patient identity rather than disease signal, invalidating generalization metrics.",
-          recommendedAction = "Enforce strict patient-grouped splits (GroupKFold / site-level holdout) and re-evaluate."
+          recommendedAction = "Enforce strict patient-grouped splits (GroupKFold / site-level holdout) and re-evaluate.",
+          evidenceQuote = quote,
+          pageNumber = QuantitativeForensicAnalyzer.resolvePageNumberAtOffset(text, cueOffset)
         )
       )
     }
 
-    val testSetTuningLeakage = Regex(
+    val testSetTuningMatch = Regex(
       """(?:hyperparameter|threshold|cutoff|early\s+stopping|model\s+selection)[^.\n]{0,60}(?:tuned|selected|optimized|chosen)\s+on\s+the\s+test\s+set""",
       RegexOption.IGNORE_CASE
-    ).containsMatchIn(text)
-    if (testSetTuningLeakage) {
+    ).find(text)
+    if (testSetTuningMatch != null) {
+      val sStart = text.lastIndexOfAny(charArrayOf('.', '\n'), testSetTuningMatch.range.first).let { if (it < 0) 0 else it + 1 }
+      val sEnd = text.indexOfAny(charArrayOf('.', '\n'), testSetTuningMatch.range.last).let { if (it < 0) text.length else it + 1 }
+      val quote = text.substring(sStart, sEnd).trim().ifBlank { testSetTuningMatch.value }
       out.add(
         DomainAuditFinding(
           findingId = id(),
@@ -771,7 +792,9 @@ object DomainStatisticalAuditModules {
           status = QuantFindingStatus.FAIL,
           detail = "Hyperparameters or decision thresholds were tuned directly on the held-out test set.",
           consequence = "Test metrics reflect optimistic selection bias rather than out-of-sample performance.",
-          recommendedAction = "Use nested cross-validation or a locked validation split strictly separated from the final test set."
+          recommendedAction = "Use nested cross-validation or a locked validation split strictly separated from the final test set.",
+          evidenceQuote = quote,
+          pageNumber = QuantitativeForensicAnalyzer.resolvePageNumberAtOffset(text, testSetTuningMatch.range.first)
         )
       )
     }
@@ -1086,19 +1109,25 @@ object EvidenceDerivedScoreGate {
     report: StatisticalAuditReport,
     baseMathScore: Int,
     baseMethodologyScore: Int,
-    manuscriptText: String = ""
+    manuscriptText: String = "",
+    verifiedDetectorIds: Set<String>? = null
   ): ScoreCalculationBreakdown {
     val safeBaseMath = baseMathScore.coerceIn(1, 10)
     val safeBaseMethod = baseMethodologyScore.coerceIn(1, 10)
+    fun isAdjudicatedVerified(id: String): Boolean =
+      verifiedDetectorIds == null || id in verifiedDetectorIds
 
     val verifiedCriticalPenalties = mutableListOf<ScorePenaltyItem>()
     val designSpecificPenalties = mutableListOf<ScorePenaltyItem>()
     val unsupportedEvidencePenalties = mutableListOf<ScorePenaltyItem>()
     val robustnessCredits = mutableListOf<ScorePenaltyItem>()
 
-    // 1. Verified Arithmetic Errors (only non-screening confirmed FAILs)
+    // 1. Verified Arithmetic Errors (only non-screening confirmed FAILs that survived adjudication)
     val arithFails = report.reconstructions.filter {
-      it.status == QuantFindingStatus.FAIL && it.findingType == StatisticalFindingType.ARITHMETIC_ERROR && !it.isScreeningSignal
+      it.status == QuantFindingStatus.FAIL &&
+        it.findingType == StatisticalFindingType.ARITHMETIC_ERROR &&
+        !it.isScreeningSignal &&
+        isAdjudicatedVerified(it.checkId)
     }
     if (arithFails.isNotEmpty()) {
       val pen = min(4, arithFails.size * 2)
@@ -1112,12 +1141,18 @@ object EvidenceDerivedScoreGate {
       )
     }
 
-    // 2. Verified Internal Contradictions (denominator drift, subgroup > total N, CI vs p conflict, Abstract vs Results conflict)
+    // 2. Verified Internal Contradictions (only adjudicated VERIFIED contradictions)
     val contraCross = report.crossLinks.filter {
-      it.status == QuantFindingStatus.FAIL && it.findingType == StatisticalFindingType.INTERNAL_CONTRADICTION && !it.isScreeningSignal
+      it.status == QuantFindingStatus.FAIL &&
+        it.findingType == StatisticalFindingType.INTERNAL_CONTRADICTION &&
+        !it.isScreeningSignal &&
+        isAdjudicatedVerified(it.linkId)
     }
     val contraRecon = report.reconstructions.filter {
-      it.status == QuantFindingStatus.FAIL && it.findingType == StatisticalFindingType.INTERNAL_CONTRADICTION && !it.isScreeningSignal
+      it.status == QuantFindingStatus.FAIL &&
+        it.findingType == StatisticalFindingType.INTERNAL_CONTRADICTION &&
+        !it.isScreeningSignal &&
+        isAdjudicatedVerified(it.checkId)
     }
     val totalContra = contraCross.size + contraRecon.size
     if (totalContra > 0) {
@@ -1132,12 +1167,18 @@ object EvidenceDerivedScoreGate {
       )
     }
 
-    // 3. Verified Design-Specific Model Mismatches (ML leakage, TWFE staggered bias, Fixed-Effect under high I², Competing-risk censoring, Weak IV, Immortal-time bias, Subgroup fallacy)
+    // 3. Verified Design-Specific Model Mismatches (only adjudicated VERIFIED mismatches)
     val modelMismatches = report.domainFindings.filter {
-      it.status == QuantFindingStatus.FAIL && (it.findingType == StatisticalFindingType.MODEL_MISMATCH || it.findingType == StatisticalFindingType.ASSUMPTION_UNCHECKED)
+      it.status == QuantFindingStatus.FAIL &&
+        (it.findingType == StatisticalFindingType.MODEL_MISMATCH || it.findingType == StatisticalFindingType.ASSUMPTION_UNCHECKED) &&
+        !it.isScreeningSignal &&
+        isAdjudicatedVerified(it.findingId)
     }
     val reconMismatches = report.reconstructions.filter {
-      it.status == QuantFindingStatus.FAIL && it.findingType == StatisticalFindingType.MODEL_MISMATCH
+      it.status == QuantFindingStatus.FAIL &&
+        it.findingType == StatisticalFindingType.MODEL_MISMATCH &&
+        !it.isScreeningSignal &&
+        isAdjudicatedVerified(it.checkId)
     }
     val mismatchCount = modelMismatches.size + reconMismatches.size
     if (mismatchCount > 0) {

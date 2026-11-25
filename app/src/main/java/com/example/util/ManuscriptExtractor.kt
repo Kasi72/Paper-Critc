@@ -51,6 +51,10 @@ enum class CoverageLevel(val label: String) {
   PARTIAL("Partial"),
   LIMITED("Limited"),
   NOT_SUPPLIED("Not supplied"),
+  REFERENCED_NOT_SUPPLIED("Referenced, not supplied"),
+  NOT_APPLICABLE("Not applicable"),
+  SUPPLIED_UNREADABLE("Supplied (unreadable)"),
+  SUPPLIED_READABLE("Supplied & readable"),
   UNKNOWN("Unknown")
 }
 
@@ -118,7 +122,9 @@ data class DocumentCoverageReport(
   fun toCoverageSummary(
     unsupportedInputCount: Int = 0,
     reconstructedClaimCount: Int = 0,
-    hasSupplementReference: Boolean = false
+    hasSupplementReference: Boolean = false,
+    supplementSupplied: Boolean = false,
+    supplementReadable: Boolean = false
   ): CoverageSummary {
     if (isCoverageUnknown) {
       return CoverageSummary(
@@ -132,11 +138,12 @@ data class DocumentCoverageReport(
       )
     }
     val textCov = when {
-      omittedPages.isEmpty() && extractionConfidence >= 4 -> CoverageLevel.COMPLETE
+      coverageStatus == CoverageStatus.COMPLETE && omittedPages.isEmpty() && extractionConfidence >= 4 -> CoverageLevel.COMPLETE
       extractedPages > 0 -> CoverageLevel.PARTIAL
       else -> CoverageLevel.LIMITED
     }
     val tableFigCov = when {
+      coverageStatus != CoverageStatus.COMPLETE -> CoverageLevel.PARTIAL
       lowTextPages.isNotEmpty() || warnings.any {
         it.contains("scanned", true) || it.contains("image", true) || it.contains("table", true) || it.contains("figure", true)
       } -> CoverageLevel.PARTIAL
@@ -146,10 +153,15 @@ data class DocumentCoverageReport(
     val quantCov = when {
       unsupportedInputCount > 0 && reconstructedClaimCount == 0 -> CoverageLevel.LIMITED
       unsupportedInputCount > 0 -> CoverageLevel.PARTIAL
-      omittedPages.isNotEmpty() || lowTextPages.isNotEmpty() -> CoverageLevel.PARTIAL
+      omittedPages.isNotEmpty() || lowTextPages.isNotEmpty() || coverageStatus != CoverageStatus.COMPLETE -> CoverageLevel.PARTIAL
       else -> CoverageLevel.COMPLETE
     }
-    val suppCov = if (hasSupplementReference) CoverageLevel.NOT_SUPPLIED else CoverageLevel.NOT_SUPPLIED
+    val suppCov = when {
+      supplementSupplied && supplementReadable -> CoverageLevel.SUPPLIED_READABLE
+      supplementSupplied && !supplementReadable -> CoverageLevel.SUPPLIED_UNREADABLE
+      hasSupplementReference -> CoverageLevel.REFERENCED_NOT_SUPPLIED
+      else -> CoverageLevel.NOT_APPLICABLE
+    }
     return CoverageSummary(
       totalPages = totalPages,
       extractedPages = extractedPages,
@@ -213,6 +225,47 @@ data class DocumentCoverageReport(
         warnings = listOf(reason),
         coverageStatus = CoverageStatus.UNKNOWN
       )
+
+    /**
+     * Honest coverage model for arbitrary user-pasted or shared text:
+     * Character readability is high, but full-document completeness (Methods, tables, figures,
+     * appendices, supplements) cannot be verified from a raw text paste, so coverage MUST NOT
+     * default to COMPLETE / 5/5.
+     */
+    fun forDirectPastedText(
+      text: String,
+      engine: String = "Direct Text Editor"
+    ): DocumentCoverageReport {
+      val trimmed = text.trim()
+      if (trimmed.isEmpty()) {
+        return unknown("Pasted manuscript text is empty.")
+      }
+      val pageMarkers = Regex("""\[PAGE\s+(\d+)\]""", RegexOption.IGNORE_CASE).findAll(trimmed).mapNotNull {
+        it.groupValues[1].toIntOrNull()
+      }.toList()
+      val pages = (pageMarkers.maxOrNull() ?: ((trimmed.length / 2200) + 1)).coerceAtLeast(1)
+      val words = trimmed.split(Regex("""\s+""")).size
+      val hasMethodsHeading = Regex("""(?im)^\s*(methods|methodology|materials\s+and\s+methods|study\s+design|identification)\b""").containsMatchIn(trimmed)
+      val hasResultsHeading = Regex("""(?im)^\s*(results|empirical\s+results|findings)\b""").containsMatchIn(trimmed)
+      val isShortExcerpt = words < 400 || (!hasMethodsHeading && !hasResultsHeading)
+      val confidence = if (isShortExcerpt) 2 else 3
+      val status = if (words < 150) CoverageStatus.UNKNOWN else CoverageStatus.PARTIAL
+      val warning = if (isShortExcerpt) {
+        "Direct pasted text ($words words): character readability is high, but document completeness (Methods, Results, tables, figures, supplements) is unverified; absence criticisms restricted."
+      } else {
+        "Direct pasted text ($words words): full-document completeness (tables, figures, appendices, supplements) is unverified; absence criticisms restricted."
+      }
+      return DocumentCoverageReport(
+        totalPages = pages,
+        extractedPages = pages,
+        totalChars = trimmed.length,
+        totalWords = words,
+        extractionEngine = engine,
+        extractionConfidence = confidence,
+        warnings = listOf(warning),
+        coverageStatus = status
+      )
+    }
 
     fun forCompleteText(
       text: String,

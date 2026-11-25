@@ -1,18 +1,22 @@
 package com.example.data.repository
 
 import android.content.Context
+import android.util.Log
 import com.example.R
 import com.example.data.model.PaperReview
+import com.example.data.model.ReviewFindingCodec
 import com.example.data.model.ReviewMode
 import com.example.util.OperationType
 import com.example.util.handleFirestoreError
 import com.google.firebase.Firebase
 import com.google.firebase.Timestamp
 import com.google.firebase.auth.auth
+import com.google.firebase.firestore.DocumentReference
 import com.google.firebase.firestore.DocumentSnapshot
 import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.FirebaseFirestoreException
+import com.google.firebase.firestore.Query
 import com.google.firebase.firestore.snapshots
 import java.util.Locale
 import kotlinx.coroutines.CancellationException
@@ -22,6 +26,9 @@ import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.tasks.await
+
+private const val REPO_TAG = "ReviewRepository"
+private const val FINDINGS_CHUNKS_COLLECTION = "findings_chunks"
 
 class ReviewRepository(private val db: FirebaseFirestore) {
 
@@ -38,6 +45,87 @@ class ReviewRepository(private val db: FirebaseFirestore) {
       ?: throw IllegalStateException("User must be signed in with Google before accessing Firestore.")
   }
 
+  private suspend fun hydrateChunkedFindings(review: PaperReview, ownerUid: String): PaperReview {
+    if (review.findingsChunkCount <= 0 || review.id.isBlank()) {
+      return review
+    }
+    val chunksSnap = db.collection("users")
+      .document(ownerUid)
+      .collection("reviews")
+      .document(review.id)
+      .collection(FINDINGS_CHUNKS_COLLECTION)
+      .orderBy("chunkIndex", Query.Direction.ASCENDING)
+      .get()
+      .await()
+
+    val orderedPayloads = chunksSnap.documents.mapNotNull { doc ->
+      doc.getString("payload")
+    }
+    if (orderedPayloads.size < review.findingsChunkCount) {
+      throw IllegalStateException(
+        "Incomplete findings ledger chunks for ${review.id}: found ${orderedPayloads.size}/${review.findingsChunkCount}."
+      )
+    }
+    val reassembled = ReviewFindingCodec.reassembleAndVerify(
+      chunks = orderedPayloads,
+      expectedChecksumSha256 = review.findingsChecksum
+    ).getOrThrow()
+    return review.copy(structuredFindingsJson = reassembled)
+  }
+
+  private suspend fun writeDocumentWithLosslessChunks(
+    docRef: DocumentReference,
+    review: PaperReview,
+    uid: String,
+    createdAtValue: Any,
+    updatedAtValue: Any,
+    cleanupPreviousChunks: Boolean
+  ) {
+    val packaged = ReviewFindingCodec.packageForCloud(review.structuredFindingsJson)
+    val payload = buildFirestorePayload(
+      review = review,
+      uid = uid,
+      createdAtValue = createdAtValue,
+      updatedAtValue = updatedAtValue,
+      packagedLedger = packaged
+    )
+
+    val existingChunkRefs = if (cleanupPreviousChunks) {
+      runCatching {
+        docRef.collection(FINDINGS_CHUNKS_COLLECTION).get().await().documents.map { it.reference }
+      }.getOrDefault(emptyList())
+    } else {
+      emptyList()
+    }
+
+    val batch = db.batch()
+    batch.set(docRef, payload)
+
+    // Remove stale excess chunks if new chunk count is smaller
+    existingChunkRefs.forEach { oldRef ->
+      val idx = oldRef.id.removePrefix("chunk_").toIntOrNull()
+      if (idx == null || idx >= packaged.chunks.size) {
+        batch.delete(oldRef)
+      }
+    }
+
+    packaged.chunks.forEachIndexed { index, chunkPayload ->
+      val chunkRef = docRef.collection(FINDINGS_CHUNKS_COLLECTION).document("chunk_$index")
+      batch.set(
+        chunkRef,
+        mapOf(
+          "userId" to uid,
+          "chunkIndex" to index,
+          "totalChunks" to packaged.chunks.size,
+          "payload" to chunkPayload,
+          "checksum" to ReviewFindingCodec.sha256Hex(chunkPayload)
+        )
+      )
+    }
+
+    batch.commit().await()
+  }
+
   fun observeReviews(userId: String = requireUserId()): Flow<List<PaperReview>> = flow {
     val path = "users/$userId/reviews"
     emitAll(
@@ -47,10 +135,24 @@ class ReviewRepository(private val db: FirebaseFirestore) {
         .whereEqualTo("userId", userId)
         .snapshots()
         .map { snapshot ->
-          snapshot.toObjects(
+          val rawReviews = snapshot.toObjects(
             PaperReview::class.java,
             DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
           ).sortedByDescending { it.createdAt ?: Timestamp(0, 0) }
+          rawReviews.map { review ->
+            if (review.findingsChunkCount > 0) {
+              try {
+                hydrateChunkedFindings(review, userId)
+              } catch (e: CancellationException) {
+                throw e
+              } catch (e: Exception) {
+                Log.w(REPO_TAG, "Failed to hydrate chunked findings for ${review.id}", e)
+                review
+              }
+            } else {
+              review
+            }
+          }
         }
         .catch { error ->
           val firestoreError = generateSequence(error) { it.cause }
@@ -80,12 +182,14 @@ class ReviewRepository(private val db: FirebaseFirestore) {
         .whereEqualTo("userId", uid)
         .get()
         .await()
-      Result.success(
-        snapshot.toObjects(
-          PaperReview::class.java,
-          DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
-        ).sortedByDescending { it.createdAt ?: Timestamp(0, 0) }
-      )
+      val reviews = snapshot.toObjects(
+        PaperReview::class.java,
+        DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
+      ).sortedByDescending { it.createdAt ?: Timestamp(0, 0) }
+        .map { review ->
+          if (review.findingsChunkCount > 0) hydrateChunkedFindings(review, uid) else review
+        }
+      Result.success(reviews)
     } catch (e: CancellationException) {
       throw e
     } catch (e: Exception) {
@@ -107,7 +211,12 @@ class ReviewRepository(private val db: FirebaseFirestore) {
         PaperReview::class.java,
         DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
       ) ?: throw IllegalStateException("Review document $reviewId not found")
-      Result.success(review)
+      val hydrated = if (review.findingsChunkCount > 0) {
+        hydrateChunkedFindings(review, resolvedOwner)
+      } else {
+        review
+      }
+      Result.success(hydrated)
     } catch (e: CancellationException) {
       throw e
     } catch (e: Exception) {
@@ -123,15 +232,15 @@ class ReviewRepository(private val db: FirebaseFirestore) {
       return Result.failure(e)
     }
     val docRef = db.collection("users").document(uid).collection("reviews").document()
-    // Never include "id" in raw Map payload when @DocumentId is on PaperReview
-    val payload = buildFirestorePayload(
-      review = review,
-      uid = uid,
-      createdAtValue = FieldValue.serverTimestamp(),
-      updatedAtValue = FieldValue.serverTimestamp()
-    )
     return try {
-      docRef.set(payload).await()
+      writeDocumentWithLosslessChunks(
+        docRef = docRef,
+        review = review,
+        uid = uid,
+        createdAtValue = FieldValue.serverTimestamp(),
+        updatedAtValue = FieldValue.serverTimestamp(),
+        cleanupPreviousChunks = false
+      )
       Result.success(docRef.id)
     } catch (e: CancellationException) {
       throw e
@@ -153,14 +262,65 @@ class ReviewRepository(private val db: FirebaseFirestore) {
     val existingCreatedAt = review.createdAt
       ?: return Result.failure(IllegalArgumentException("Review createdAt must not be null for update"))
     val docRef = db.collection("users").document(uid).collection("reviews").document(review.id)
-    val payload = buildFirestorePayload(
-      review = review,
-      uid = uid,
-      createdAtValue = existingCreatedAt,
-      updatedAtValue = FieldValue.serverTimestamp()
-    )
     return try {
-      docRef.set(payload).await()
+      writeDocumentWithLosslessChunks(
+        docRef = docRef,
+        review = review,
+        uid = uid,
+        createdAtValue = existingCreatedAt,
+        updatedAtValue = FieldValue.serverTimestamp(),
+        cleanupPreviousChunks = true
+      )
+      Result.success(Unit)
+    } catch (e: CancellationException) {
+      throw e
+    } catch (e: Exception) {
+      handleFirestoreError(e, OperationType.UPDATE, docRef.path)
+      Result.failure(e)
+    }
+  }
+
+  /**
+   * Field-level partial update for bookmark state so concurrent edits to personalNotes or
+   * other fields never clobber one another.
+   */
+  suspend fun updateBookmark(reviewId: String, bookmarked: Boolean): Result<Unit> {
+    val uid = try {
+      requireUserId()
+    } catch (e: Exception) {
+      return Result.failure(e)
+    }
+    if (reviewId.isBlank()) {
+      return Result.failure(IllegalArgumentException("Review ID must not be blank for bookmark update"))
+    }
+    val docRef = db.collection("users").document(uid).collection("reviews").document(reviewId)
+    return try {
+      docRef.update(buildBookmarkPatchPayload(bookmarked)).await()
+      Result.success(Unit)
+    } catch (e: CancellationException) {
+      throw e
+    } catch (e: Exception) {
+      handleFirestoreError(e, OperationType.UPDATE, docRef.path)
+      Result.failure(e)
+    }
+  }
+
+  /**
+   * Field-level partial update for personalNotes so concurrent edits to bookmark or other fields
+   * never overwrite each other.
+   */
+  suspend fun updatePersonalNotes(reviewId: String, notes: String): Result<Unit> {
+    val uid = try {
+      requireUserId()
+    } catch (e: Exception) {
+      return Result.failure(e)
+    }
+    if (reviewId.isBlank()) {
+      return Result.failure(IllegalArgumentException("Review ID must not be blank for notes update"))
+    }
+    val docRef = db.collection("users").document(uid).collection("reviews").document(reviewId)
+    return try {
+      docRef.update(buildPersonalNotesPatchPayload(notes)).await()
       Result.success(Unit)
     } catch (e: CancellationException) {
       throw e
@@ -181,7 +341,13 @@ class ReviewRepository(private val db: FirebaseFirestore) {
     }
     val docRef = db.collection("users").document(uid).collection("reviews").document(reviewId)
     return try {
-      docRef.delete().await()
+      val chunkDocs = runCatching {
+        docRef.collection(FINDINGS_CHUNKS_COLLECTION).get().await().documents
+      }.getOrDefault(emptyList())
+      val batch = db.batch()
+      chunkDocs.forEach { batch.delete(it.reference) }
+      batch.delete(docRef)
+      batch.commit().await()
       Result.success(Unit)
     } catch (e: CancellationException) {
       throw e
@@ -210,17 +376,28 @@ class ReviewRepository(private val db: FirebaseFirestore) {
       "UNVERIFIED", "LEGACY_UNVALIDATED", "REQUIRES_REANALYSIS"
     )
 
+    internal fun buildBookmarkPatchPayload(
+      bookmarked: Boolean,
+      updatedAtValue: Any = FieldValue.serverTimestamp()
+    ): Map<String, Any> = mapOf(
+      "bookmarked" to bookmarked,
+      "updatedAt" to updatedAtValue
+    )
+
+    internal fun buildPersonalNotesPatchPayload(
+      notes: String,
+      updatedAtValue: Any = FieldValue.serverTimestamp()
+    ): Map<String, Any> = mapOf(
+      "personalNotes" to notes.trim().take(5000),
+      "updatedAt" to updatedAtValue
+    )
+
     internal fun allowedVerdictsForMode(mode: ReviewMode): Set<String> = when (mode) {
       ReviewMode.POST_PUBLICATION_APPRAISAL -> POST_PUB_VERDICTS
       ReviewMode.JOURNAL_REFEREE -> JOURNAL_VERDICTS
       ReviewMode.CLINICAL_EVIDENCE_APPRAISAL -> CLINICAL_VERDICTS
     }
 
-    /**
-     * Strictly guarantees the returned verdict belongs to [mode]'s allowed enum.
-     * Cross-mode verdicts (e.g., ACCEPT passed under CLINICAL_EVIDENCE_APPRAISAL) are mapped to
-     * the corresponding tier in [mode] so Firestore and local storage never hold cross-mode records.
-     */
     internal fun normalizeVerdict(raw: String, mode: ReviewMode = ReviewMode.POST_PUBLICATION_APPRAISAL): String {
       val upper = raw.trim().uppercase(Locale.US).replace(' ', '_').replace('-', '_')
       if (upper in allowedVerdictsForMode(mode)) return upper
@@ -257,21 +434,23 @@ class ReviewRepository(private val db: FirebaseFirestore) {
 
     internal fun normalizeValidationStatus(raw: String): String {
       val upper = raw.trim().uppercase(Locale.US).replace(' ', '_')
-      return if (upper in ALLOWED_VALIDATION_STATUSES) upper else "PARTIALLY_VALIDATED"
+      return if (upper in ALLOWED_VALIDATION_STATUSES) upper else "LEGACY_UNVALIDATED"
     }
 
     /**
      * Builds the complete, strictly self-consistent Firestore document payload:
      * - Derives all 6 rubric dimensions (`1..10`) AND `credibilityScore` from a single reconciled
      *   [PaperReviewRubric] instance so individual axes and the weighted composite can NEVER disagree.
-     * - Enforces mode-aligned verdict enums matching `firestore.rules`.
-     * - Preserves full justifications, separated confidence metrics, provenance, and evidence ledger JSON.
+     * - Never truncates `structuredFindingsJson`: oversized ledgers are chunked losslessly via
+     *   [ReviewFindingCodec.packageForCloud] and stored in `findings_chunks`.
+     * - Never fabricates a default publication year ("2026") when year is absent/unverified.
      */
     internal fun buildFirestorePayload(
       review: PaperReview,
       uid: String,
       createdAtValue: Any,
-      updatedAtValue: Any
+      updatedAtValue: Any,
+      packagedLedger: ReviewFindingCodec.LosslessLedgerPackage = ReviewFindingCodec.packageForCloud(review.structuredFindingsJson)
     ): Map<String, Any> {
       val resolvedMode = review.resolvedReviewMode()
       val rubric = review.toRubric()
@@ -279,8 +458,8 @@ class ReviewRepository(private val db: FirebaseFirestore) {
       return mapOf(
         "userId" to uid,
         "title" to review.title.trim().take(500).ifEmpty { "Untitled Manuscript" },
-        "authors" to review.authors.trim().take(500).ifEmpty { "Unknown Authors" },
-        "publicationYear" to review.publicationYear.trim().take(20).ifEmpty { "2026" },
+        "authors" to review.authors.trim().take(500).ifEmpty { "Authors not verified" },
+        "publicationYear" to review.publicationYear.trim().take(40),
         "venueOrCitation" to review.venueOrCitation.trim().take(500),
         "isEmpirical" to review.isEmpirical,
         "credibilityScore" to authoritativeComposite,
@@ -298,13 +477,16 @@ class ReviewRepository(private val db: FirebaseFirestore) {
         "originalityJustification" to review.originalityJustification.trim().take(4000),
         "mathRigorJustification" to review.mathRigorJustification.trim().take(4000),
         "reproducibilityJustification" to review.reproducibilityJustification.trim().take(4000),
-        // Separated confidence, mode, provenance & structured evidence ledger
+        // Separated confidence, mode, provenance & lossless chunked evidence ledger metadata
         "refereeConfidence" to review.refereeConfidence.coerceIn(1, 5),
         "extractionConfidence" to review.extractionConfidence.coerceIn(1, 5),
         "reviewMode" to resolvedMode.name,
         "coverageDisclosure" to review.coverageDisclosure.trim().take(2000),
         "validationStatus" to normalizeValidationStatus(review.validationStatus),
-        "structuredFindingsJson" to review.structuredFindingsJson.trim().take(60000),
+        "structuredFindingsJson" to packagedLedger.inlineJson,
+        "schemaVersion" to review.schemaVersion.coerceAtLeast(5),
+        "findingsChunkCount" to packagedLedger.chunks.size,
+        "findingsChecksum" to packagedLedger.checksumSha256,
         // Narrative dossier sections
         "abstractSummary" to review.abstractSummary.trim().take(5000).ifEmpty { "No abstract summary provided." },
         "researchQuestion" to review.researchQuestion.trim().take(3000).ifEmpty { "Not specified." },

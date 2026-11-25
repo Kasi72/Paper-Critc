@@ -744,8 +744,10 @@ fun IosSettingsScreen(
   userEmail: String,
   syncedReviewCount: Int = 0,
   unsyncedLocalCount: Int = 0,
+  adoptableAnonymousCount: Int = 0,
   isSyncingPortfolio: Boolean = false,
   onSyncPortfolioNow: () -> Unit = {},
+  onAdoptAnonymousReviews: () -> Unit = {},
   onUpdateSettings: ((AppSettingsState) -> AppSettingsState) -> Unit,
   onSelectActiveProvider: (String) -> Unit = {},
   onSaveProvider: (AiApiProviderEntry) -> Unit = {},
@@ -1255,6 +1257,19 @@ fun IosSettingsScreen(
                   .fillMaxWidth()
                   .testTag("settings_sync_portfolio_button")
               )
+              if (adoptableAnonymousCount > 0) {
+                Spacer(modifier = Modifier.height(8.dp))
+                IosSecondarySquircleButton(
+                  text = "Adopt $adoptableAnonymousCount Local Signed-Out Draft(s)",
+                  onClick = onAdoptAnonymousReviews,
+                  icon = Icons.Default.FolderOpen,
+                  tintColor = CupertinoBlue,
+                  cornerRadius = 9.dp,
+                  modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("settings_adopt_anonymous_button")
+                )
+              }
               Spacer(modifier = Modifier.height(8.dp))
               IosSecondarySquircleButton(
                 text = "Sign Out of Google Account",

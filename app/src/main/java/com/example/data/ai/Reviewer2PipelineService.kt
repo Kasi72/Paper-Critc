@@ -994,12 +994,12 @@ class Reviewer2PipelineService {
     val resolvedAuthors = when {
       authors.isNotBlank() -> authors.trim()
       extractedAuthors.isNotBlank() && !extractedAuthors.equals("unknown", ignoreCase = true) -> extractedAuthors
-      else -> "Authors Not Disclosed"
+      else -> "Authors Not Verified"
     }
     val resolvedYear = when {
       year.isNotBlank() -> year.trim()
       extractedYear.matches(Regex("""(19|20)\d{2}""")) -> extractedYear
-      else -> "2026"
+      else -> ""
     }
     val resolvedVenue = venueOrCitation.trim().ifBlank {
       "$extractedDesign • ${options.targetVenue}"
@@ -1250,26 +1250,11 @@ class Reviewer2PipelineService {
     )
 
     val credibilityScore = adjudicated.weightedCredibilityScore.toLong()
-    val clinicalGradeAssessment = if (options.reviewMode == ReviewMode.CLINICAL_EVIDENCE_APPRAISAL) {
-      evaluateClinicalGradeCertainty(
-        manuscriptText = manuscriptText,
-        forensicReport = forensicReport,
-        adjudicatedFindings = adjudicated.adjudicatedFindings,
-        extractionConfidence = preliminaryExtractionConfidence
-      )
-    } else null
-    val verdict = if (clinicalGradeAssessment != null &&
-      adjudicated.resolvedVerdict != "INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT" &&
-      adjudicated.resolvedVerdict != "PROVISIONAL_APPRAISAL_DESIGN_UNCERTAIN"
-    ) {
-      clinicalGradeAssessment.verdictEnum
-    } else {
-      adjudicated.resolvedVerdict
-    }
     val structuredFindingsJson = ReviewFindingCodec.encode(adjudicated.adjudicatedFindings)
 
-    // Single authoritative ConfidenceSummary + CoverageSummary propagated consistently across
-    // Page 1 banner, rubric metadata, coverage disclosure, uncertainty budget, and persisted PaperReview.
+    // Single authoritative ConfidenceSummary + CoverageSummary computed BEFORE finalizing GRADE
+    // certainty, final verdict, and validationStatus so Page 1 banner, rubric metadata, coverage
+    // disclosure, uncertainty budget, and persisted PaperReview can NEVER contradict each other (P1-13).
     val confidenceSummary = computeAuthoritativeConfidenceSummary(
       manuscriptText = manuscriptText,
       coverageReport = coverageReport,
@@ -1288,6 +1273,23 @@ class Reviewer2PipelineService {
         extractionConfidence = extractionConfidence
       )
     } ?: coverageAwareEpistemic
+
+    val clinicalGradeAssessment = if (options.reviewMode == ReviewMode.CLINICAL_EVIDENCE_APPRAISAL) {
+      evaluateClinicalGradeCertainty(
+        manuscriptText = manuscriptText,
+        forensicReport = forensicReport,
+        adjudicatedFindings = adjudicated.adjudicatedFindings,
+        extractionConfidence = extractionConfidence
+      )
+    } else null
+
+    val verdict = reconcileFinalVerdictWithEpistemicState(
+      adjudicatedVerdict = adjudicated.resolvedVerdict,
+      clinicalGradeAssessment = clinicalGradeAssessment,
+      finalEpistemic = finalEpistemic,
+      finalExtractionConfidence = extractionConfidence,
+      reviewMode = options.reviewMode
+    )
     val anyJsonRepaired = pass1Result.wasRepaired || pass2Result.wasRepaired || (quantResultOrNull?.wasRepaired == true)
     val validationStatus = computeValidationStatus(
       resolvedVerdict = verdict,
@@ -1359,14 +1361,18 @@ class Reviewer2PipelineService {
       com.example.util.DossierFormattingEngine.cleanAcademicProse(pass2Json.optString("stage02eTo03cVerifiedListV2", "")),
       adjudicated.adjudicatedFindings
     )
-    val stage04aIsItCredibleEssay = sanitizeProseAgainstDismissedFindings(
-      com.example.util.DossierFormattingEngine.cleanAcademicProse(pass2Json.optString("stage04aIsItCredibleEssay", "")),
-      adjudicated.adjudicatedFindings
+    val credibleEssaySection = buildEvidenceGovernedReportSection(
+      title = "Credibility Synthesis",
+      rawProse = com.example.util.DossierFormattingEngine.cleanAcademicProse(pass2Json.optString("stage04aIsItCredibleEssay", "")),
+      adjudicatedFindings = adjudicated.adjudicatedFindings
     )
-    val stage08aTo08bAlchemistEditorNote = sanitizeProseAgainstDismissedFindings(
-      com.example.util.DossierFormattingEngine.cleanAcademicProse(pass2Json.optString("stage08aTo08bAlchemistEditorNote", "")),
-      adjudicated.adjudicatedFindings
+    val stage04aIsItCredibleEssay = credibleEssaySection.renderMarkdown()
+    val editorNoteSection = buildEvidenceGovernedReportSection(
+      title = "Editorial Decision & Action Plan",
+      rawProse = com.example.util.DossierFormattingEngine.cleanAcademicProse(pass2Json.optString("stage08aTo08bAlchemistEditorNote", "")),
+      adjudicatedFindings = adjudicated.adjudicatedFindings
     )
+    val stage08aTo08bAlchemistEditorNote = editorNoteSection.renderMarkdown()
     val stage09aTo09cCopyeditReport = com.example.util.DossierFormattingEngine.cleanAcademicProse(
       pass2Json.optString("stage09aTo09cCopyeditReport", "")
     )
@@ -2907,7 +2913,19 @@ class Reviewer2PipelineService {
                 val windowEnd = (matchEnd + 160).coerceAtMost(manuscriptText.length)
                 val surrounding = if (windowEnd > windowStart) manuscriptText.substring(windowStart, windowEnd) else quote
                 val entailment = evaluateQuoteEntailment(finding, quote, surrounding)
-                if (verification.pageMismatchWarning != null) {
+                if (entailment == EntailmentStatus.CONTRADICTED_BY_POLARITY) {
+                  updatedStatus = FindingStatus.CONTRADICTED
+                  updatedCounter.add(
+                    EvidenceAnchor(
+                      pageNumber = if (verification.resolvedPage > 0) verification.resolvedPage else claimedPage,
+                      section = primaryAnchor?.section?.ifBlank { "Manuscript text" } ?: "Manuscript text",
+                      exactQuote = quote,
+                      startOffset = verification.startOffset,
+                      endOffset = verification.endOffset
+                    )
+                  )
+                  notes.add("Contradicted by source polarity: verbatim quote directly negates or reverses the stated claim (CONTRADICTED_BY_POLARITY).")
+                } else if (verification.pageMismatchWarning != null) {
                   updatedStatus = FindingStatus.PARTIALLY_SUPPORTED
                   notes.add(verification.pageMismatchWarning)
                 } else if (updatedStatus == FindingStatus.VERIFIED && entailment != EntailmentStatus.ENTAILED) {
@@ -3261,12 +3279,29 @@ class Reviewer2PipelineService {
       val rawMath = mathRigorScore.coerceIn(1, 10)
       val r = reproducibilityScore.coerceIn(1, 10)
 
+      // P0-07: Only VERIFIED, assessable findings may drive EvidenceDerivedScoreGate penalties
+      // or verdict caps. Collect the detector IDs embedded in verified findings' verificationNotes.
+      val detectorIdPattern = Regex("""\(([A-Z]+-[A-Za-z0-9_-]+)(?:,|\))""")
+      val verifiedDetectorIds = finalFindings
+        .filter {
+          it.status == FindingStatus.VERIFIED &&
+            it.reportingStatus != "NOT_ASSESSABLE_FROM_SUPPLIED_MATERIAL"
+        }
+        .flatMap { f ->
+          buildList {
+            add(f.id)
+            detectorIdPattern.findAll(f.verificationNotes).forEach { m -> add(m.groupValues[1]) }
+          }
+        }
+        .toSet()
+
       val breakdown = statAudit?.let {
         EvidenceDerivedScoreGate.evaluate(
           report = it,
           baseMathScore = rawMath,
           baseMethodologyScore = rawM,
-          manuscriptText = manuscriptText
+          manuscriptText = manuscriptText,
+          verifiedDetectorIds = verifiedDetectorIds
         )
       }
       val m = if (applyStatisticalScoreGate && breakdown != null && effectiveEpistemic?.stopAndAsk?.shouldStopAndAsk != true) {
@@ -3435,7 +3470,193 @@ class Reviewer2PipelineService {
     enum class EntailmentStatus {
       ENTAILED,
       PARTIAL_OR_AMBIGUOUS,
-      NOT_ENTAILED
+      NOT_ENTAILED,
+      CONTRADICTED_BY_POLARITY
+    }
+
+    /**
+     * P0-10 Structured prose governance:
+     * Verified factual claims in editorial prose must anchor to an active VERIFIED finding ID,
+     * while unverified or partially-supported narrative items are explicitly quarantined under
+     * [openQuestionsForInvestigation] so dismissed/unverified allegations cannot appear as facts.
+     */
+    data class AnchoredReportStatement(
+      val text: String,
+      val linkedFindingIds: List<String>,
+      val isVerifiedAnchored: Boolean
+    )
+
+    data class ReportSection(
+      val title: String,
+      val verifiedStatements: List<AnchoredReportStatement>,
+      val contextStatements: List<String>,
+      val openQuestionsForInvestigation: List<String>,
+      val strippedDismissedCount: Int
+    ) {
+      fun renderMarkdown(): String = buildString {
+        if (verifiedStatements.isNotEmpty()) {
+          verifiedStatements.forEach { stmt ->
+            appendLine(stmt.text)
+          }
+        }
+        if (contextStatements.isNotEmpty()) {
+          if (isNotEmpty()) appendLine()
+          contextStatements.forEach { appendLine(it) }
+        }
+        if (openQuestionsForInvestigation.isNotEmpty()) {
+          if (isNotEmpty()) appendLine()
+          appendLine("[QUESTIONS REQUIRING FURTHER INVESTIGATION (UNVERIFIED)]")
+          openQuestionsForInvestigation.forEach { q ->
+            val cleaned = q.removePrefix("•").removePrefix("-").trim()
+            appendLine("• $cleaned")
+          }
+        }
+      }.trim()
+    }
+
+    internal fun buildEvidenceGovernedReportSection(
+      title: String,
+      rawProse: String,
+      adjudicatedFindings: List<ReviewFinding>
+    ): ReportSection {
+      if (rawProse.isBlank()) {
+        return ReportSection(title, emptyList(), emptyList(), emptyList(), 0)
+      }
+      val afterDismissed = sanitizeProseAgainstDismissedFindings(rawProse, adjudicatedFindings)
+      val strippedDismissedCount = (rawProse.lines().count { it.isNotBlank() } -
+        afterDismissed.lines().count { it.isNotBlank() }).coerceAtLeast(0)
+
+      val verifiedFindings = adjudicatedFindings.filter { it.status == FindingStatus.VERIFIED }
+      val unverifiedOrPartialFindings = adjudicatedFindings.filter {
+        it.status == FindingStatus.UNVERIFIED || it.status == FindingStatus.PARTIALLY_SUPPORTED
+      }
+      val verifiedIdSet = verifiedFindings.map { it.id.uppercase(Locale.US) }.toSet()
+      val unverifiedIdSet = unverifiedOrPartialFindings.map { it.id.uppercase(Locale.US) }.toSet()
+      val findingIdRegex = Regex("""\[([A-Z]-\d{1,3})\]""")
+      val allegationCueRegex = Regex(
+        """(?i)\b(?:flaw|error|contradict|invalid|fabricat|omitted|missing|failed\s+to|did\s+not|bias|confound|leakage|overfit|unadjusted|violat|miscalculat|discrepancy)\b"""
+      )
+      val stopWords = setOf(
+        "the", "and", "for", "with", "that", "this", "from", "were", "was", "are", "not", "but",
+        "study", "paper", "authors", "missing", "lacks", "omitted", "reported", "analysis", "results"
+      )
+      fun tokenize(s: String): Set<String> = s.lowercase(Locale.US)
+        .split(Regex("""[^a-z0-9²]+"""))
+        .filter { it.length >= 4 && it !in stopWords }
+        .toSet()
+
+      val verifiedTokenMap = verifiedFindings.associate { it.id to tokenize("${it.title} ${it.allegation}") }
+      val unverifiedTokenMap = unverifiedOrPartialFindings.associate { it.id to tokenize("${it.title} ${it.allegation}") }
+
+      val verifiedStmts = mutableListOf<AnchoredReportStatement>()
+      val contextStmts = mutableListOf<String>()
+      val openQuestions = mutableListOf<String>()
+
+      afterDismissed.lines().map { it.trim() }.filter { it.isNotEmpty() }.forEach { line ->
+        if (line.startsWith("[") && line.endsWith("]")) {
+          contextStmts.add(line)
+          return@forEach
+        }
+        val explicitIds = findingIdRegex.findAll(line).map { it.groupValues[1].uppercase(Locale.US) }.distinct().toList()
+        val matchedVerifiedIds = explicitIds.filter { it in verifiedIdSet }.toMutableList()
+        val matchedUnverifiedIds = explicitIds.filter { it in unverifiedIdSet }
+
+        if (matchedVerifiedIds.isEmpty() && matchedUnverifiedIds.isEmpty() && adjudicatedFindings.isNotEmpty()) {
+          val lineTokens = tokenize(line)
+          verifiedTokenMap.forEach { (id, fTokens) ->
+            if (fTokens.size >= 2) {
+              val hits = lineTokens.intersect(fTokens).size
+              if (hits >= 3 && hits.toDouble() / fTokens.size.toDouble() >= 0.40) {
+                matchedVerifiedIds.add(id)
+              }
+            }
+          }
+          if (matchedVerifiedIds.isEmpty()) {
+            val matchesUnverified = unverifiedTokenMap.values.any { uTokens ->
+              if (uTokens.size < 2) false
+              else {
+                val hits = lineTokens.intersect(uTokens).size
+                hits >= 3 && hits.toDouble() / uTokens.size.toDouble() >= 0.40
+              }
+            }
+            if (matchesUnverified) {
+              openQuestions.add(line)
+              return@forEach
+            }
+          }
+        }
+
+        when {
+          matchedVerifiedIds.isNotEmpty() -> {
+            val idsSorted = matchedVerifiedIds.distinct()
+            val anchoredLine = if (explicitIds.any { it in verifiedIdSet }) {
+              line
+            } else {
+              "[${idsSorted.joinToString(", ")}] $line"
+            }
+            verifiedStmts.add(
+              AnchoredReportStatement(
+                text = anchoredLine,
+                linkedFindingIds = idsSorted,
+                isVerifiedAnchored = true
+              )
+            )
+          }
+          matchedUnverifiedIds.isNotEmpty() -> {
+            openQuestions.add(line)
+          }
+          adjudicatedFindings.isNotEmpty() && allegationCueRegex.containsMatchIn(line) &&
+            !line.contains("dismissed", ignoreCase = true) &&
+            !line.contains("counterevidence", ignoreCase = true) -> {
+            // Unanchored substantive criticism -> quarantine as open question instead of verified fact
+            openQuestions.add(line)
+          }
+          else -> {
+            contextStmts.add(line)
+          }
+        }
+      }
+
+      return ReportSection(
+        title = title,
+        verifiedStatements = verifiedStmts,
+        contextStatements = contextStmts,
+        openQuestionsForInvestigation = openQuestions,
+        strippedDismissedCount = strippedDismissedCount
+      )
+    }
+
+    /**
+     * P1-13 Final Verdict / Epistemic / GRADE Reconciliation Gate:
+     * Ensures the final persisted verdict is strictly consistent with the FINAL post-adjudication
+     * extractionConfidence, finalEpistemic stop-and-ask state, and final clinical GRADE assessment.
+     */
+    internal fun reconcileFinalVerdictWithEpistemicState(
+      adjudicatedVerdict: String,
+      clinicalGradeAssessment: GradeCertaintyAssessment?,
+      finalEpistemic: EpistemicSafeguardReport?,
+      finalExtractionConfidence: Int,
+      reviewMode: ReviewMode
+    ): String {
+      if (finalEpistemic?.stopAndAsk?.shouldStopAndAsk == true) {
+        return "INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT"
+      }
+      if (finalExtractionConfidence <= 2 &&
+        adjudicatedVerdict in setOf("ACCEPT", "HIGH_CREDIBILITY", "HIGH_CERTAINTY", "MODERATE_CERTAINTY")
+      ) {
+        return "INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT"
+      }
+      if (reviewMode == ReviewMode.CLINICAL_EVIDENCE_APPRAISAL && clinicalGradeAssessment != null) {
+        if (!clinicalGradeAssessment.isAssessable) {
+          return "INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT"
+        }
+        if (adjudicatedVerdict != "INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT" &&
+          adjudicatedVerdict != "PROVISIONAL_APPRAISAL_DESIGN_UNCERTAIN"
+        ) {
+          return clinicalGradeAssessment.verdictEnum
+        }
+      }
+      return adjudicatedVerdict
     }
 
     data class DocumentReadinessResult(
@@ -3478,9 +3699,9 @@ class Reviewer2PipelineService {
     }
 
     /**
-     * P1-10 Pre-Inference Document-Readiness Gate:
-     * Prevents burning full multi-pass LLM inference on unreadable multi-page scanned PDFs or
-     * empty inputs where Methods, Results, and tables are inaccessible.
+     * P1-12 Pre-Inference Document-Readiness Gate:
+     * Prevents burning full multi-pass LLM inference on unreadable or partially-rendered scanned
+     * PDFs (requiring 100% page coverage or full OCR for any scanned PDF) or empty inputs.
      */
     internal fun evaluateDocumentReadinessGate(
       manuscriptText: String,
@@ -3504,9 +3725,11 @@ class Reviewer2PipelineService {
         blocking.add("Scanned image-only PDF cannot be inspected by a text-only external API provider.")
         actions.add("Run OCR on the PDF to embed a searchable text layer, or switch to a multimodal vision provider.")
       }
-      if (isScanned && totalPages >= 4 && attachedBitmapCount < (totalPages + 1) / 2) {
-        blocking.add("Scanned PDF has $totalPages page(s) with no searchable text layer and only $attachedBitmapCount rendered page image(s) (<50% coverage).")
-        actions.add("Provide a text-searchable / OCR-processed PDF so Methods, Results, and all tables can be read completely.")
+      if (isScanned && totalPages >= 1 && attachedBitmapCount < totalPages) {
+        blocking.add(
+          "Scanned PDF has $totalPages page(s) with no searchable text layer, but only $attachedBitmapCount/$totalPages page image(s) were attached (incomplete coverage)."
+        )
+        actions.add("Provide a text-searchable / OCR-processed PDF or full-page vision coverage so Methods, Results, and all tables can be inspected.")
       }
       if (!isScanned && totalPages >= 8 && wordCount < 80 && attachedBitmapCount == 0) {
         blocking.add("Extracted text contains only $wordCount word(s) across $totalPages page(s), indicating a broken font encoding or image-only PDF.")
@@ -3521,10 +3744,9 @@ class Reviewer2PipelineService {
     }
 
     /**
-     * P0-04 Scientific Entailment Gate:
-     * Independently checks whether a verbatim-verified source quote logically connects to the
-     * substantive claim in [finding] (preventing an exact quote about study demographics from
-     * validating an unrelated methodological allegation).
+     * P0-06 Scientific Entailment & Polarity Gate:
+     * Independently checks whether a verbatim-verified source quote logically entails OR directly
+     * contradicts (via negation or directional inversion) the substantive claim in [finding].
      */
     internal fun evaluateQuoteEntailment(
       finding: ReviewFinding,
@@ -3532,6 +3754,7 @@ class Reviewer2PipelineService {
       surroundingWindow: String
     ): EntailmentStatus {
       val claimText = "${finding.title} ${finding.allegation}".lowercase(Locale.US)
+      val quoteLower = matchedQuote.lowercase(Locale.US)
       val evidenceText = "$matchedQuote $surroundingWindow".lowercase(Locale.US)
       if (matchedQuote.trim().length < 12) return EntailmentStatus.NOT_ENTAILED
 
@@ -3558,7 +3781,44 @@ class Reviewer2PipelineService {
       }
       val overlapRatio = matchedTokens.toDouble() / claimTokens.size.toDouble()
 
-      // Absence/omission claims ("did not adjust for confounding", "no sensitivity analysis")
+      // 1. Predicate-anchored negation / polarity contradiction check (P0-06)
+      val polarityPredicates = listOf(
+        "reduc", "decreas", "increas", "improv", "lower", "elevat", "rais", "associat",
+        "benefit", "harm", "effect", "differen", "significan", "adjust", "blind", "random",
+        "perform", "conduct", "includ", "correlat", "predict", "prevent", "protect", "worsen"
+      )
+      val negationPrefix = """(?:did\s+not|does\s+not|do\s+not|was\s+not|were\s+not|is\s+not|are\s+not|not\s+significantly|no\s+statistically\s+significant|no\s+significant|no|never|failed\s+to|fail\s+to|without|neither|unable\s+to)"""
+      val sharedPredicates = polarityPredicates.filter { stem ->
+        claimText.contains(stem) && quoteLower.contains(stem)
+      }
+      if (sharedPredicates.isNotEmpty() && (matchedTokens >= 2 || matchedNumbers.isNotEmpty())) {
+        for (stem in sharedPredicates) {
+          val negatedPattern = Regex("""\b$negationPrefix(?:\s+\w+){0,4}\s+[a-z]*$stem[a-z]*\b""")
+          val claimNegated = negatedPattern.containsMatchIn(claimText)
+          val quoteNegated = negatedPattern.containsMatchIn(quoteLower)
+          if (claimNegated != quoteNegated) {
+            return EntailmentStatus.CONTRADICTED_BY_POLARITY
+          }
+        }
+      }
+
+      // 2. Direct opposite-direction contradiction check (e.g., "increased mortality" vs "reduced mortality")
+      val decreasePattern = Regex("""\b(?:reduc\w*|decreas\w*|lower\w*|declin\w*|fell|drop\w*|protect\w*|benefit\w*)\b""")
+      val increasePattern = Regex("""\b(?:increas\w*|elevat\w*|rais\w*|higher|rose|worsen\w*|harm\w*)\b""")
+      val anyNegation = Regex("""\b$negationPrefix\b""")
+      if (!anyNegation.containsMatchIn(claimText) && !anyNegation.containsMatchIn(quoteLower) &&
+        (matchedTokens >= 2 || matchedNumbers.isNotEmpty())
+      ) {
+        val claimDec = decreasePattern.containsMatchIn(claimText) && !increasePattern.containsMatchIn(claimText)
+        val claimInc = increasePattern.containsMatchIn(claimText) && !decreasePattern.containsMatchIn(claimText)
+        val quoteDec = decreasePattern.containsMatchIn(quoteLower) && !increasePattern.containsMatchIn(quoteLower)
+        val quoteInc = increasePattern.containsMatchIn(quoteLower) && !decreasePattern.containsMatchIn(quoteLower)
+        if ((claimDec && quoteInc) || (claimInc && quoteDec)) {
+          return EntailmentStatus.CONTRADICTED_BY_POLARITY
+        }
+      }
+
+      // 3. Absence/omission claims ("did not adjust for confounding", "no sensitivity analysis")
       // cannot be entailed solely by quoting an unrelated descriptive sentence!
       val isAbsenceClaim = Regex(
         """\b(?:no|lack(?:s|ed|ing)?|missing|omitted|did\s+not|failed\s+to|without|unadjusted|not\s+reported|absent)\b"""
@@ -3611,7 +3871,7 @@ class Reviewer2PipelineService {
 
       val filteredLines = prose.lines().filterNot { line ->
         val trimmed = line.trim()
-        if (trimmed.isEmpty() || trimmed.startsWith("[")) return@filterNot false
+        if (trimmed.isEmpty() || (trimmed.startsWith("[") && trimmed.endsWith("]"))) return@filterNot false
         val lower = trimmed.lowercase(Locale.US)
         // Preserve explicit dismissal/retraction notes
         if (lower.contains("dismissed") || lower.contains("contradicted") || lower.contains("counterevidence")) {
@@ -3663,10 +3923,14 @@ class Reviewer2PipelineService {
     }
 
     /**
-     * P1-08 Transparent Outcome-Specific GRADE Clinical Certainty Evaluator:
-     * Evaluates clinical evidence certainty strictly via GRADE domains (starting design level +
-     * Risk of Bias, Inconsistency, Indirectness, Imprecision, Publication Bias) rather than
-     * converting general originality/clarity scores into GRADE certainty labels.
+     * P1-11 Transparent Outcome-Specific GRADE Clinical Certainty Evaluator:
+     * Evaluates clinical evidence certainty strictly via explicit outcome evidence + GRADE domains.
+     * - Requires explicit clinical outcome / effect profile evidence before issuing a rating.
+     * - Systematic reviews start at High ONLY when Methods/inclusion criteria explicitly state
+     *   randomized controlled trials were pooled/included (never from casual "RCT" mentions).
+     * - Unassessed GRADE domains default to NOT_ASSESSABLE rather than optimistically NOT_SERIOUS.
+     * - Returns INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT when outcome evidence is missing or critical
+     *   domains (Risk of Bias, Imprecision, or >=2 domains) are NOT_ASSESSABLE.
      */
     internal fun evaluateClinicalGradeCertainty(
       manuscriptText: String,
@@ -3676,13 +3940,18 @@ class Reviewer2PipelineService {
     ): GradeCertaintyAssessment {
       val statAudit = forensicReport?.quantForensics?.statisticalAudit
       val subDesign = statAudit?.subDesign
-      val lower = manuscriptText.lowercase(Locale.US)
+      val refCut = Regex("""(?im)^\s*(?:\d+(?:\.\d+)*\.?\s+)?(references|bibliography|works\s+cited)\s*$""")
+        .find(manuscriptText)?.range?.first ?: manuscriptText.length
+      val bodyText = manuscriptText.substring(0, refCut)
+      val lower = bodyText.lowercase(Locale.US)
 
       // Determine GRADE starting level strictly from study design (RCT=High(3), Observational=Low(1))
       val (startingLevel, startingRank) = when (subDesign) {
         AuditSubDesign.RCT -> "High (Randomized Controlled Trial)" to 3
         AuditSubDesign.META_ANALYSIS, AuditSubDesign.SYSTEMATIC_REVIEW -> {
-          val poolsRcts = Regex("""\b(?:randomized|randomised|rct|clinical\s+trials?)\b""").containsMatchIn(lower)
+          val poolsRcts = Regex(
+            """(?i)\b(?:meta[\s-]?analysis\s+of\s+(?:\d+\s+)?(?:randomized|randomised|rcts?)|included\s+(?:\d+\s+)?(?:randomized|randomised|rcts?)|pooled\s+(?:\d+\s+)?(?:randomized|randomised|rcts?)|(?:randomized|randomised)\s+controlled\s+trials?\s+were\s+(?:included|eligible|pooled))\b"""
+          ).containsMatchIn(bodyText)
           if (poolsRcts) "High (Systematic Review of RCTs)" to 3 else "Low (Systematic Review of Observational/Mixed Studies)" to 1
         }
         AuditSubDesign.OBSERVATIONAL_COHORT,
@@ -3691,7 +3960,18 @@ class Reviewer2PipelineService {
         else -> "Not Assessable (Non-Clinical / Uncertain Design)" to -1
       }
 
-      if (startingRank < 0 || extractionConfidence <= 2 || statAudit?.designClassification?.abstained == true) {
+      val hasOutcomeEffectEvidence = (statAudit?.claims?.isNotEmpty() == true) ||
+        Regex(
+          """(?i)\b(?:hr|or|rr|irr|md|smd|ard|arr|nnt|risk\s+ratio|odds\s+ratio|hazard\s+ratio|mean\s+difference|mortality|survival|remission|hospitalization|event\s+rate)\b[^.\n]{0,80}(?:\d+(?:\.\d+)?|\bci\b|\bp\s*[=<>])"""
+        ).containsMatchIn(bodyText) ||
+        Regex("""\b\d+\s*/\s*\d+\b[^.\n]{0,40}\b(?:vs\.?|versus)\b[^.\n]{0,40}\b\d+\s*/\s*\d+\b""", RegexOption.IGNORE_CASE).containsMatchIn(bodyText)
+
+      if (startingRank < 0 || extractionConfidence <= 2 || statAudit?.designClassification?.abstained == true || !hasOutcomeEffectEvidence) {
+        val reason = if (!hasOutcomeEffectEvidence && startingRank >= 0) {
+          "GRADE certainty cannot be rated because no explicit clinical outcome effect profile (effect estimate, confidence interval, or comparative event counts) was extracted from the supplied text."
+        } else {
+          "GRADE certainty cannot be rated because study design, outcome-specific bias domains, or source extraction are insufficient."
+        }
         return GradeCertaintyAssessment(
           startingLevel = startingLevel,
           startingRank = -1,
@@ -3702,7 +3982,7 @@ class Reviewer2PipelineService {
           publicationBias = GradeDomainConcern.NOT_ASSESSABLE,
           verdictEnum = "INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT",
           isAssessable = false,
-          rationale = "GRADE certainty cannot be rated because study design, outcome-specific bias domains, or source extraction are insufficient."
+          rationale = reason
         )
       }
 
@@ -3717,35 +3997,84 @@ class Reviewer2PipelineService {
         txt.contains("bias") || txt.contains("confound") || txt.contains("attrition") ||
           txt.contains("blinding") || txt.contains("allocation") || txt.contains("leakage") || txt.contains("contradiction")
       }
+      val hasExplicitBiasControls = Regex(
+        """(?i)\b(?:double[\s-]?blind|single[\s-]?blind|masked|allocation\s+concealment|randomiz(?:ed|ation)\s+1:1|placebo|intention[\s-]?to[\s-]?treat|rob[\s-]?2|robins[\s-]?i|newcastle[\s-]?ottawa|propensity\s+score|multivariable\s+(?:cox|logistic|regression)|adjusted\s+for)\b"""
+      ).containsMatchIn(bodyText)
       val riskOfBias = when {
         verifiedCriticalCount >= 2 || biasFindingsCount >= 3 -> GradeDomainConcern.VERY_SERIOUS
         verifiedCriticalCount == 1 || biasFindingsCount >= 1 -> GradeDomainConcern.SERIOUS
-        else -> GradeDomainConcern.NOT_SERIOUS
+        hasExplicitBiasControls -> GradeDomainConcern.NOT_SERIOUS
+        else -> GradeDomainConcern.NOT_ASSESSABLE
       }
 
       val highHeterogeneity = statAudit?.reconstructions?.any {
         it.detail.contains("I²=", ignoreCase = true) &&
           Regex("""I²\s*=\s*([5-9]\d|100)""").containsMatchIn(it.detail)
-      } == true || Regex("""I[²2]\s*[=≥>]\s*(?:[6-9]\d|100)\s*%""").containsMatchIn(manuscriptText)
-      val inconsistency = if (highHeterogeneity) GradeDomainConcern.SERIOUS else GradeDomainConcern.NOT_SERIOUS
+      } == true || Regex("""I[²2]\s*[=≥>]\s*(?:[6-9]\d|100)\s*%""").containsMatchIn(bodyText)
+      val hasHeterogeneityEvidence = subDesign == AuditSubDesign.RCT ||
+        Regex("""(?i)(?:I[²2]\s*[=<>≤≥]\s*\d|heterogeneity|tau[\s-]?squared|cochran|consistent\s+across)""").containsMatchIn(bodyText)
+      val inconsistency = when {
+        highHeterogeneity -> GradeDomainConcern.SERIOUS
+        hasHeterogeneityEvidence -> GradeDomainConcern.NOT_SERIOUS
+        else -> GradeDomainConcern.NOT_ASSESSABLE
+      }
 
       val indirectnessCues = activeFindings.any { f ->
         val txt = "${f.title} ${f.allegation}".lowercase(Locale.US)
         txt.contains("surrogate") || txt.contains("indirect") || txt.contains("generalizab") || txt.contains("external validity")
       }
-      val indirectness = if (indirectnessCues) GradeDomainConcern.SERIOUS else GradeDomainConcern.NOT_SERIOUS
+      val hasDirectClinicalOutcome = Regex(
+        """(?i)\b(?:mortality|death|survival|heart\s+failure|stroke|myocardial|hospitalization|clinical\s+endpoint|primary\s+(?:outcome|endpoint)|patients?)\b"""
+      ).containsMatchIn(bodyText)
+      val indirectness = when {
+        indirectnessCues -> GradeDomainConcern.SERIOUS
+        hasDirectClinicalOutcome -> GradeDomainConcern.NOT_SERIOUS
+        else -> GradeDomainConcern.NOT_ASSESSABLE
+      }
 
       val imprecisionCues = statAudit?.reconstructions?.any {
         it.findingType == StatisticalFindingType.IMPRECISION_OR_HIGH_VARIANCE
       } == true || activeFindings.any { f ->
         "${f.title} ${f.allegation}".lowercase(Locale.US).let { it.contains("imprecis") || it.contains("underpower") || it.contains("wide ci") }
       }
-      val imprecision = if (imprecisionCues) GradeDomainConcern.SERIOUS else GradeDomainConcern.NOT_SERIOUS
+      val hasPrecisionEvidence = Regex("""(?i)(?:95%\s*ci|confidence\s+interval|credible\s+interval|\bn\s*=\s*\d+)""").containsMatchIn(bodyText)
+      val imprecision = when {
+        imprecisionCues -> GradeDomainConcern.SERIOUS
+        hasPrecisionEvidence -> GradeDomainConcern.NOT_SERIOUS
+        else -> GradeDomainConcern.NOT_ASSESSABLE
+      }
 
       val pubBiasCues = activeFindings.any { f ->
         "${f.title} ${f.allegation}".lowercase(Locale.US).let { it.contains("publication bias") || it.contains("funnel") || it.contains("selective reporting") }
       }
-      val publicationBias = if (pubBiasCues) GradeDomainConcern.SERIOUS else GradeDomainConcern.NOT_SERIOUS
+      val hasPubBiasAssessment = Regex(
+        """(?i)\b(?:nct\d{6,}|prospero|isrctn|clinicaltrials\.gov|registered\s+protocol|funnel\s+plot|egger|begg|trim[\s-]?and[\s-]?fill|publication\s+bias)\b"""
+      ).containsMatchIn(bodyText)
+      val publicationBias = when {
+        pubBiasCues -> GradeDomainConcern.SERIOUS
+        hasPubBiasAssessment -> GradeDomainConcern.NOT_SERIOUS
+        else -> GradeDomainConcern.NOT_ASSESSABLE
+      }
+
+      val unassessedCount = listOf(riskOfBias, inconsistency, indirectness, imprecision, publicationBias)
+        .count { it == GradeDomainConcern.NOT_ASSESSABLE }
+      if (riskOfBias == GradeDomainConcern.NOT_ASSESSABLE ||
+        imprecision == GradeDomainConcern.NOT_ASSESSABLE ||
+        unassessedCount >= 2
+      ) {
+        return GradeCertaintyAssessment(
+          startingLevel = startingLevel,
+          startingRank = startingRank,
+          riskOfBias = riskOfBias,
+          inconsistency = inconsistency,
+          indirectness = indirectness,
+          imprecision = imprecision,
+          publicationBias = publicationBias,
+          verdictEnum = "INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT",
+          isAssessable = false,
+          rationale = "GRADE certainty withheld: $unassessedCount domain(s) could not be assessed from supplied text (Risk of Bias=${riskOfBias.label}, Imprecision=${imprecision.label})."
+        )
+      }
 
       val totalDowngrade = riskOfBias.downgradeSteps + inconsistency.downgradeSteps +
         indirectness.downgradeSteps + imprecision.downgradeSteps + publicationBias.downgradeSteps

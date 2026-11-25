@@ -1,0 +1,353 @@
+# **Paper Critic — Ultra-Thorough GitHub Bug Audit**
+
+Repository: [Kasi72/Paper-Critc](https://github.com/Kasi72/Paper-Critc?utm_source=chatgpt.com) · Branch: `main` · Commit: [cae0a7d](https://github.com/Kasi72/Paper-Critc/commit/cae0a7df6839f62224589787c2c159c2920d4f78?utm_source=chatgpt.com) · 25 November 2026
+
+I've reopened the current repository and inspected the updated implementation. This revision includes substantial changes beyond the version previously audited, including a Scientific Truth Gate, a fuller epistemic safeguard system, revised PDF export logic, calibration infrastructure, and new tests.
+
+The biggest remaining risks are no longer simply poor PDF parsing or incorrect rubric arithmetic. **They concern account-level data isolation, preservation of scientific evidence, and whether a report's verification labels accurately reflect what was checked.**
+
+## **1. Critical findings: address these before releasing the app**
+
+### **P0-01 — Reviews can become visible across different signed-in accounts on the same device**
+
+Privacy and data isolation
+
+**Source:** [PaperCriticViewModel.kt, lines 239–292](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/ui/viewmodel/PaperCriticViewModel.kt?utm_source=chatgpt.com#L239-L292) and [Local database DAO](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/data/local/PaperCriticSqlDatabase.kt?utm_source=chatgpt.com#L236-L251)
+
+The local Room database returns cached reviews without filtering them by the currently authenticated user's ID.
+
+The archive UI then merges these local records with the current user's cloud records, also without filtering local records by owner.
+
+A possible sequence is:
+
+1. Researcher A signs in, generates reviews, and caches them locally.
+2. Researcher A signs out.
+3. Researcher B signs in on the same Android device.
+4. Researcher B's archive can still contain Researcher A's locally cached reviews.
+
+The Firestore ownership rules are not enough to prevent this because the affected records are already on the device.
+
+**Fix:** Enforce ownership at the repository boundary, not just in the UI. Separate anonymous local reviews from account-owned reviews, filter Room queries by the active account, and clear account-scoped in-memory state on logout.
+
+### **P0-02 — Automatic synchronization can upload one researcher's local manuscript review to another researcher's cloud account**
+
+**Source:** [Authentication and portfolio synchronization](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/ui/viewmodel/PaperCriticViewModel.kt?utm_source=chatgpt.com#L445-L543)
+
+The synchronization routine selects pending reviews by checking whether their IDs begin with `local_` or `sql_`, or their stored `userId` is blank.
+
+It does not establish that these pending reviews belong to the person who just signed in.
+
+When automatic synchronization is enabled, local reports left by a previous user may therefore be copied into the new user's Firestore account.
+
+This is particularly serious for unpublished manuscripts or confidential peer-review material.
+
+**Fix:** Assign every local record an explicit ownership scope at creation. Never infer ownership from an ID prefix. Require explicit adoption of anonymous records by the current user; do not automatically upload them on sign-in.
+
+### **P0-03 — Switching accounts during an AI analysis can change who receives the resulting report**
+
+**Source:** [Review generation and saving](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/ui/viewmodel/PaperCriticViewModel.kt?utm_source=chatgpt.com#L750-L843)
+
+The manuscript is captured at the start of analysis, but the active authenticated user is read again after the model finishes.
+
+If the user changes accounts while the analysis is running, the completed review can be saved under the account active at completion rather than the one that initiated the analysis.
+
+**Fix:** Capture the initiating user ID and a session-generation token before starting inference. Before saving, verify that the session has not changed. Cancel or quarantine the result if it has.
+
+**Required regression test:** Start analysis as account A, switch to B before completion, and assert that no A-owned report is saved or exposed under B.
+
+These three findings form one critical release blocker: **user identity must remain attached to data throughout its entire lifecycle.**
+
+## **2. High-impact scientific and data-integrity defects**
+
+### **P0-04 — Firestore synchronization can corrupt the structured evidence ledger**
+
+**Source:** [ReviewRepository.kt, Firestore serialization](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/data/repository/ReviewRepository.kt?utm_source=chatgpt.com#L270-L325) and [PaperReview.kt, finding serialization](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/data/model/PaperReview.kt?utm_source=chatgpt.com#L97-L150)
+
+The cloud serializer applies `.take(60000)` directly to `structuredFindingsJson`. If a complete ledger exceeds 60,000 characters, this truncates the JSON string without regard to object boundaries.
+
+The decoder then catches parsing failures and returns an **empty findings list**.
+
+The outcome can be particularly damaging: the report's headline verdict and prose survive, while the structured evidence supporting them disappears from the cloud version. The view model subsequently reads the cloud version and caches it locally.
+
+**Proposed correction:** Never truncate structured JSON. Store each finding in a separate record or chunk a versioned ledger with an integrity hash. Verify the serialized result by decoding it and comparing finding counts and IDs before accepting synchronization. Retain the complete local original if cloud serialization fails.
+
+**Regression test:** Generate a ledger exceeding 60,000 characters, synchronize it, reload it, and confirm exact preservation of all findings, anchors and statuses.
+
+### **P0-05 — The code can declare an incomplete pasted manuscript to be fully extracted**
+
+**Source:** [ManuscriptExtractor.kt, forCompleteText()](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/util/ManuscriptExtractor.kt?utm_source=chatgpt.com#L217-L236)
+
+The `forCompleteText()` function assigns `COMPLETE` coverage and extraction confidence **5/5** to arbitrary direct-text input. It estimates page count from text length or page markers rather than confirming the document's completeness.
+
+An abstract or manually pasted Results excerpt can therefore acquire metadata implying complete document coverage.
+
+**Correction:** Separate *text readability* from *document completeness*. Pasted text can have high character readability, but its completeness should remain unknown unless the complete source is independently established. Do not certify absent Methods, analyses or tables from excerpt-only input.
+
+### **P0-06 — The new scientific entailment verifier can mistake lexical similarity for proof**
+
+**Source:** [Reviewer2PipelineService.kt, evaluateQuoteEntailment()](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/data/ai/Reviewer2PipelineService.kt?utm_source=chatgpt.com#L3529-L3584)
+
+The implementation treats overlapping numbers and word stems as evidence that a quotation supports an allegation. It has no general mechanism to establish whether the statement is affirmed, negated, qualified, or about a different causal direction.
+
+For example, these statements have very similar lexical content but opposite meanings:
+
+> “Treatment reduced mortality by 20%.”
+
+> “Treatment did not reduce mortality by 20%.”
+
+A shared numerical value plus overlapping terms can satisfy the current entailment threshold.
+
+**Correction:** A quotation match must establish only *source authenticity*. Scientific entailment needs a separate check for polarity, outcome, population, comparator, time point, statistical scale and context. When these cannot be established, use `PARTIALLY_SUPPORTED` or `UNVERIFIED`; never infer support from token overlap alone.
+
+### **P0-07 — Statistical penalties can influence the verdict before their findings are finally verified**
+
+**Source:** [Reviewer2PipelineService.kt, scoring and verdict adjudication](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/data/ai/Reviewer2PipelineService.kt?utm_source=chatgpt.com#L3243-L3340)
+
+The evidence-derived scoring gate calculates penalties from the statistical audit report. The verdict can also be escalated by `breakdown.verdictCapReason`.
+
+These mechanisms operate on detector outputs, not exclusively on the final list of independently adjudicated and verified findings.
+
+Consequently, a statistical screening error can potentially influence methodology scores or block a favorable verdict even when its corresponding finding remains only partially supported.
+
+**Correction:** Calculate score adjustments and verdict restrictions from final adjudicated finding IDs, with explicit scientific applicability checks. Separate provisional risk signals from verified errors, and publish an auditable score-change ledger.
+
+### **P0-08 — A failed or missing custom API key can silently change the manuscript's AI provider**
+
+**Source:** [PaperCriticViewModel.kt, provider resolution](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/ui/viewmodel/PaperCriticViewModel.kt?utm_source=chatgpt.com#L1219-L1231) and [Reviewer2PipelineService.kt, provider routing](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/data/ai/Reviewer2PipelineService.kt?utm_source=chatgpt.com#L630-L675)
+
+When `useCustomApiProvider` is enabled but the selected provider is missing or its decrypted key is empty, `resolveActiveExternalProvider()` returns `null`.
+
+The pipeline interprets `null` as a request to use the built-in Firebase model. This happens independently of the setting that normally requires consent before an external provider falls back to Firebase.
+
+**Failure scenario:** A researcher configures a preferred external provider, its stored key becomes unreadable, and the application sends the manuscript to Firebase instead.
+
+The code supports this routing path; whether it has occurred in production remains unverified.
+
+**Fix:** Replace the nullable provider argument with an explicit routing choice: `BUILT_IN`, `CUSTOM(providerId)` or `UNAVAILABLE`. If a custom provider is selected but unavailable, stop with an actionable error. Do not silently substitute a different inference provider.
+
+### **P0-09 — API credentials and provider configuration are also shared across local accounts**
+
+**Source:** [Provider database entity](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/data/local/PaperCriticSqlDatabase.kt?utm_source=chatgpt.com#L190-L233) and [Shared provider preferences](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/ui/viewmodel/PaperCriticViewModel.kt?utm_source=chatgpt.com#L1383-L1444)
+
+The stored custom-provider records do not contain an owner ID. The app's selected provider is also stored in application-wide preferences.
+
+Android Keystore protects keys at rest, but it does not inherently separate account A from account B within the same application installation.
+
+Therefore, another user signing into the same app installation can potentially inherit the previous user's configured provider and make requests using their API credentials.
+
+**Fix:** Associate provider records and selection settings with an account-scoped profile. On logout, remove decrypted credentials from in-memory state. Never expose another account's provider configurations in the settings UI.
+
+### **P0-10 — The final report still contains AI prose that is not fully governed by the evidence ledger**
+
+**Source:** [Reviewer2PipelineService.kt, report assembly](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/data/ai/Reviewer2PipelineService.kt?utm_source=chatgpt.com#L1340-L1512) and [Prose sanitizer](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/data/ai/Reviewer2PipelineService.kt?utm_source=chatgpt.com#L3591-L3627)
+
+The revised pipeline correctly stopped appending an unadjudicated verified-findings list when structured findings exist.
+
+But it still incorporates model-generated statistical commentary, blue-team prose, editorial judgments and rubric rationales.
+
+Its new sanitizer compares text against findings marked `CONTRADICTED`. It does not establish that each sentence is supported by an active, verified finding.
+
+A paraphrased false criticism can survive the keyword filter. So can a criticism that is merely unverified rather than explicitly contradicted.
+
+**Fix:** After adjudication, create a typed `ReportSection` model whose substantive statements reference verified finding IDs. Generate the main report from those sections. Unverified analysis belongs in a separately labeled *Questions requiring further investigation* section.
+
+**Release criterion:** Removing or downgrading a finding must automatically remove or qualify every dependent statement throughout the exported report.
+
+## **3. Remaining methodological and reliability flaws**
+
+### **P1-11 — Clinical GRADE certainty can be assigned without outcome-specific evidence**
+
+**Source:** [evaluateClinicalGradeCertainty()](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/data/ai/Reviewer2PipelineService.kt?utm_source=chatgpt.com#L3671-L3771)
+
+This module has improved: it no longer simply converts the six-axis score into GRADE certainty. It now evaluates five GRADE domains.
+
+However, the implementation is still not a defensible outcome-specific GRADE assessment.
+
+For systematic reviews, it searches the manuscript for words such as `randomized`, `rct` or `clinical trials`. Merely mentioning an RCT can establish a high starting certainty level, even when the review primarily pools observational studies.
+
+The domain assessments are also keyword-driven. For instance, the absence of a recognized publication-bias concern becomes `NOT_SERIOUS`. But failure to detect a problem is not evidence that the problem was assessed and found absent.
+
+The current output describes itself as *Outcome-Specific GRADE Certainty* without requiring an explicitly identified outcome, comparison, effect estimate or associated body of evidence.
+
+**Fix:** Require an evidence profile for each clinical outcome. Keep domains as `NOT_ASSESSABLE` until sufficient evidence exists, and do not produce a final GRADE rating where critical information is missing.
+
+### **P1-12 — The scanned-document readiness gate permits substantial unreadable content**
+
+**Source:** [Document readiness gate](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/data/ai/Reviewer2PipelineService.kt?utm_source=chatgpt.com#L3480-L3521)
+
+The gate blocks scanned PDFs of at least four pages only when fewer than half their pages are visually attached.
+
+That still allows a ten-page scanned manuscript to pass with five rendered images and no searchable text layer.
+
+A three-page scanned manuscript can also evade that particular condition entirely.
+
+**Fix:** For image-only papers, require complete OCR or verified visual access to all scientifically relevant pages. Half-page coverage should never be treated as full-document readiness.
+
+### **P1-13 — A final confidence recalculation does not trigger a corresponding verdict recalculation**
+
+**Source:** [Final confidence and epistemic recalculation](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/data/ai/Reviewer2PipelineService.kt?utm_source=chatgpt.com#L1271-L1301)
+
+The pipeline performs adjudication using preliminary extraction confidence, then recalculates confidence using the adjudicated findings. It also builds an updated epistemic assessment from that final confidence.
+
+But the previously resolved score and verdict are not passed through adjudication again.
+
+This can result in inconsistencies between the final completeness assessment and the decision reached using earlier assumptions.
+
+**Fix:** Define a finalization sequence in which confidence, completeness, verified findings and verdict are reconciled before report assembly. Add an invariant test that prevents publication when the final completeness gate disagrees with the resolved verdict.
+
+### **P1-14 — Legacy cloud reports may still inherit an unjustified&#x20;**`VERIFIED`**&#x20;label**
+
+**Source:** [PaperReview defaults](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/data/model/PaperReview.kt?utm_source=chatgpt.com#L425-L455)
+
+The new Room migrations correctly protect legacy local records. That particular earlier bug has been addressed.
+
+However, `PaperReview` still defaults `validationStatus` to `VERIFIED` and `structuredFindingsJson` to an empty string.
+
+Older Firestore documents that lack these fields can therefore deserialize with a misleading verification label.
+
+**Fix:** Make the model default `LEGACY_UNVALIDATED`. Upgrade existing cloud records explicitly, with a schema version and evidence-validation version.
+
+### **P1-15 — Confidence-interval parsing does not adequately preserve interval type**
+
+**Source:** [StatisticalClaimParser.kt, interval recognition](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/data/ai/stats/StatisticalClaimParser.kt?utm_source=chatgpt.com#L87-L97)
+
+The parser recognizes confidence intervals, credible intervals (`CrI`), uncertainty intervals (`UI`) and prediction intervals (`PI`) in overlapping patterns.
+
+However, the resulting quantitative claims do not consistently preserve which statistical interval family was reported.
+
+Those interval types are not interchangeable. A Bayesian credible interval should not automatically be evaluated using frequentist confidence-interval and p-value consistency rules.
+
+**Fix:** Add an explicit `IntervalType` to every parsed estimate, and make reconstruction rules declare which interval families they support.
+
+### **P1-16 — Statistical extraction still has fixed first-match limits**
+
+**Source:** [StatisticalClaimParser.kt, claim extraction](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/data/ai/stats/StatisticalClaimParser.kt?utm_source=chatgpt.com#L455-L558)
+
+The parser limits several categories to the first 12, 30 or 40 matches.
+
+A manuscript can therefore be fully extracted while its later statistical claims never reach the audit.
+
+The limit is especially problematic for lengthy systematic reviews or papers with extensive results tables.
+
+**Fix:** Parse the complete source into a structured claims database. Apply computational limits to subsequent analysis, not to initial discovery. If a cap is necessary, explicitly report the unprocessed count and prioritize primary outcomes rather than source order.
+
+### **P1-17 — Concurrent updates can overwrite user notes or bookmarks**
+
+**Source:** [ReviewRepository.kt, updateReview()](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/data/repository/ReviewRepository.kt?utm_source=chatgpt.com#L144-L171)
+
+Cloud updates use `docRef.set(payload)` to replace the entire document.
+
+Bookmark changes and personal-note edits are initiated independently using review objects that may contain stale values for other fields.
+
+Whichever full-document write completes last can overwrite the other edit.
+
+**Fix:** Use field-level updates for independent operations, or optimistic concurrency control with a record revision. Test simultaneous bookmark and note updates.
+
+### **P1-18 — A missing publication year is silently replaced with 2026**
+
+**Source:** [Article metadata resolution](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/data/ai/Reviewer2PipelineService.kt?utm_source=chatgpt.com#L980-L1006)
+
+When neither the user nor the model supplies a usable publication year, the code defaults to `"2026"`.
+
+That fabricates bibliographic metadata. An unknown year should remain unknown.
+
+**Fix:** Use a nullable publication year and display *Year not verified*. The same principle should apply to article title, author names, DOI and journal identity.
+
+### **P1-19 — Supplementary-material coverage contains an unconditional classification error**
+
+**Source:** [DocumentCoverageReport.toCoverageSummary()](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/util/ManuscriptExtractor.kt?utm_source=chatgpt.com#L118-L162)
+
+The code assigns:
+
+```
+val suppCov =
+    if (hasSupplementReference)
+        CoverageLevel.NOT_SUPPLIED
+    else
+        CoverageLevel.NOT_SUPPLIED
+```
+
+Both branches have the same outcome.
+
+As a result, the system cannot distinguish a paper with no supplementary materials from one that references unavailable supplementary materials.
+
+**Fix:** Track `NOT_APPLICABLE`, `REFERENCED_NOT_SUPPLIED`, `SUPPLIED_UNREADABLE` and `SUPPLIED_READABLE` as distinct states.
+
+## **4. PDF, provenance and release-quality issues**
+
+| Priority | Finding                                                                                                                                                                                                                                                                         | Specific repair                                                                                                             |
+| -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| P1       | [PDF diagnostic function](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/util/PdfReportExporter.kt?utm_source=chatgpt.com#L121-L142) inspects a text stream captured during rendering, not independently extracted content from the finished PDF | Reopen the actual PDF bytes, extract text, inspect page boundaries, rasterize pages and detect clipped/overlapping elements |
+| P1       | The PDF's `VERIFIED` label can imply broader validation than its claim-level checks establish                                                                                                                                                                                   | Distinguish source-quote verification, scientific verification and editorial validation                                     |
+| P2       | [PDF cache management](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/util/PdfReportExporter.kt?utm_source=chatgpt.com#L159-L235) removes old export files according to age or file count                                                        | Avoid deleting files still being shared; use explicit retention and cleanup rules                                           |
+| P2       | [EvidenceAnchor serialization](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/data/model/PaperReview.kt?utm_source=chatgpt.com#L152-L184) does not persist `boundingBox`                                                                         | Serialize source coordinates so evidence highlighting survives cloud and local round-trips                                  |
+| P2       | [HTTP response reader](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/data/ai/ExternalApiGatewayClient.kt?utm_source=chatgpt.com#L473-L484) silently caps response bytes                                                                         | Detect truncation and return a distinct incomplete-response error                                                           |
+| P2       | [Release configuration](https://github.com/Kasi72/Paper-Critc/blob/main/app/build.gradle.kts?utm_source=chatgpt.com#L44-L52) disables release minification and shrinking                                                                                                        | Establish a hardened release profile with R8 and regression coverage                                                        |
+| P2       | No GitHub Actions CI workflow appears in the inspected repository tree                                                                                                                                                                                                          | Require automated build, unit, Robolectric and security checks before merging                                               |
+
+One distinction matters here: the code now uses unique PDF filenames, atomic-style temporary-file export, improved rubric pagination and more human-readable report formatting. Those are genuine corrections to previously identified defects. I would not reopen them as unresolved bugs.
+
+## **5. Regression tests that should be added immediately**
+
+The existing test suites are extensive, but several high-risk integration paths are missing.
+
+| Test                        | Input / scenario                                              | Required behavior                                            |
+| --------------------------- | ------------------------------------------------------------- | ------------------------------------------------------------ |
+| Account isolation           | Sign in as A, cache a review, sign out, sign in as B          | B cannot view, edit, delete or sync A's review               |
+| Anonymous adoption          | Sign in after creating local-only reports                     | Reports remain local until explicitly adopted for cloud sync |
+| Session-switch race         | Start review as A and switch to B during inference            | Result cannot be saved to B                                  |
+| Provider fail-closed        | Select custom provider, then make key unavailable             | No request is sent to Firebase                               |
+| Oversized ledger round-trip | Serialize and reload a 100 KB structured findings ledger      | Every finding and anchor survives intact                     |
+| Legacy cloud document       | Load a document without validation fields                     | Status remains `LEGACY_UNVALIDATED`                          |
+| Entailment polarity         | “Treatment did not reduce mortality”                          | Must not support the opposite allegation                     |
+| GRADE missing evidence      | Review with incomplete outcome data                           | No unsupported high-certainty rating                         |
+| Scanned paper               | 10-page image-only PDF with five page images                  | Full-document appraisal is blocked or explicitly limited     |
+| Statistical saturation      | Paper with 100+ quantitative claims                           | No silent first-match omission                               |
+| Actual PDF rendering        | Very long titles, tables, rationales and multilingual symbols | Finished PDF contains all expected text without clipping     |
+| Concurrent edits            | Update bookmark and notes nearly simultaneously               | Both changes persist                                         |
+
+The benchmark should also include **the full original psychiatric-bed article**, rather than relying only on synthetic excerpts reproducing its known numerical inconsistency.
+
+## **6. A practical engineering repair plan**
+
+**Release blocker A — Account and provider isolation**
+
+Owner-scoped Room data, explicit anonymous-data adoption, session-bound tasks and fail-closed provider routing.
+
+*Done when:* No review, chat, API credential or upload can cross account boundaries.
+
+**Release blocker B — Lossless persistence**
+
+Remove JSON truncation, add versioning and checksums, protect local originals and implement atomic synchronization.
+
+*Done when:* Cloud round-trips reproduce the complete local scientific report.
+
+**Release blocker C — Scientific truth preservation**
+
+Replace lexical entailment with context-aware verification; allow only adjudicated findings to influence scores and authoritative prose.
+
+*Done when:* Every consequential statement is traceable to scientifically appropriate evidence.
+
+**Quality upgrade D — Clinical and statistical validity**
+
+Build genuinely outcome-specific certainty assessments, preserve interval types and eliminate claim-extraction saturation.
+
+*Done when:* Methodologically valid alternative interpretations are not mislabeled as errors.
+
+**Quality upgrade E — Publication-grade reporting**
+
+Independently validate exported PDF bytes, add navigable source evidence and establish real-manuscript benchmarks.
+
+*Done when:* Expert review and automated visual checks both approve the generated reports.
+
+## **7. Final audit judgment**
+
+The latest version is considerably more capable than the earlier builds. Its numerical reconstruction, quote anchoring, epistemic safeguards and tests show real engineering progress.
+
+But I would **not yet classify it as release-ready for confidential manuscript evaluation**.
+
+The most urgent defects are the cross-account data paths, silent provider substitution and loss-prone cloud serialization. The most urgent scientific defects are lexical entailment being used as confirmation, and unverified detector outputs or AI-generated prose potentially influencing authoritative conclusions.
+
+For the next engineering iteration, I recommend **fixing these integrity and isolation failures before adding any more reviewer personas, statistical detectors or report sections**.
+
+**Verification scope:** This is a source-level audit of commit `cae0a7d`. I inspected the GitHub repository, but did not execute the Android app, run Gradle, reproduce the account-switch sequence on devices, or complete live-model evaluations. The documented code paths are grounded in the current source; runtime behavior and fixes should be confirmed by the regression tests above.

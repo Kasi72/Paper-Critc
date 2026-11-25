@@ -6,6 +6,7 @@ import com.google.firebase.firestore.Exclude
 import com.google.firebase.firestore.IgnoreExtraProperties
 import com.google.firebase.firestore.PropertyName
 import com.google.firebase.firestore.ServerTimestamp
+import java.security.MessageDigest
 import kotlin.math.roundToInt
 import org.json.JSONArray
 import org.json.JSONObject
@@ -159,6 +160,11 @@ object ReviewFindingCodec {
       obj.put("exactQuote", a.exactQuote)
       if (a.startOffset != null) obj.put("startOffset", a.startOffset)
       if (a.endOffset != null) obj.put("endOffset", a.endOffset)
+      if (!a.boundingBox.isNullOrEmpty()) {
+        val boxArr = JSONArray()
+        a.boundingBox.forEach { coord -> boxArr.put(coord.toDouble()) }
+        obj.put("boundingBox", boxArr)
+      }
       arr.put(obj)
     }
     return arr
@@ -169,6 +175,16 @@ object ReviewFindingCodec {
     return buildList {
       for (i in 0 until arr.length()) {
         val obj = arr.optJSONObject(i) ?: continue
+        val boxArr = obj.optJSONArray("boundingBox")
+        val decodedBox: List<Float>? = if (boxArr != null && boxArr.length() > 0) {
+          buildList<Float> {
+            for (b in 0 until boxArr.length()) {
+              add(boxArr.optDouble(b, 0.0).toFloat())
+            }
+          }
+        } else {
+          null
+        }
         add(
           EvidenceAnchor(
             documentId = obj.optString("documentId", ""),
@@ -176,10 +192,126 @@ object ReviewFindingCodec {
             section = obj.optString("section", "").takeIf { it.isNotBlank() },
             exactQuote = obj.optString("exactQuote", ""),
             startOffset = if (obj.has("startOffset") && !obj.isNull("startOffset")) obj.optInt("startOffset") else null,
-            endOffset = if (obj.has("endOffset") && !obj.isNull("endOffset")) obj.optInt("endOffset") else null
+            endOffset = if (obj.has("endOffset") && !obj.isNull("endOffset")) obj.optInt("endOffset") else null,
+            boundingBox = decodedBox
           )
         )
       }
+    }
+  }
+
+  const val INLINE_CLOUD_LIMIT_CHARS = 55_000
+  const val CLOUD_CHUNK_SIZE_CHARS = 48_000
+
+  data class FindingsChunk(
+    val chunkIndex: Int,
+    val totalChunks: Int,
+    val payload: String,
+    val checksum: String
+  )
+
+  fun sha256Hex(raw: String): String {
+    if (raw.isEmpty()) return ""
+    val digest = MessageDigest.getInstance("SHA-256").digest(raw.toByteArray(Charsets.UTF_8))
+    return digest.joinToString("") { "%02x".format(it) }
+  }
+
+  /**
+   * Splits a serialized findings ledger into lossless UTF-16 character chunks without ever
+   * truncating JSON mid-array. Returns an empty list if [rawJson] is blank.
+   */
+  fun splitIntoLosslessChunks(
+    rawJson: String,
+    maxChunkChars: Int = CLOUD_CHUNK_SIZE_CHARS
+  ): List<FindingsChunk> {
+    val trimmed = rawJson.trim()
+    if (trimmed.isEmpty()) return emptyList()
+    val safeSize = maxChunkChars.coerceAtLeast(1024)
+    val total = (trimmed.length + safeSize - 1) / safeSize
+    val fullChecksum = sha256Hex(trimmed)
+    return (0 until total).map { idx ->
+      val start = idx * safeSize
+      val end = minOf(trimmed.length, start + safeSize)
+      FindingsChunk(
+        chunkIndex = idx,
+        totalChunks = total,
+        payload = trimmed.substring(start, end),
+        checksum = fullChecksum
+      )
+    }
+  }
+
+  /**
+   * Reassembles ordered [chunks] and verifies SHA-256 integrity + valid JSON round-trip.
+   * Returns null if any chunk is missing, corrupted, or fails checksum/JSON validation.
+   */
+  fun reassembleAndVerifyChunks(
+    chunks: List<FindingsChunk>,
+    expectedChunkCount: Int,
+    expectedChecksum: String
+  ): String? {
+    if (expectedChunkCount <= 0 || chunks.size != expectedChunkCount) return null
+    val sorted = chunks.sortedBy { it.chunkIndex }
+    for (i in sorted.indices) {
+      if (sorted[i].chunkIndex != i) return null
+    }
+    val assembled = sorted.joinToString(separator = "") { it.payload }
+    if (expectedChecksum.isNotBlank() && sha256Hex(assembled) != expectedChecksum) {
+      return null
+    }
+    val validJson = runCatching { JSONArray(assembled); true }.getOrDefault(false)
+    return if (validJson) assembled else null
+  }
+
+  data class LosslessLedgerPackage(
+    val inlineJson: String,
+    val chunks: List<String>,
+    val checksumSha256: String
+  )
+
+  fun packageForCloud(
+    rawJson: String,
+    maxChunkChars: Int = CLOUD_CHUNK_SIZE_CHARS
+  ): LosslessLedgerPackage {
+    val trimmed = rawJson.trim()
+    if (trimmed.isEmpty()) {
+      return LosslessLedgerPackage(inlineJson = "", chunks = emptyList(), checksumSha256 = "")
+    }
+    val checksum = sha256Hex(trimmed)
+    if (trimmed.length <= maxChunkChars) {
+      return LosslessLedgerPackage(
+        inlineJson = trimmed,
+        chunks = emptyList(),
+        checksumSha256 = checksum
+      )
+    }
+    val chunks = splitIntoLosslessChunks(trimmed, maxChunkChars).map { it.payload }
+    return LosslessLedgerPackage(
+      inlineJson = "",
+      chunks = chunks,
+      checksumSha256 = checksum
+    )
+  }
+
+  fun reassembleAndVerify(
+    chunks: List<String>,
+    expectedChecksumSha256: String
+  ): Result<String> {
+    if (chunks.isEmpty()) {
+      return Result.failure(IllegalStateException("Expected chunked findings ledger, but zero chunks were retrieved."))
+    }
+    val assembled = chunks.joinToString(separator = "")
+    if (expectedChecksumSha256.isNotBlank()) {
+      val actual = sha256Hex(assembled)
+      if (!actual.equals(expectedChecksumSha256, ignoreCase = true)) {
+        return Result.failure(
+          IllegalStateException("Findings ledger checksum mismatch: expected $expectedChecksumSha256, got $actual.")
+        )
+      }
+    }
+    return runCatching {
+      JSONArray(assembled)
+      assembled
     }
   }
 }
@@ -374,36 +506,48 @@ data class PaperReviewRubric(
       }
 
       return PaperReviewRubric(
-        methodology = methodologyScore,
-        methodologyJustification = extractJustification(
-          "Methodology",
-          cleanSnippet(review.keyMethodology, "Evaluated via methodological design & verification cascade.")
-        ),
-        clarity = clarityScore,
-        clarityJustification = extractJustification(
-          "Clarity",
-          cleanSnippet(review.copyeditSuggestions, "Evaluated via reporting clarity and academic copyediting pass.")
-        ),
-        significance = significanceScore,
-        significanceJustification = extractJustification(
-          "Significance",
-          cleanSnippet(review.coreContributions, "Evaluated via claimed contributions and applicability synthesis.")
-        ),
-        originality = originalityScore,
-        originalityJustification = extractJustification(
-          "Originality",
-          cleanSnippet(review.researchQuestion, "Evaluated via research question originality and novelty delta.")
-        ),
-        mathematicalRigor = mathScore,
-        mathematicalRigorJustification = extractJustification(
-          "Math",
-          cleanSnippet(review.mathAuditReport, "Evaluated via statistical and numerical consistency audit.")
-        ),
-        reproducibility = reproScore,
-        reproducibilityJustification = extractJustification(
-          "Reproducibility",
-          cleanSnippet(review.codeAuditReport, "Evaluated via protocol transparency and reproducibility audit.")
-        ),
+        methodology = if (review.methodologyScore in 1..10) review.methodologyScore else methodologyScore,
+        methodologyJustification = review.methodologyJustification.ifBlank {
+          extractJustification(
+            "Methodology",
+            cleanSnippet(review.keyMethodology, "Evaluated via methodological design & verification cascade.")
+          )
+        },
+        clarity = if (review.clarityScore in 1..10) review.clarityScore else clarityScore,
+        clarityJustification = review.clarityJustification.ifBlank {
+          extractJustification(
+            "Clarity",
+            cleanSnippet(review.copyeditSuggestions, "Evaluated via reporting clarity and academic copyediting pass.")
+          )
+        },
+        significance = if (review.significanceScore in 1..10) review.significanceScore else significanceScore,
+        significanceJustification = review.significanceJustification.ifBlank {
+          extractJustification(
+            "Significance",
+            cleanSnippet(review.coreContributions, "Evaluated via claimed contributions and applicability synthesis.")
+          )
+        },
+        originality = if (review.originalityScore in 1..10) review.originalityScore else originalityScore,
+        originalityJustification = review.originalityJustification.ifBlank {
+          extractJustification(
+            "Originality",
+            cleanSnippet(review.researchQuestion, "Evaluated via research question originality and novelty delta.")
+          )
+        },
+        mathematicalRigor = if (review.mathRigorScore in 1..10) review.mathRigorScore else mathScore,
+        mathematicalRigorJustification = review.mathRigorJustification.ifBlank {
+          extractJustification(
+            "Math",
+            cleanSnippet(review.mathAuditReport, "Evaluated via statistical and numerical consistency audit.")
+          )
+        },
+        reproducibility = if (review.reproducibilityScore in 1..10) review.reproducibilityScore else reproScore,
+        reproducibilityJustification = review.reproducibilityJustification.ifBlank {
+          extractJustification(
+            "Reproducibility",
+            cleanSnippet(review.codeAuditReport, "Evaluated via protocol transparency and reproducibility audit.")
+          )
+        },
         refereeConfidence = confidence,
         extractionConfidence = review.extractionConfidence.coerceIn(1, 5),
         overallCredibilityScore = exactComposite,
@@ -428,7 +572,7 @@ data class PaperReview(
   val userId: String = "",
   val title: String = "",
   val authors: String = "",
-  val publicationYear: String = "2026",
+  val publicationYear: String = "",
   val venueOrCitation: String = "",
   @get:PropertyName("isEmpirical") val isEmpirical: Boolean = true,
   val credibilityScore: Long = 75L,
@@ -451,8 +595,11 @@ data class PaperReview(
   val extractionConfidence: Int = 4,
   val reviewMode: String = ReviewMode.POST_PUBLICATION_APPRAISAL.name,
   val coverageDisclosure: String = "",
-  val validationStatus: String = "VERIFIED",
+  val validationStatus: String = "LEGACY_UNVALIDATED",
   val structuredFindingsJson: String = "",
+  val schemaVersion: Int = 5,
+  val findingsChunkCount: Int = 0,
+  val findingsChecksum: String = "",
   // Narrative dossier sections
   val abstractSummary: String = "",
   val researchQuestion: String = "",

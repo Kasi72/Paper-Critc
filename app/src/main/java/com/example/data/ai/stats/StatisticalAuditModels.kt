@@ -61,6 +61,14 @@ enum class TailSpecification {
   UNSPECIFIED
 }
 
+enum class IntervalType(val label: String) {
+  CONFIDENCE_INTERVAL("Confidence Interval (CI)"),
+  CREDIBLE_INTERVAL("Bayesian Credible Interval (CrI)"),
+  UNCERTAINTY_INTERVAL("Uncertainty Interval (UI)"),
+  PREDICTION_INTERVAL("Prediction Interval (PI)"),
+  UNSPECIFIED("Interval")
+}
+
 /**
  * Fine-grained sub-design classification enabling precision domain-specific statistical audits
  * across all major scientific & mathematical genres.
@@ -98,6 +106,7 @@ data class QuantitativeClaim(
   val ciLower: Double? = null,
   val ciUpper: Double? = null,
   val ciLevel: Double = 0.95,
+  val intervalType: IntervalType = IntervalType.UNSPECIFIED,
   val testStatisticName: String = "",
   val testStatisticValue: Double? = null,
   val degreesOfFreedom: Double? = null,

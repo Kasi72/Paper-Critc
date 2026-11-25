@@ -20,6 +20,9 @@ import com.example.data.ai.epistemic.ReportingStatus
 import com.example.data.model.FindingStatus
 import com.example.data.model.PaperReview
 import com.example.data.model.ReviewFinding
+import com.tom_roush.pdfbox.pdmodel.PDDocument
+import com.tom_roush.pdfbox.text.PDFTextStripper
+import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
@@ -64,7 +67,9 @@ data class PdfRenderDiagnostics(
   val rawHeaderCount: Int,
   val rawMarkdownRowCount: Int,
   val internalEnumCount: Int,
-  val clippedContentDetected: Boolean
+  val clippedContentDetected: Boolean,
+  val extractedFromPdfBytes: Boolean = false,
+  val pageCount: Int = 1
 ) {
   val isClean: Boolean
     get() = rawHeaderCount == 0 && rawMarkdownRowCount == 0 && internalEnumCount == 0 && !clippedContentDetected
@@ -95,7 +100,9 @@ object PdfReportExporter {
    */
   fun inspectRenderedText(
     extractedText: String,
-    clippedContentDetected: Boolean = false
+    clippedContentDetected: Boolean = false,
+    extractedFromPdfBytes: Boolean = false,
+    pageCount: Int = 1
   ): PdfRenderDiagnostics {
     val rawHeaders = rawHeaderScanRegex.findAll(extractedText).count()
     val rawRows = rawMarkdownRowScanRegex.findAll(extractedText).count()
@@ -104,12 +111,32 @@ object PdfReportExporter {
       rawHeaderCount = rawHeaders,
       rawMarkdownRowCount = rawRows,
       internalEnumCount = internalEnums,
-      clippedContentDetected = clippedContentDetected
+      clippedContentDetected = clippedContentDetected,
+      extractedFromPdfBytes = extractedFromPdfBytes,
+      pageCount = pageCount
     )
   }
 
   /**
-   * Renders [review] to PDF bytes and returns both the rendered PDF payload, the captured
+   * Attempts real byte-level PDF text extraction via PDFBox from rendered PDF bytes.
+   * Returns Pair(extractedText, pageCount) when [pdfBytes] is a standard PDF document with text,
+   * or null when running in headless bitmap-fallback test mode.
+   */
+  internal fun extractTextFromPdfBytes(pdfBytes: ByteArray): Pair<String, Int>? {
+    if (pdfBytes.size < 8) return null
+    val header = String(pdfBytes, 0, 5, Charsets.US_ASCII)
+    if (header != "%PDF-") return null
+    return runCatching {
+      PDDocument.load(ByteArrayInputStream(pdfBytes)).use { doc ->
+        val pages = doc.numberOfPages
+        val text = PDFTextStripper().getText(doc).orEmpty()
+        if (pages > 0 && text.isNotBlank()) text to pages else null
+      }
+    }.getOrNull()
+  }
+
+  /**
+   * Renders [review] to PDF bytes and returns both the rendered PDF payload, the captured/extracted
    * rendered text stream, and the P0.3 [PdfRenderDiagnostics] verification result.
    */
   data class RenderedPdfResult(
@@ -125,18 +152,30 @@ object PdfReportExporter {
   ): RenderedPdfResult {
     val baos = ByteArrayOutputStream()
     val textSink = StringBuilder()
+    val clipTracker = BooleanArray(1) { false }
+    val pageCountTracker = IntArray(1) { 1 }
     renderReviewToPdfStream(
       review = review,
       outputStream = baos,
       scope = scope,
       precomputedQuantBlocks = precomputedQuantBlocks,
-      renderedTextSink = textSink
+      renderedTextSink = textSink,
+      clippedContentTracker = clipTracker,
+      pageCountTracker = pageCountTracker
     )
-    val captured = textSink.toString()
-    val diag = inspectRenderedText(captured)
+    val bytes = baos.toByteArray()
+    val pdfBoxExtracted = extractTextFromPdfBytes(bytes)
+    val inspectedText = pdfBoxExtracted?.first ?: textSink.toString()
+    val resolvedPages = pdfBoxExtracted?.second ?: pageCountTracker[0].coerceAtLeast(1)
+    val diag = inspectRenderedText(
+      extractedText = inspectedText,
+      clippedContentDetected = clipTracker[0],
+      extractedFromPdfBytes = pdfBoxExtracted != null,
+      pageCount = resolvedPages
+    )
     return RenderedPdfResult(
-      pdfBytes = baos.toByteArray(),
-      renderedText = captured,
+      pdfBytes = bytes,
+      renderedText = inspectedText,
       diagnostics = diag
     )
   }
@@ -158,6 +197,7 @@ object PdfReportExporter {
 
   private const val MAX_CACHED_EXPORT_FILES = 12
   private const val MAX_CACHED_EXPORT_AGE_MS = 24L * 60L * 60L * 1000L
+  private const val MIN_ACTIVE_SHARE_RETENTION_MS = 60L * 60L * 1000L // Never evict PDFs shared within last 60 min
 
   internal fun generateUniqueExportFileName(
     title: String,
@@ -193,8 +233,16 @@ object PdfReportExporter {
       }?.sortedByDescending { it.lastModified() } ?: return
       existing.forEachIndexed { index, file ->
         if (file.absolutePath == keepFile.absolutePath) return@forEachIndexed
-        val isStale = (now - file.lastModified()) > MAX_CACHED_EXPORT_AGE_MS
-        if (index >= MAX_CACHED_EXPORT_FILES || isStale || file.name.endsWith(".tmp", ignoreCase = true)) {
+        val ageMs = (now - file.lastModified()).coerceAtLeast(0L)
+        if (file.name.endsWith(".tmp", ignoreCase = true)) {
+          if (ageMs > 5L * 60L * 1000L) file.delete()
+          return@forEachIndexed
+        }
+        // Conservative cleanup: never delete a PDF created within the last 60 minutes so
+        // concurrent Android share-sheet intents never lose their FileProvider stream mid-share.
+        if (ageMs < MIN_ACTIVE_SHARE_RETENTION_MS) return@forEachIndexed
+        val isStale = ageMs > MAX_CACHED_EXPORT_AGE_MS
+        if (index >= MAX_CACHED_EXPORT_FILES || isStale) {
           file.delete()
         }
       }
@@ -286,7 +334,9 @@ object PdfReportExporter {
     outputStream: OutputStream,
     scope: PdfExportScope = PdfExportScope.SCIENTIFIC_APPRAISAL_REPORT,
     precomputedQuantBlocks: List<ReportBlock>? = null,
-    renderedTextSink: StringBuilder? = null
+    renderedTextSink: StringBuilder? = null,
+    clippedContentTracker: BooleanArray? = null,
+    pageCountTracker: IntArray? = null
   ) {
     val document = PdfDocument()
     try {
@@ -1278,8 +1328,28 @@ object PdfReportExporter {
     } else {
       "Extraction Confidence: $authoritativeExtractionConf/5"
     }
+    val verifiedQuoteCount = findings.count { it.status == FindingStatus.VERIFIED && it.supportingEvidence.any { a -> a.exactQuote.isNotBlank() } }
+    val quoteVerificationLabel = when {
+      findings.isEmpty() -> "No structured quote ledger"
+      verifiedQuoteCount == findings.size -> "All ${findings.size} quotes matched"
+      else -> "$verifiedQuoteCount/${findings.size} quotes matched"
+    }
+    val scientificVerificationLabel = when (review.validationStatus.uppercase(Locale.US)) {
+      "VERIFIED" -> "Source-Anchored & Entailed"
+      "ADJUDICATED_WITH_CAVEATS" -> "Adjudicated with Caveats"
+      "PARTIALLY_VALIDATED" -> "Partially Validated"
+      "PROVISIONAL" -> "Provisional / Incomplete Coverage"
+      else -> "Legacy Unvalidated"
+    }
+    val editorialValidationLabel = when (review.validationStatus.uppercase(Locale.US)) {
+      "VERIFIED" -> "Editorial Gate Passed"
+      "LEGACY_UNVALIDATED" -> "Legacy Unvalidated"
+      else -> review.validationStatus.replace('_', ' ')
+    }
     val coverageText = buildString {
-      append("Validation Status: ${review.validationStatus.replace('_', ' ')}")
+      append("Source Quote Verification: $quoteVerificationLabel")
+      append("  |  Scientific Verification: $scientificVerificationLabel")
+      append("  |  Editorial Validation: $editorialValidationLabel")
       append("  |  $reconciledCoverageDisclosure")
       append("  |  Generated: $dateStr")
     }
@@ -1555,6 +1625,10 @@ object PdfReportExporter {
     }
 
     drawFooter(canvas, pageNumber)
+    if (cursorY > PAGE_HEIGHT - MARGIN_BOTTOM + 4f) {
+      clippedContentTracker?.set(0, true)
+    }
+    pageCountTracker?.set(0, pageNumber)
     if (!useBitmapFallback) {
       page?.let { document.finishPage(it) }
       document.writeTo(outputStream)

@@ -14,8 +14,8 @@ service cloud.firestore {
       return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
     }
 
-    function hasAllowedReviewKeys(data) {
-      return data.keys().hasOnly([
+    function hasAllowedReviewKeys(d) {
+      return d.keys().hasOnly([
         'userId', 'title', 'authors', 'publicationYear', 'venueOrCitation',
         'isEmpirical', 'credibilityScore', 'verdict',
         'methodologyScore', 'significanceScore', 'clarityScore',
@@ -24,6 +24,7 @@ service cloud.firestore {
         'originalityJustification', 'mathRigorJustification', 'reproducibilityJustification',
         'refereeConfidence', 'extractionConfidence', 'reviewMode',
         'coverageDisclosure', 'validationStatus', 'structuredFindingsJson',
+        'schemaVersion', 'findingsChunkCount', 'findingsChecksum',
         'abstractSummary', 'researchQuestion', 'keyMethodology', 'coreContributions',
         'redTeamCritique', 'blueTeamVerification', 'mathAuditReport',
         'codeAuditReport', 'editorNote', 'copyeditSuggestions',
@@ -33,74 +34,116 @@ service cloud.firestore {
     }
 
     function isModeAlignedVerdict(mode, verdict) {
-      return (verdict in ['INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT', 'PROVISIONAL_APPRAISAL_DESIGN_UNCERTAIN'] && mode in ['POST_PUBLICATION_APPRAISAL', 'JOURNAL_REFEREE', 'CLINICAL_EVIDENCE_APPRAISAL']) ||
-             (mode == 'POST_PUBLICATION_APPRAISAL' && verdict in ['HIGH_CREDIBILITY', 'SOUND_WITH_CAVEATS', 'REQUIRES_CORRECTION', 'MAJOR_CONCERNS', 'LOW_CREDIBILITY']) ||
-             (mode == 'JOURNAL_REFEREE' && verdict in ['ACCEPT', 'MINOR_REVISION', 'MINOR_REVISION_WITH_CAVEATS', 'MAJOR_REVISION', 'REJECT_AND_RESUBMIT', 'REJECT']) ||
-             (mode == 'CLINICAL_EVIDENCE_APPRAISAL' && verdict in ['HIGH_CERTAINTY', 'MODERATE_CERTAINTY', 'LOW_CERTAINTY', 'VERY_LOW_CERTAINTY']);
+      return (mode == 'POST_PUBLICATION_APPRAISAL' && verdict in ['HIGH_CREDIBILITY', 'SOUND_WITH_CAVEATS', 'REQUIRES_CORRECTION', 'MAJOR_CONCERNS', 'LOW_CREDIBILITY', 'INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT', 'PROVISIONAL_APPRAISAL_DESIGN_UNCERTAIN']) ||
+             (mode == 'JOURNAL_REFEREE' && verdict in ['ACCEPT', 'MINOR_REVISION', 'MINOR_REVISION_WITH_CAVEATS', 'MAJOR_REVISION', 'REJECT_AND_RESUBMIT', 'REJECT', 'INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT', 'PROVISIONAL_APPRAISAL_DESIGN_UNCERTAIN']) ||
+             (mode == 'CLINICAL_EVIDENCE_APPRAISAL' && verdict in ['HIGH_CERTAINTY', 'MODERATE_CERTAINTY', 'LOW_CERTAINTY', 'VERY_LOW_CERTAINTY', 'INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT', 'PROVISIONAL_APPRAISAL_DESIGN_UNCERTAIN']);
     }
 
-    function isLegacyReviewSchema(data) {
-      return !('reviewMode' in data) &&
-             !('methodologyScore' in data) &&
-             !('significanceScore' in data) &&
-             !('clarityScore' in data) &&
-             !('originalityScore' in data) &&
-             !('mathRigorScore' in data) &&
-             !('reproducibilityScore' in data) &&
-             data.verdict in ['ACCEPT', 'MINOR_REVISION', 'MAJOR_REVISION', 'REJECT_AND_RESUBMIT', 'REJECT'];
+    function isLegacyReviewSchema(d) {
+      return !d.keys().hasAny([
+               'methodologyScore', 'significanceScore', 'clarityScore',
+               'originalityScore', 'mathRigorScore', 'reproducibilityScore'
+             ]) &&
+             d.verdict in ['ACCEPT', 'MINOR_REVISION', 'MAJOR_REVISION', 'REJECT_AND_RESUBMIT', 'REJECT'];
     }
 
-    function isV4ConsistentReviewSchema(data) {
-      return 'reviewMode' in data &&
-             isModeAlignedVerdict(data.reviewMode, data.verdict) &&
-             data.methodologyScore is int && data.methodologyScore >= 1 && data.methodologyScore <= 10 &&
-             data.significanceScore is int && data.significanceScore >= 1 && data.significanceScore <= 10 &&
-             data.clarityScore is int && data.clarityScore >= 1 && data.clarityScore <= 10 &&
-             data.originalityScore is int && data.originalityScore >= 1 && data.originalityScore <= 10 &&
-             data.mathRigorScore is int && data.mathRigorScore >= 1 && data.mathRigorScore <= 10 &&
-             data.reproducibilityScore is int && data.reproducibilityScore >= 1 && data.reproducibilityScore <= 10 &&
-             data.credibilityScore == int((data.methodologyScore * 25 + data.significanceScore * 20 + data.clarityScore * 15 + data.originalityScore * 15 + data.mathRigorScore * 15 + data.reproducibilityScore * 10 + 5) / 10);
+    function isV4RubricConsistent(d) {
+      let m = d.methodologyScore;
+      let s = d.significanceScore;
+      let c = d.clarityScore;
+      let o = d.originalityScore;
+      let r = d.mathRigorScore;
+      let p = d.reproducibilityScore;
+      return m is int && m >= 1 && m <= 10 &&
+             s is int && s >= 1 && s <= 10 &&
+             c is int && c >= 1 && c <= 10 &&
+             o is int && o >= 1 && o <= 10 &&
+             r is int && r >= 1 && r <= 10 &&
+             p is int && p >= 1 && p <= 10 &&
+             d.credibilityScore == int((m * 25 + s * 20 + c * 15 + o * 15 + r * 15 + p * 10 + 5) / 10);
     }
 
-    function isValidCoreReview(data) {
-      return data.userId == request.auth.uid &&
-             data.title is string && data.title.size() >= 1 && data.title.size() <= 500 &&
-             data.authors is string && data.authors.size() >= 1 && data.authors.size() <= 500 &&
-             data.publicationYear is string && data.publicationYear.size() >= 1 && data.publicationYear.size() <= 20 &&
-             data.venueOrCitation is string && data.venueOrCitation.size() <= 500 &&
-             data.isEmpirical is bool &&
-             data.credibilityScore is int && data.credibilityScore >= 0 && data.credibilityScore <= 100 &&
-             (isV4ConsistentReviewSchema(data) || isLegacyReviewSchema(data)) &&
-             data.abstractSummary is string && data.abstractSummary.size() >= 1 && data.abstractSummary.size() <= 5000 &&
-             data.researchQuestion is string && data.researchQuestion.size() >= 1 && data.researchQuestion.size() <= 3000 &&
-             data.keyMethodology is string && data.keyMethodology.size() >= 1 && data.keyMethodology.size() <= 4000 &&
-             data.coreContributions is string && data.coreContributions.size() >= 1 && data.coreContributions.size() <= 6000 &&
-             data.redTeamCritique is string && data.redTeamCritique.size() >= 1 && data.redTeamCritique.size() <= 12000 &&
-             data.blueTeamVerification is string && data.blueTeamVerification.size() >= 1 && data.blueTeamVerification.size() <= 10000 &&
-             data.mathAuditReport is string && data.mathAuditReport.size() <= 8000 &&
-             data.codeAuditReport is string && data.codeAuditReport.size() <= 8000 &&
-             data.editorNote is string && data.editorNote.size() >= 1 && data.editorNote.size() <= 8000 &&
-             data.copyeditSuggestions is string && data.copyeditSuggestions.size() <= 8000 &&
-             data.reviewerQuestions is string && data.reviewerQuestions.size() <= 8000 &&
-             data.formattedDossier is string && data.formattedDossier.size() >= 1 && data.formattedDossier.size() <= 40000 &&
-             data.bookmarked is bool &&
-             data.personalNotes is string && data.personalNotes.size() <= 5000 &&
-             data.createdAt is timestamp && data.createdAt <= request.time &&
-             data.updatedAt is timestamp && data.updatedAt <= request.time;
+    function isValidCoreReview(d) {
+      return d.userId == request.auth.uid &&
+             d.title is string && d.title != '' && d.title.size() <= 500 &&
+             d.authors is string && d.authors != '' && d.authors.size() <= 500 &&
+             d.publicationYear is string && d.publicationYear.size() <= 40 &&
+             d.venueOrCitation is string && d.venueOrCitation.size() <= 500 &&
+             d.isEmpirical is bool &&
+             d.credibilityScore is int && d.credibilityScore >= 0 && d.credibilityScore <= 100 &&
+             (('reviewMode' in d)
+               ? (isModeAlignedVerdict(d.reviewMode, d.verdict) &&
+                  d.keys().hasAll(['methodologyScore', 'significanceScore', 'clarityScore', 'originalityScore', 'mathRigorScore', 'reproducibilityScore']) &&
+                  isV4RubricConsistent(d))
+               : isLegacyReviewSchema(d)) &&
+             d.abstractSummary is string && d.abstractSummary.size() <= 5000 &&
+             d.researchQuestion is string && d.researchQuestion.size() <= 3000 &&
+             d.keyMethodology is string && d.keyMethodology.size() <= 4000 &&
+             d.coreContributions is string && d.coreContributions.size() <= 6000 &&
+             d.redTeamCritique is string && d.redTeamCritique.size() <= 12000 &&
+             d.blueTeamVerification is string && d.blueTeamVerification.size() <= 10000 &&
+             d.mathAuditReport is string && d.mathAuditReport.size() <= 8000 &&
+             d.codeAuditReport is string && d.codeAuditReport.size() <= 8000 &&
+             d.editorNote is string && d.editorNote.size() <= 8000 &&
+             d.copyeditSuggestions is string && d.copyeditSuggestions.size() <= 8000 &&
+             d.reviewerQuestions is string && d.reviewerQuestions.size() <= 8000 &&
+             d.formattedDossier is string && d.formattedDossier != '' && d.formattedDossier.size() <= 40000 &&
+             d.bookmarked is bool &&
+             d.personalNotes is string && d.personalNotes.size() <= 5000 &&
+             d.createdAt is timestamp && d.createdAt <= request.time &&
+             d.updatedAt is timestamp && d.updatedAt <= request.time;
     }
 
-    function isValidProvenanceMeta(data) {
-      return data.get('methodologyJustification', '') is string && data.get('methodologyJustification', '').size() <= 4000 &&
-             data.get('significanceJustification', '') is string && data.get('significanceJustification', '').size() <= 4000 &&
-             data.get('clarityJustification', '') is string && data.get('clarityJustification', '').size() <= 4000 &&
-             data.get('originalityJustification', '') is string && data.get('originalityJustification', '').size() <= 4000 &&
-             data.get('mathRigorJustification', '') is string && data.get('mathRigorJustification', '').size() <= 4000 &&
-             data.get('reproducibilityJustification', '') is string && data.get('reproducibilityJustification', '').size() <= 4000 &&
-             data.get('refereeConfidence', 3) is int && data.get('refereeConfidence', 3) >= 1 && data.get('refereeConfidence', 3) <= 5 &&
-             data.get('extractionConfidence', 3) is int && data.get('extractionConfidence', 3) >= 1 && data.get('extractionConfidence', 3) <= 5 &&
-             data.get('coverageDisclosure', '') is string && data.get('coverageDisclosure', '').size() <= 2000 &&
-             data.get('validationStatus', 'PARTIALLY_VALIDATED') in ['VERIFIED', 'ADJUDICATED_WITH_CAVEATS', 'PARTIALLY_VALIDATED', 'PROVISIONAL', 'UNVERIFIED', 'LEGACY_UNVALIDATED', 'REQUIRES_REANALYSIS'] &&
-             data.get('structuredFindingsJson', '') is string && data.get('structuredFindingsJson', '').size() <= 60000;
+    function isValidJustifications(d) {
+      let mj = d.get('methodologyJustification', '');
+      let sj = d.get('significanceJustification', '');
+      let cj = d.get('clarityJustification', '');
+      let oj = d.get('originalityJustification', '');
+      let rj = d.get('mathRigorJustification', '');
+      let pj = d.get('reproducibilityJustification', '');
+      return mj is string && mj.size() <= 4000 &&
+             sj is string && sj.size() <= 4000 &&
+             cj is string && cj.size() <= 4000 &&
+             oj is string && oj.size() <= 4000 &&
+             rj is string && rj.size() <= 4000 &&
+             pj is string && pj.size() <= 4000;
+    }
+
+    function isValidAuditMeta(d) {
+      let rc = d.get('refereeConfidence', 3);
+      let ec = d.get('extractionConfidence', 3);
+      let cd = d.get('coverageDisclosure', '');
+      let sf = d.get('structuredFindingsJson', '');
+      let sv = d.get('schemaVersion', 5);
+      let fc = d.get('findingsChunkCount', 0);
+      let cs = d.get('findingsChecksum', '');
+      return rc is int && rc >= 1 && rc <= 5 &&
+             ec is int && ec >= 1 && ec <= 5 &&
+             cd is string && cd.size() <= 2000 &&
+             d.get('validationStatus', 'LEGACY_UNVALIDATED') in ['VERIFIED', 'ADJUDICATED_WITH_CAVEATS', 'PARTIALLY_VALIDATED', 'PROVISIONAL', 'UNVERIFIED', 'LEGACY_UNVALIDATED', 'REQUIRES_REANALYSIS'] &&
+             sf is string && sf.size() <= 60000 &&
+             sv is int && sv >= 1 && sv <= 20 &&
+             fc is int && fc >= 0 && fc <= 64 &&
+             cs is string && cs.size() <= 128;
+    }
+
+    function isValidPartialFieldUpdate(next, prev) {
+      let changed = next.diff(prev).affectedKeys();
+      return next.updatedAt is timestamp && next.updatedAt <= request.time &&
+             (
+               (changed.hasOnly(['bookmarked', 'updatedAt']) && next.bookmarked is bool) ||
+               (changed.hasOnly(['personalNotes', 'updatedAt']) && next.personalNotes is string && next.personalNotes.size() <= 5000)
+             );
+    }
+
+    function isValidFindingsChunk(d) {
+      return d.keys().hasOnly(['userId', 'chunkIndex', 'totalChunks', 'payload', 'checksum']) &&
+             d.userId == request.auth.uid &&
+             d.chunkIndex is int && d.chunkIndex >= 0 && d.chunkIndex < 64 &&
+             d.totalChunks is int && d.totalChunks >= 1 && d.totalChunks <= 64 &&
+             d.chunkIndex < d.totalChunks &&
+             d.payload is string && d.payload != '' && d.payload.size() <= 55000 &&
+             d.checksum is string && d.checksum.size() <= 128;
     }
 
     match /users/{userId}/reviews/{reviewId} {
@@ -111,17 +154,32 @@ service cloud.firestore {
                        isValidId(reviewId) &&
                        hasAllowedReviewKeys(request.resource.data) &&
                        isValidCoreReview(request.resource.data) &&
-                       isValidProvenanceMeta(request.resource.data);
+                       isValidJustifications(request.resource.data) &&
+                       isValidAuditMeta(request.resource.data);
 
       allow update: if isOwner(userId) &&
                        isValidId(reviewId) &&
-                       hasAllowedReviewKeys(request.resource.data) &&
-                       isValidCoreReview(request.resource.data) &&
-                       isValidProvenanceMeta(request.resource.data) &&
                        request.resource.data.userId == resource.data.userId &&
-                       request.resource.data.createdAt == resource.data.createdAt;
+                       request.resource.data.createdAt == resource.data.createdAt &&
+                       (
+                         isValidPartialFieldUpdate(request.resource.data, resource.data) ||
+                         (hasAllowedReviewKeys(request.resource.data) &&
+                          isValidCoreReview(request.resource.data) &&
+                          isValidJustifications(request.resource.data) &&
+                          isValidAuditMeta(request.resource.data))
+                       );
 
       allow delete: if isOwner(userId) && isValidId(reviewId) && resource.data.userId == request.auth.uid;
+
+      match /findings_chunks/{chunkId} {
+        allow get: if isOwner(userId) && isValidId(reviewId) && isValidId(chunkId) && resource.data.userId == request.auth.uid;
+        allow list: if isOwner(userId) && isValidId(reviewId);
+        allow create: if isOwner(userId) && isValidId(reviewId) && isValidId(chunkId) && isValidFindingsChunk(request.resource.data);
+        allow update: if isOwner(userId) && isValidId(reviewId) && isValidId(chunkId) &&
+                         isValidFindingsChunk(request.resource.data) &&
+                         request.resource.data.userId == resource.data.userId;
+        allow delete: if isOwner(userId) && isValidId(reviewId) && isValidId(chunkId) && resource.data.userId == request.auth.uid;
+      }
     }
   }
 }

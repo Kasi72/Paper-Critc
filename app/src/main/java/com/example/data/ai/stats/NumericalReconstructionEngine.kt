@@ -126,30 +126,54 @@ object NumericalReconstructionEngine {
     var idx = 1
     fun nextId() = "NR-%03d".format(Locale.US, idx++)
 
-    val activeClaims = ledger.claims.filter { !it.isFromReferenceOrCitation }
+    val activeClaims = ledger.claims
+      .filter { !it.isFromReferenceOrCitation }
+      .sortedWith(
+        compareBy<QuantitativeClaim>(
+          { claim ->
+            when (claim.hierarchy) {
+              AnalysisHierarchy.PRIMARY -> 0
+              AnalysisHierarchy.SECONDARY -> 1
+              AnalysisHierarchy.UNSPECIFIED -> 2
+              AnalysisHierarchy.SENSITIVITY -> 3
+              AnalysisHierarchy.SUBGROUP -> 4
+              AnalysisHierarchy.EXPLORATORY -> 5
+            }
+          },
+          { claim ->
+            when {
+              claim.section.contains("Result", ignoreCase = true) -> 0
+              claim.section.contains("Abstract", ignoreCase = true) -> 1
+              claim.section.contains("Table", ignoreCase = true) -> 2
+              else -> 3
+            }
+          },
+          { it.startOffset }
+        )
+      )
 
     // 1. Test-statistic reconstructions (t, z, chi2, F, r) with one-sided/two-sided & custom alpha
     activeClaims.filter { it.testStatisticName.isNotBlank() && it.testStatisticValue != null && it.pValue != null }
-      .take(20)
+      .take(150)
       .forEach { claim ->
         reconstructTestStatistic(nextId(), claim)?.let { results.add(it) }
       }
 
     // 2. 2x2 Table reconstructions (OR, RR, ARR, NNT, chi2, Exact Fisher)
-    ledger.twoByTwoTables.take(10).forEach { tbl ->
+    ledger.twoByTwoTables.take(60).forEach { tbl ->
       results.addAll(reconstructTwoByTwoTable(tbl, ::nextId))
     }
 
     // 3. Binomial proportions (x/n vs reported %) & Wilson 95% CI
     activeClaims.filter { it.numerator != null && it.denominator != null && it.effectMeasure == "Proportion (%)" }
-      .take(12)
+      .take(150)
       .forEach { claim ->
         reconstructProportion(nextId(), claim)?.let { results.add(it) }
       }
 
     // 4. Regression beta / SE / Wald z / CI reconstruction
     activeClaims.filter { it.effectMeasure.equals("beta", true) && it.pointEstimate != null && it.standardError != null }
-      .take(12)
+      .take(150)
       .forEach { claim ->
         reconstructRegressionClaim(nextId(), claim)?.let { results.add(it) }
       }
@@ -159,7 +183,7 @@ object NumericalReconstructionEngine {
       it.pointEstimate != null && it.ciLower != null && it.ciUpper != null &&
         it.parseStatus != ClaimParseStatus.AMBIGUOUS &&
         it.effectMeasure.uppercase(Locale.US) in setOf("OR", "AOR", "RR", "ARR", "HR", "AHR", "IRR", "PR")
-    }.take(14).forEach { claim ->
+    }.take(150).forEach { claim ->
       reconstructRatioOrSurvivalCi(nextId(), claim)?.let { results.add(it) }
     }
 
@@ -972,6 +996,12 @@ object NumericalReconstructionEngine {
     val alphaLevel = (1.0 - claim.ciLevel).coerceIn(0.001, 0.25)
     val ciPctLabel = "${(claim.ciLevel * 100.0).roundToInt()}%"
     val quoteLower = claim.sourceQuote.lowercase(Locale.US)
+    val isNonFrequentistInterval = claim.intervalType in setOf(
+      IntervalType.CREDIBLE_INTERVAL,
+      IntervalType.UNCERTAINTY_INTERVAL,
+      IntervalType.PREDICTION_INTERVAL
+    ) || Regex("""\b(?:CrI|UI|PI|credible\s+interval|uncertainty\s+interval|prediction\s+interval)\b""", RegexOption.IGNORE_CASE)
+      .containsMatchIn(claim.sourceQuote)
     val isAdjustedP = Regex(
       """\b(?:adjusted\s+p|p[\s_-]?adj|bonferroni|holm|hochberg|benjamini|fdr|q[\s-]?value|multiplicity[- ]adjusted|corrected\s+p)\b""",
       RegexOption.IGNORE_CASE
@@ -987,10 +1017,26 @@ object NumericalReconstructionEngine {
     val lowerAlphaMargin = alphaLevel * 0.75
     val rawPDisagreesWithCi = repP != null && claim.pValueOperator == "=" &&
       ((ciExcludesNull && repP > upperAlphaMargin) || (ciIncludesNull && repP < lowerAlphaMargin))
-    val pContradictsCi = rawPDisagreesWithCi && !isAdjustedP && !isOneSided
-    val pRequiresProcedureVerification = rawPDisagreesWithCi && (isAdjustedP || isOneSided)
+    val pContradictsCi = rawPDisagreesWithCi && !isNonFrequentistInterval && !isAdjustedP && !isOneSided
+    val pRequiresProcedureVerification = rawPDisagreesWithCi && !isNonFrequentistInterval && (isAdjustedP || isOneSided)
 
     return when {
+      isNonFrequentistInterval -> NumericalReconstructionResult(
+        checkId = checkId,
+        calculatorName = "Bayesian / Predictive Interval Geometry ($label • ${claim.intervalType.label})",
+        reportedValue = claim.sourceQuote,
+        recomputedValue = "Ordered positive bounds [$lo, $hi] containing $label=$est; frequentist Wald CI-vs-p test not applicable to ${claim.intervalType.label}.",
+        tolerance = "Interval bound ordering (Bayesian/predictive guard)",
+        sourceEvidence = claim.sourceQuote,
+        pageNumber = claim.page,
+        section = claim.section,
+        assumptions = listOf("Interval explicitly reported as ${claim.intervalType.label}; frequentist Wald two-sided p-value equivalence does not apply."),
+        status = QuantFindingStatus.PASS,
+        findingType = StatisticalFindingType.PASS,
+        scientificConsequence = "Bounds are geometrically valid; frequentist CI-vs-p contradiction rules are intentionally suppressed for Bayesian credible, uncertainty, and prediction intervals.",
+        detail = "$label=$est (${claim.intervalType.label} $lo–$hi) is properly ordered; skipped frequentist Wald CI-vs-p contradiction flag.",
+        assumptionContract = ratioContract
+      )
       pContradictsCi && repP != null -> NumericalReconstructionResult(
         checkId = checkId,
         calculatorName = "Ratio / Survival CI-vs-p ($label)",

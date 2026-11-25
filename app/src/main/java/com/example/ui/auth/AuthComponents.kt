@@ -292,8 +292,10 @@ fun GoogleCloudSyncDialog(
   userEmail: String,
   syncedCount: Int,
   unsyncedLocalCount: Int,
+  adoptableAnonymousCount: Int = 0,
   isSyncing: Boolean,
   onSyncNow: () -> Unit,
+  onAdoptAnonymousReviews: () -> Unit = {},
   onSignOut: () -> Unit,
   onDismiss: () -> Unit
 ) {
@@ -387,6 +389,14 @@ fun GoogleCloudSyncDialog(
             containerColor = com.example.ui.theme.CupertinoBlue
           )
 
+          if (adoptableAnonymousCount > 0) {
+            com.example.ui.components.IosSecondarySquircleButton(
+              text = "Adopt $adoptableAnonymousCount Local Signed-Out Draft(s)",
+              onClick = onAdoptAnonymousReviews,
+              tintColor = com.example.ui.theme.CupertinoBlue
+            )
+          }
+
           com.example.ui.components.IosSecondarySquircleButton(
             text = "Sign Out of Google Account",
             onClick = {
@@ -397,7 +407,7 @@ fun GoogleCloudSyncDialog(
           )
         } else {
           Text(
-            text = "Sign in with your Google account to automatically back up your 30-stage referee dossiers, bookmarks, and revision notes to Firebase Firestore and access them on any Android device.",
+            text = "Sign in with your Google account to back up this account's referee dossiers, bookmarks, and revision notes to Firebase Firestore across devices.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
           )
@@ -409,7 +419,7 @@ fun GoogleCloudSyncDialog(
               modifier = Modifier.fillMaxWidth()
             ) {
               Text(
-                text = "You have $unsyncedLocalCount unsynced dossier(s) in this session that will automatically upload upon sign-in.",
+                text = "You have $unsyncedLocalCount local signed-out dossier(s). They remain strictly local after sign-in unless you explicitly choose to adopt them into your account.",
                 style = MaterialTheme.typography.labelSmall,
                 color = com.example.ui.theme.CupertinoBlue,
                 modifier = Modifier.padding(10.dp)

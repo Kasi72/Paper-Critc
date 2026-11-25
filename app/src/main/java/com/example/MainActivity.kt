@@ -58,6 +58,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -191,12 +192,14 @@ class MainActivity : ComponentActivity() {
       }
 
       MyApplicationTheme(darkTheme = useDarkTheme) {
-        PaperCriticAuthenticatedShell(
-          viewModel = viewModel,
-          isSignedIn = currentUser != null,
-          userDisplayName = currentUser?.displayName ?: "",
-          userEmail = currentUser?.email ?: ""
-        )
+        key(currentUser?.uid ?: "__local_anonymous__") {
+          PaperCriticAuthenticatedShell(
+            viewModel = viewModel,
+            isSignedIn = currentUser != null,
+            userDisplayName = currentUser?.displayName ?: "",
+            userEmail = currentUser?.email ?: ""
+          )
+        }
       }
     }
   }
@@ -266,6 +269,7 @@ fun PaperCriticAuthenticatedShell(
   val apiTestResultMessage by viewModel.apiTestResultMessage.collectAsStateWithLifecycle()
   val statusBanner by viewModel.statusBanner.collectAsStateWithLifecycle()
   val unsyncedLocalCount by viewModel.unsyncedLocalCount.collectAsStateWithLifecycle()
+  val adoptableAnonymousReviews by viewModel.adoptableAnonymousReviews.collectAsStateWithLifecycle()
   val isSyncingPortfolio by viewModel.isSyncingPortfolio.collectAsStateWithLifecycle()
 
   var showCloudSyncDialog by remember { mutableStateOf(false) }
@@ -291,8 +295,10 @@ fun PaperCriticAuthenticatedShell(
       userEmail = userEmail,
       syncedCount = allReviews.count { !it.id.startsWith("local_") && it.id.isNotBlank() },
       unsyncedLocalCount = unsyncedLocalCount,
+      adoptableAnonymousCount = adoptableAnonymousReviews.size,
       isSyncing = isSyncingPortfolio,
       onSyncNow = viewModel::syncPortfolioToCloud,
+      onAdoptAnonymousReviews = { viewModel.adoptAnonymousReviewsForCurrentUser() },
       onSignOut = {
         signOut(credentialManager = credentialManager, scope = scope)
       },
@@ -471,8 +477,10 @@ fun PaperCriticAuthenticatedShell(
                 userEmail = userEmail,
                 syncedReviewCount = allReviews.count { !it.id.startsWith("local_") && it.id.isNotBlank() },
                 unsyncedLocalCount = unsyncedLocalCount,
+                adoptableAnonymousCount = adoptableAnonymousReviews.size,
                 isSyncingPortfolio = isSyncingPortfolio,
                 onSyncPortfolioNow = viewModel::syncPortfolioToCloud,
+                onAdoptAnonymousReviews = { viewModel.adoptAnonymousReviewsForCurrentUser() },
                 onUpdateSettings = viewModel::updateSettings,
                 onSelectActiveProvider = viewModel::selectActiveApiProvider,
                 onSaveProvider = viewModel::saveOrUpdateApiProvider,

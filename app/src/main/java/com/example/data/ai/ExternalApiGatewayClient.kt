@@ -473,12 +473,18 @@ object ExternalApiGatewayClient {
   private fun readStreamBoundedUtf8(input: InputStream, maxBytes: Int): String {
     val out = ByteArrayOutputStream()
     val buffer = ByteArray(8192)
-    var remaining = maxBytes
-    while (remaining > 0) {
-      val read = input.read(buffer, 0, minOf(buffer.size, remaining))
+    var totalRead = 0
+    while (totalRead <= maxBytes) {
+      val toRead = minOf(buffer.size, (maxBytes + 1) - totalRead)
+      val read = input.read(buffer, 0, toRead)
       if (read <= 0) break
+      if (totalRead + read > maxBytes) {
+        throw IllegalStateException(
+          "Provider HTTP response exceeded the ${maxBytes / (1024 * 1024)} MB safety limit and was truncated; aborting to prevent corrupted partial JSON."
+        )
+      }
       out.write(buffer, 0, read)
-      remaining -= read
+      totalRead += read
     }
     return out.toByteArray().toString(Charsets.UTF_8)
   }

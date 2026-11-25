@@ -1,21 +1,37 @@
-# Add project specific ProGuard rules here.
-# You can control the set of applied configuration files using the
-# proguardFiles setting in build.gradle.
-#
-# For more details, see
-#   http://developer.android.com/guide/developing/tools/proguard.html
+# Paper Critic Release R8 / ProGuard Keep Rules
+# Preserve stack trace line numbers for crash diagnostics
+-keepattributes SourceFile,LineNumberTable
+-renamesourcefileattribute SourceFile
+-keepattributes *Annotation*,Signature,InnerClasses,EnclosingMethod
 
-# If your project uses WebView with JS, uncomment the following
-# and specify the fully qualified class name to the JavaScript interface
-# class:
-#-keepclassmembers class fqcn.of.javascript.interface.for.webview {
-#   public *;
-#}
+# Firestore & Data Models (reflection/POJO/enum serialization)
+-keep class com.example.data.model.** { *; }
+-keepclassmembers enum com.example.data.model.** {
+    public static **[] values();
+    public static ** valueOf(java.lang.String);
+}
 
-# Uncomment this to preserve the line number information for
-# debugging stack traces.
-#-keepattributes SourceFile,LineNumberTable
+# Room Database Entities, DAOs, and Generated Impl
+-keep class com.example.data.local.** { *; }
+-keep class * extends androidx.room.RoomDatabase
+-dontwarn androidx.room.paging.**
 
-# If you keep the line number information, uncomment this to
-# hide the original source file name.
-#-renamesourcefileattribute SourceFile
+# PDFBox-Android font/encoding & parser classes
+-keep class com.tom_roush.pdfbox.** { *; }
+-keep class com.tom_roush.fontbox.** { *; }
+-dontwarn com.tom_roush.pdfbox.**
+-dontwarn com.tom_roush.fontbox.**
+-dontwarn org.bouncycastle.**
+
+# Firebase AI Logic, Auth, Firestore, App Check, Credentials
+-keep class com.google.firebase.** { *; }
+-keep class androidx.credentials.** { *; }
+-keep class com.google.android.libraries.identity.googleid.** { *; }
+-dontwarn com.google.firebase.**
+
+# Kotlin Coroutines
+-keepnames class kotlinx.coroutines.internal.MainDispatcherFactory {}
+-keepnames class kotlinx.coroutines.CoroutineExceptionHandler {}
+-keepclassmembers class kotlinx.coroutines.** {
+    volatile <fields>;
+}

@@ -6,6 +6,7 @@ import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import com.example.data.ai.ManuscriptForensicEngine
 import com.example.data.ai.Reviewer2PipelineService
+import com.example.data.local.ANONYMOUS_OWNER_SCOPE
 import com.example.data.local.ApiKeyVault
 import com.example.data.local.CredentialStorageUnavailableException
 import com.example.data.local.KeyDecryptOutcome
@@ -133,7 +134,7 @@ class ExampleRobolectricTest {
       )
 
       db.sqlDao().upsertReview(SqlReviewCacheEntity.fromPaperReview(review))
-      val loadedEntity = db.sqlDao().getReviewById("room-v4-test-1")
+      val loadedEntity = db.sqlDao().getReviewByIdForOwner("room-v4-test-1", "local-user")
       assertNotNull(loadedEntity)
 
       val loaded = loadedEntity!!.toPaperReview()

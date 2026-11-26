@@ -12,6 +12,7 @@ import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
+import com.example.data.model.LedgerLoadState
 import com.example.data.model.PaperReview
 import com.example.data.model.ReviewMode
 import com.google.firebase.Timestamp
@@ -58,6 +59,9 @@ data class SqlReviewCacheEntity(
   val schemaVersion: Int = 1,
   val findingsChunkCount: Int = 0,
   val findingsChecksum: String = "",
+  val narrativeChunkCount: Int = 0,
+  val narrativeChecksum: String = "",
+  val ledgerLoadState: String = LedgerLoadState.COMPLETE.name,
   val abstractSummary: String,
   val researchQuestion: String,
   val keyMethodology: String,
@@ -72,6 +76,9 @@ data class SqlReviewCacheEntity(
   val formattedDossier: String,
   val bookmarked: Boolean,
   val personalNotes: String,
+  val bookmarkDirty: Boolean = false,
+  val personalNotesDirty: Boolean = false,
+  val localAnnotationUpdatedAtMs: Long = 0L,
   val searchGroundingReport: String = "",
   val createdAtSeconds: Long = System.currentTimeMillis() / 1000L,
   val createdAtNanos: Int = 0,
@@ -115,6 +122,8 @@ data class SqlReviewCacheEntity(
       schemaVersion = schemaVersion,
       findingsChunkCount = findingsChunkCount,
       findingsChecksum = findingsChecksum,
+      narrativeChunkCount = narrativeChunkCount,
+      narrativeChecksum = narrativeChecksum,
       abstractSummary = abstractSummary,
       researchQuestion = researchQuestion,
       keyMethodology = keyMethodology,
@@ -130,7 +139,8 @@ data class SqlReviewCacheEntity(
       bookmarked = bookmarked,
       personalNotes = personalNotes,
       createdAt = safeCreatedAt,
-      updatedAt = safeUpdatedAt
+      updatedAt = safeUpdatedAt,
+      ledgerLoadState = LedgerLoadState.fromNameOrDefault(ledgerLoadState)
     )
   }
 
@@ -138,7 +148,10 @@ data class SqlReviewCacheEntity(
     fun fromPaperReview(
       review: PaperReview,
       ownerScope: String = normalizeOwnerScope(review.userId),
-      searchGroundingReport: String = ""
+      searchGroundingReport: String = "",
+      bookmarkDirty: Boolean = false,
+      personalNotesDirty: Boolean = false,
+      localAnnotationUpdatedAtMs: Long = 0L
     ): SqlReviewCacheEntity {
       val rubric = review.toRubric()
       val stableId = review.id.ifBlank { "sql_${java.util.UUID.randomUUID()}" }
@@ -175,6 +188,9 @@ data class SqlReviewCacheEntity(
         schemaVersion = review.schemaVersion,
         findingsChunkCount = review.findingsChunkCount,
         findingsChecksum = review.findingsChecksum,
+        narrativeChunkCount = review.narrativeChunkCount,
+        narrativeChecksum = review.narrativeChecksum,
+        ledgerLoadState = review.ledgerLoadState.name,
         abstractSummary = review.abstractSummary,
         researchQuestion = review.researchQuestion,
         keyMethodology = review.keyMethodology,
@@ -189,6 +205,9 @@ data class SqlReviewCacheEntity(
         formattedDossier = review.formattedDossier,
         bookmarked = review.bookmarked,
         personalNotes = review.personalNotes,
+        bookmarkDirty = bookmarkDirty,
+        personalNotesDirty = personalNotesDirty,
+        localAnnotationUpdatedAtMs = localAnnotationUpdatedAtMs,
         searchGroundingReport = searchGroundingReport,
         createdAtSeconds = review.createdAt?.seconds ?: 0L,
         createdAtNanos = review.createdAt?.nanoseconds ?: 0,
@@ -287,26 +306,50 @@ interface PaperCriticSqlDao {
   suspend fun upsertReviews(entities: List<SqlReviewCacheEntity>)
 
   @Query(
-    "UPDATE sql_review_cache SET bookmarked = :bookmarked, updatedAtEpochMs = :updatedAtEpochMs " +
+    "UPDATE sql_review_cache SET bookmarked = :bookmarked, bookmarkDirty = :dirty, " +
+      "localAnnotationUpdatedAtMs = :updatedAtEpochMs, updatedAtEpochMs = :updatedAtEpochMs " +
       "WHERE id = :reviewId AND ownerScope = :ownerScope"
   )
   suspend fun updateBookmarkForOwner(
     reviewId: String,
     ownerScope: String,
     bookmarked: Boolean,
+    dirty: Boolean = true,
     updatedAtEpochMs: Long = System.currentTimeMillis()
   ): Int
 
   @Query(
-    "UPDATE sql_review_cache SET personalNotes = :personalNotes, updatedAtEpochMs = :updatedAtEpochMs " +
+    "UPDATE sql_review_cache SET personalNotes = :personalNotes, personalNotesDirty = :dirty, " +
+      "localAnnotationUpdatedAtMs = :updatedAtEpochMs, updatedAtEpochMs = :updatedAtEpochMs " +
       "WHERE id = :reviewId AND ownerScope = :ownerScope"
   )
   suspend fun updatePersonalNotesForOwner(
     reviewId: String,
     ownerScope: String,
     personalNotes: String,
+    dirty: Boolean = true,
     updatedAtEpochMs: Long = System.currentTimeMillis()
   ): Int
+
+  @Query(
+    "UPDATE sql_review_cache SET bookmarkDirty = 0 WHERE id = :reviewId AND ownerScope = :ownerScope"
+  )
+  suspend fun clearBookmarkDirtyForOwner(reviewId: String, ownerScope: String)
+
+  @Query(
+    "UPDATE sql_review_cache SET personalNotesDirty = 0 WHERE id = :reviewId AND ownerScope = :ownerScope"
+  )
+  suspend fun clearPersonalNotesDirtyForOwner(reviewId: String, ownerScope: String)
+
+  @Query(
+    "SELECT * FROM sql_review_cache WHERE ownerScope = :ownerScope AND (bookmarkDirty = 1 OR personalNotesDirty = 1)"
+  )
+  suspend fun getDirtyAnnotationReviewsForOwner(ownerScope: String): List<SqlReviewCacheEntity>
+
+  @Query(
+    "UPDATE sql_review_cache SET searchGroundingReport = :report WHERE id = :reviewId AND ownerScope = :ownerScope"
+  )
+  suspend fun updateSearchGroundingReportForOwner(reviewId: String, ownerScope: String, report: String): Int
 
   @Query("DELETE FROM sql_review_cache WHERE id = :reviewId AND ownerScope = :ownerScope")
   suspend fun deleteReviewByIdForOwner(reviewId: String, ownerScope: String)
@@ -364,6 +407,18 @@ interface PaperCriticSqlDao {
 
   @Query("DELETE FROM sql_api_providers WHERE id = :providerId AND ownerScope = :ownerScope")
   suspend fun deleteApiProviderForOwner(providerId: String, ownerScope: String)
+
+  @Query(
+    "SELECT COUNT(*) FROM sql_api_providers " +
+      "WHERE ownerScope = '$ANONYMOUS_OWNER_SCOPE' AND protocolTypeName != 'FIREBASE_AI_LOGIC_KEYLESS' AND TRIM(apiKey) != ''"
+  )
+  fun observeAnonymousCustomProviderCount(): Flow<Int>
+
+  @Query(
+    "SELECT * FROM sql_api_providers " +
+      "WHERE ownerScope = '$ANONYMOUS_OWNER_SCOPE' AND protocolTypeName != 'FIREBASE_AI_LOGIC_KEYLESS' AND TRIM(apiKey) != ''"
+  )
+  suspend fun getAnonymousCustomProvidersOnce(): List<SqlApiProviderEntity>
 }
 
 @Database(
@@ -372,7 +427,7 @@ interface PaperCriticSqlDao {
     SqlChatMessageEntity::class,
     SqlApiProviderEntity::class
   ],
-  version = 7,
+  version = 8,
   exportSchema = false
 )
 abstract class PaperCriticSqlDatabase : RoomDatabase() {
@@ -569,6 +624,23 @@ abstract class PaperCriticSqlDatabase : RoomDatabase() {
       }
     }
 
+    /**
+     * Non-destructive v7 -> v8 upgrade:
+     * - Adds narrative chunking metadata + explicit [ledgerLoadState] column.
+     * - Adds durable local dirty-field outbox columns ([bookmarkDirty], [personalNotesDirty],
+     *   [localAnnotationUpdatedAtMs]) so cloud refreshes never overwrite newer offline edits.
+     */
+    val MIGRATION_7_8 = object : Migration(7, 8) {
+      override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE sql_review_cache ADD COLUMN narrativeChunkCount INTEGER NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE sql_review_cache ADD COLUMN narrativeChecksum TEXT NOT NULL DEFAULT ''")
+        db.execSQL("ALTER TABLE sql_review_cache ADD COLUMN ledgerLoadState TEXT NOT NULL DEFAULT 'COMPLETE'")
+        db.execSQL("ALTER TABLE sql_review_cache ADD COLUMN bookmarkDirty INTEGER NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE sql_review_cache ADD COLUMN personalNotesDirty INTEGER NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE sql_review_cache ADD COLUMN localAnnotationUpdatedAtMs INTEGER NOT NULL DEFAULT 0")
+      }
+    }
+
     fun getDatabase(context: Context): PaperCriticSqlDatabase {
       return INSTANCE ?: synchronized(this) {
         val instance = Room.databaseBuilder(
@@ -576,7 +648,7 @@ abstract class PaperCriticSqlDatabase : RoomDatabase() {
           PaperCriticSqlDatabase::class.java,
           "paper_critic_sql_database"
         )
-          .addMigrations(MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7)
+          .addMigrations(MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8)
           .build()
         INSTANCE = instance
         instance

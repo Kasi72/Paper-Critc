@@ -192,6 +192,8 @@ fun ArchiveScreen(
     }
   }
 
+  val assessedReviews = remember(allReviews) { allReviews.filter { !it.isUnassessed() } }
+
   val historySubTabs = listOf(
     IosSubTabEntry(
       title = "Dossiers",
@@ -201,7 +203,7 @@ fun ArchiveScreen(
     IosSubTabEntry(
       title = "Stats",
       icon = Icons.Default.Analytics,
-      badge = if (allReviews.isNotEmpty()) "${allReviews.map { it.credibilityScore }.average().toInt()}%" else null
+      badge = if (assessedReviews.isNotEmpty()) "${assessedReviews.map { it.credibilityScore }.average().toInt()}%" else if (allReviews.isNotEmpty()) "N/A" else null
     ),
     IosSubTabEntry(
       title = "Sync",
@@ -387,12 +389,32 @@ fun ArchiveScreen(
                           )
                         }
                       }
+                      if (itemReview.ledgerLoadState != com.example.data.model.LedgerLoadState.COMPLETE) {
+                        val degradedShape = SquircleShape(cornerRadius = 6.dp, smoothing = 0.88f)
+                        Box(
+                          modifier = Modifier
+                            .clip(degradedShape)
+                            .background(CupertinoAmber.copy(alpha = 0.14f))
+                            .border(0.5.dp, CupertinoAmber.copy(alpha = 0.40f), degradedShape)
+                            .padding(horizontal = 6.dp, vertical = 4.dp)
+                        ) {
+                          Text(
+                            text = "INCOMPLETE",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontFamily = JetBrainsMonoFamily,
+                            fontSize = 8.5.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = CupertinoAmber
+                          )
+                        }
+                      }
                     }
 
                     Row(
                       verticalAlignment = Alignment.CenterVertically,
                       horizontalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
+                      val isItemUnassessed = itemReview.isUnassessed()
                       Box(
                         modifier = Modifier
                           .neuRecessed(
@@ -403,11 +425,11 @@ fun ArchiveScreen(
                           .padding(horizontal = 9.dp, vertical = 4.5.dp)
                       ) {
                         Text(
-                          text = "${itemReview.credibilityScore}/100",
+                          text = if (isItemUnassessed) "N/A" else "${itemReview.credibilityScore}/100",
                           fontFamily = JetBrainsMonoFamily,
                           style = MaterialTheme.typography.labelSmall,
                           fontWeight = FontWeight.ExtraBold,
-                          color = CupertinoBlue
+                          color = if (isItemUnassessed) CupertinoAmber else CupertinoBlue
                         )
                       }
                       IconButton(
@@ -496,17 +518,22 @@ fun ArchiveScreen(
 
       1 -> {
         item {
+          val unassessedCount = allReviews.size - assessedReviews.size
           IosGroupedCard(
-            header = "Portfolio Rubric Averages (${allReviews.size} Reviewed Papers)"
+            header = "Portfolio Rubric Averages (${assessedReviews.size} Assessed Papers)"
           ) {
-            if (allReviews.isEmpty()) {
+            if (assessedReviews.isEmpty()) {
               Text(
-                text = "Analyze at least one paper to compute portfolio-wide rubric statistics across Methodology, Significance, Clarity, Originality, Mathematical Rigor, and Reproducibility.",
+                text = if (unassessedCount > 0) {
+                  "$unassessedCount readiness-blocked draft(s) are excluded from portfolio rubric averages. Upload a readable full manuscript to compute scored portfolio metrics."
+                } else {
+                  "Analyze at least one paper to compute portfolio-wide rubric statistics across Methodology, Significance, Clarity, Originality, Mathematical Rigor, and Reproducibility."
+                },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
               )
             } else {
-              val rubrics = remember(allReviews) { allReviews.map { it.toRubric() } }
+              val rubrics = remember(assessedReviews) { assessedReviews.map { it.toRubric() } }
               val avgCredibility = rubrics.map { it.overallCredibilityScore }.average().toInt()
               val avgMethodology = rubrics.map { it.methodology }.average()
               val avgSignificance = rubrics.map { it.significance }.average()
@@ -523,6 +550,13 @@ fun ArchiveScreen(
                   fontWeight = FontWeight.Bold,
                   color = CupertinoBlue
                 )
+                if (unassessedCount > 0) {
+                  Text(
+                    text = "Excluded $unassessedCount unassessed readiness-blocked draft(s) from mean scores.",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                  )
+                }
 
                 val metrics = listOf(
                   Triple("Methodology", avgMethodology, CupertinoIndigo),
@@ -745,9 +779,11 @@ fun IosSettingsScreen(
   syncedReviewCount: Int = 0,
   unsyncedLocalCount: Int = 0,
   adoptableAnonymousCount: Int = 0,
+  anonymousCustomProviderCount: Int = 0,
   isSyncingPortfolio: Boolean = false,
   onSyncPortfolioNow: () -> Unit = {},
   onAdoptAnonymousReviews: () -> Unit = {},
+  onAdoptAnonymousApiProviders: () -> Unit = {},
   onUpdateSettings: ((AppSettingsState) -> AppSettingsState) -> Unit,
   onSelectActiveProvider: (String) -> Unit = {},
   onSaveProvider: (AiApiProviderEntry) -> Unit = {},
@@ -1127,6 +1163,8 @@ fun IosSettingsScreen(
             apiProviders = apiProviders,
             isTestingApiKey = isTestingApiKey,
             apiTestResultMessage = apiTestResultMessage,
+            anonymousCustomProviderCount = anonymousCustomProviderCount,
+            onAdoptAnonymousApiProviders = onAdoptAnonymousApiProviders,
             onUpdateSettings = onUpdateSettings,
             onSelectActiveProvider = onSelectActiveProvider,
             onSaveProvider = onSaveProvider,

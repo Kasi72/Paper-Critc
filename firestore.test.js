@@ -406,3 +406,55 @@ test("v5 lossless chunked findings, unverified empty publicationYear, and concur
   assert.equal(updatedSnap.data().publicationYear, "");
 });
 
+test("Unassessed readiness-gate zero-score records and lossless narrative_chunks subcollection rules", async () => {
+  const aliceDb = testEnv.authenticatedContext(ALICE_UID).firestore();
+  const bobDb = testEnv.authenticatedContext(BOB_UID).firestore();
+  const created = new Date(Date.now() - 2000);
+  const unassessedRef = aliceDb.collection("users").doc(ALICE_UID).collection("reviews").doc("review_unassessed_01");
+
+  await assertSucceeds(
+    unassessedRef.set(
+      buildFullV4ReviewPayload(ALICE_UID, created, {
+        verdict: "INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT",
+        credibilityScore: 0,
+        methodologyScore: 0,
+        significanceScore: 0,
+        clarityScore: 0,
+        originalityScore: 0,
+        mathRigorScore: 0,
+        reproducibilityScore: 0,
+        validationStatus: "UNVERIFIED",
+        narrativeChunkCount: 1,
+        narrativeChecksum: "cafebabe",
+      })
+    )
+  );
+
+  const nChunkRef = unassessedRef.collection("narrative_chunks").doc("chunk_0");
+  await assertSucceeds(
+    nChunkRef.set({
+      userId: ALICE_UID,
+      chunkIndex: 0,
+      totalChunks: 1,
+      payload: "{\"formattedDossier\":\"Full un-truncated narrative\"}",
+      checksum: "cafebabe",
+    })
+  );
+
+  // Cross-user access to narrative_chunks MUST fail
+  await assertFails(
+    bobDb
+      .collection("users")
+      .doc(ALICE_UID)
+      .collection("reviews")
+      .doc("review_unassessed_01")
+      .collection("narrative_chunks")
+      .doc("chunk_0")
+      .get()
+  );
+
+  await assertSucceeds(nChunkRef.delete());
+  await assertSucceeds(unassessedRef.delete());
+});
+
+

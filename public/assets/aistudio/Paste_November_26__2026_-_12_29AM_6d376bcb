@@ -1,0 +1,270 @@
+# **Paper Critic — Fresh GitHub Code Audit**
+
+Repository: [Kasi72/Paper-Critc](https://github.com/Kasi72/Paper-Critc?utm_source=chatgpt.com) · Latest inspected commit: [fd34c94](https://github.com/Kasi72/Paper-Critc/commit/fd34c94e5c073ec2541c3684b68b3af09169af3b?utm_source=chatgpt.com) · 26 November 2026 (IST)
+
+I checked the latest `main` branch, compared it with the previously audited commit (`cae0a7d`), reviewed the changed Kotlin implementation and Firebase rules, and inspected the actual GitHub Actions failures.
+
+**The new code fixes several major problems from the last audit. However, it still has build, evidence-integrity, and clinical-appraisal weaknesses that warrant correction before release.**
+
+## **1. Confirmed release blocker: GitHub CI is failing**
+
+P0 — Build pipeline broken
+
+**Latest CI run: Failed**
+
+[View failed GitHub Actions run](https://github.com/Kasi72/Paper-Critc/actions/runs/45674811260?utm_source=chatgpt.com)
+
+The failure is specific and reproducible from the CI logs:
+
+```
+Execution failed for task ':app:validateSigningDebug'
+
+Keystore file '.../Paper-Critc/debug.keystore'
+not found for signing config 'debugConfig'.
+```
+
+The preceding CI run failed for the same reason.
+
+**Root cause:** [app/build.gradle.kts](https://github.com/Kasi72/Paper-Critc/blob/fd34c94e5c073ec2541c3684b68b3af09169af3b/app/build.gradle.kts?utm_source=chatgpt.com#L28-L57) explicitly configures debug signing to use a local `debug.keystore` file, but that file isn't present in the GitHub Actions checkout.
+
+**Recommended fix:** Remove the custom debug signing override from the Gradle `debug` build type, allowing Android Gradle Plugin to use its standard generated debug keystore. Preserve the separately configured release signing.
+
+After that, run the build, unit tests and lint as separate CI steps, rather than one combined command. This makes it possible to tell a compilation failure from a test failure or lint issue.
+
+**Important:** The CI failure occurs before the complete build-and-test workflow finishes. Therefore, passing tests reported from another environment do not establish that the current GitHub revision passes CI.
+
+## **2. What has actually been fixed since the last audit**
+
+The current source includes concrete repairs for several previously reported issues:
+
+- **Account separation:** Room records now use owner scopes, including composite primary keys for account-owned reviews and API providers.
+- **Anonymous review handling:** Local anonymous drafts require explicit adoption before account synchronization.
+- **Provider privacy:** An unavailable custom API provider now produces an error rather than silently selecting Firebase.
+- **Large evidence ledgers:** Findings are chunked and checksummed instead of truncated to 60,000 characters.
+- **Legacy validation:** Unverified legacy reviews now default to `LEGACY_UNVALIDATED`.
+- **Concurrent note and bookmark editing:** Dedicated field-level update paths replace some full-document overwrites.
+- **PDF diagnostics:** The exporter now attempts to reopen and inspect the actual PDF bytes.
+- **Clinical appraisal:** GRADE assessment includes additional evidence gates instead of immediately assigning certainty from general rubric scores.
+
+These changes are meaningful, and the earlier audit's resolved findings should not be counted again.
+
+## **3. Remaining critical defects in the latest code**
+
+### **P0-02 — A manuscript can remain visible after switching accounts**
+
+**Source:** [Workbench form state](https://github.com/Kasi72/Paper-Critc/blob/fd34c94e5c073ec2541c3684b68b3af09169af3b/app/src/main/java/com/example/ui/viewmodel/PaperCriticViewModel.kt?utm_source=chatgpt.com#L350-L356) and [Account-switch cleanup](https://github.com/Kasi72/Paper-Critc/blob/fd34c94e5c073ec2541c3684b68b3af09169af3b/app/src/main/java/com/example/ui/viewmodel/PaperCriticViewModel.kt?utm_source=chatgpt.com#L503-L549)
+
+The new account-isolation logic clears cached reviews, the selected dossier, running analysis jobs and chat state. **It does not clear the manuscript input form.**
+
+That form contains manuscript text, replication code, article metadata and rendered PDF page images.
+
+If researcher A imports an unpublished manuscript and signs out, researcher B can inherit the manuscript still displayed in the workbench on the same installation.
+
+There is a second race: document-import operations at [Manuscript and replication-code import](https://github.com/Kasi72/Paper-Critc/blob/fd34c94e5c073ec2541c3684b68b3af09169af3b/app/src/main/java/com/example/ui/viewmodel/PaperCriticViewModel.kt?utm_source=chatgpt.com#L789-L873) are not session-bound. A file import begun by A can finish after B signs in and populate B's form.
+
+**Fix:** Make drafts account-scoped, clear the active form during account transitions, cancel outstanding import jobs, and check the initiating session before committing extracted content.
+
+**Regression test:** Import a PDF as A, switch to B during extraction, and verify that neither extracted text nor images ever appear under B.
+
+### **P0-03 — Clinical GRADE certainty can still be falsely reassuring**
+
+**Source:** [Clinical certainty evaluator](https://github.com/Kasi72/Paper-Critc/blob/fd34c94e5c073ec2541c3684b68b3af09169af3b/app/src/main/java/com/example/data/ai/Reviewer2PipelineService.kt?utm_source=chatgpt.com#L3962-L4127)
+
+The latest GRADE evaluator has better safeguards, but its decisions still rely heavily on the presence of particular phrases.
+
+For example, a mention of `placebo` can count as adequate risk-of-bias controls. A reported sample size or confidence interval can make imprecision `NOT_SERIOUS`. The occurrence of `publication bias` or `PROSPERO` can contribute to marking publication bias `NOT_SERIOUS`, even if the text states that publication bias **was not assessed**.
+
+For an RCT, a collection of such keyword matches can yield `HIGH_CERTAINTY` without independently establishing adequate risk-of-bias assessment, clinically meaningful precision or an outcome-specific evidence profile.
+
+**Fix:** Do not equate mentioning an assessment with successfully passing it. Require structured, outcome-specific GRADE domain evidence, preferably including a PICO definition, study-level risk-of-bias judgments, effect estimates and explicit rationale for every downgrade decision. If those inputs are unavailable, withhold the certainty rating.
+
+### **P0-04 — The report can label an opposing AI statement as verified**
+
+**Source:** [Evidence-governed report assembly](https://github.com/Kasi72/Paper-Critc/blob/fd34c94e5c073ec2541c3684b68b3af09169af3b/app/src/main/java/com/example/data/ai/Reviewer2PipelineService.kt?utm_source=chatgpt.com#L3544-L3653)
+
+The new report governance accepts statements linked to a verified finding ID and also automatically links sentences when enough words overlap with a verified finding.
+
+Neither mechanism proves that the sentence expresses the **same proposition**.
+
+For example, a finding asserting that a sensitivity analysis was absent and a sentence asserting that it was performed can share enough words to be linked, despite opposite meanings.
+
+The separate quote-entailment function now checks some negation and direction patterns, but the report-assembly routine does not enforce equivalent semantic checks.
+
+**Fix:** Treat finding IDs as pointers, not proof. Author verified report statements from validated, structured claims, or require a semantic consistency check for polarity, method status, outcome and scope before promoting AI prose to a verified statement. Unsupported prose must remain explicitly provisional.
+
+### **P0-05 — Incomplete manuscript submissions receive an invented numerical score**
+
+**Source:** [Document readiness failure result](https://github.com/Kasi72/Paper-Critc/blob/fd34c94e5c073ec2541c3684b68b3af09169af3b/app/src/main/java/com/example/data/ai/Reviewer2PipelineService.kt?utm_source=chatgpt.com#L817-L881)
+
+When the document-readiness gate blocks a review before any LLM appraisal, it creates a `PaperReview` with a **50/100 credibility score** and all six rubric axes at **5/10**.
+
+Those values have no evidentiary basis because the appraisal never took place. Although the verdict says insufficient evidence, the UI or a downstream export can still display an apparently meaningful score.
+
+**Fix:** Represent unassessed scores as absent, not 50. Use a distinct blocked-analysis result type, or a nullable rubric with *Not Assessed* shown consistently in the app, database and PDF.
+
+## **4. High-priority data integrity, privacy and reliability bugs**
+
+### **P1-01 — A temporary Firestore error can make a verified report lose its evidence ledger**
+
+**Source:** [Evidence chunk hydration](https://github.com/Kasi72/Paper-Critc/blob/fd34c94e5c073ec2541c3684b68b3af09169af3b/app/src/main/java/com/example/data/repository/ReviewRepository.kt?utm_source=chatgpt.com#L48-L74) and [Cloud review observation](https://github.com/Kasi72/Paper-Critc/blob/fd34c94e5c073ec2541c3684b68b3af09169af3b/app/src/main/java/com/example/data/repository/ReviewRepository.kt?utm_source=chatgpt.com#L144-L171)
+
+The evidence-ledger chunking implementation correctly checks for missing or corrupted data.
+
+But when hydration fails inside the archive listener, the exception is caught and the original, unhydrated `PaperReview` is returned.
+
+That record can still have `validationStatus = VERIFIED` while its `structuredFindingsJson` is empty. The ViewModel can then cache this degraded record offline.
+
+On a device without a previous intact local copy, this makes the report's evidence unavailable without clearly marking the review incomplete.
+
+**Solution:** Introduce a `LedgerLoadState` (`COMPLETE`, `TEMPORARILY_UNAVAILABLE`, `CORRUPT`, `INCOMPLETE`). Never present an unhydrated report as fully verified. Retain the last known-good ledger and retry hydration separately.
+
+### **P1-02 — Deleting a report can leave confidential evidence chunks in Firestore**
+
+**Source:** [Review deletion](https://github.com/Kasi72/Paper-Critc/blob/fd34c94e5c073ec2541c3684b68b3af09169af3b/app/src/main/java/com/example/data/repository/ReviewRepository.kt?utm_source=chatgpt.com#L348-L373)
+
+Before deleting a review, the repository tries to list its `findings_chunks` subcollection.
+
+If that listing fails, the code substitutes an empty list and proceeds to delete the parent document.
+
+Deleting a Firestore document does not automatically delete its subcollections. Accordingly, a failed chunk-list operation can leave the underlying manuscript evidence in cloud storage after the UI reports that the review was deleted.
+
+A related problem exists in the cleanup of old chunks during document updates.
+
+**Solution:** Do not swallow errors during destructive cleanup. Make the delete operation fail visibly until all child records can be removed, or use a trusted backend recursive-deletion operation. Test interrupted and permission-denied chunk enumeration.
+
+### **P1-03 — Cloud refresh can overwrite newer local notes, bookmarks or report details**
+
+**Source:** [Offline caching](https://github.com/Kasi72/Paper-Critc/blob/fd34c94e5c073ec2541c3684b68b3af09169af3b/app/src/main/java/com/example/data/repository/LocalReviewRepository.kt?utm_source=chatgpt.com#L45-L79) and [Automatic cloud refresh](https://github.com/Kasi72/Paper-Critc/blob/fd34c94e5c073ec2541c3684b68b3af09169af3b/app/src/main/java/com/example/ui/viewmodel/PaperCriticViewModel.kt?utm_source=chatgpt.com#L286-L297)
+
+Although notes and bookmarks now have field-level updates, ordinary cloud refreshes still replace complete local Room rows.
+
+Consider an offline note edit followed by a stale cloud snapshot. The cache routine protects certain ledger fields but has no general dirty-field or revision-based conflict management for notes and bookmarks.
+
+The separate search-grounding routine can also cache an older `PaperReview` object after a long asynchronous operation.
+
+**Solution:** Store user annotations independently, track pending writes and record revisions, and merge incoming cloud snapshots without overwriting locally modified fields. Use a durable outbox for failed cloud updates.
+
+### **P1-04 — Statistical-claim truncation is still silent**
+
+**Source:** [Claim ledger metadata](https://github.com/Kasi72/Paper-Critc/blob/fd34c94e5c073ec2541c3684b68b3af09169af3b/app/src/main/java/com/example/data/ai/stats/StatisticalClaimParser.kt?utm_source=chatgpt.com#L23-L37) and [Claim discovery and return](https://github.com/Kasi72/Paper-Critc/blob/fd34c94e5c073ec2541c3684b68b3af09169af3b/app/src/main/java/com/example/data/ai/stats/StatisticalClaimParser.kt?utm_source=chatgpt.com#L643-L695)
+
+The latest implementation raised many extraction limits to 500 matches per statistical family. This is an improvement.
+
+However, calls such as `.take(MAX_PER_FAMILY_DISCOVERY)` still discard later matches. The returned ledger defaults `truncatedClaimCount` to zero rather than computing the actual number omitted.
+
+A lengthy manuscript could therefore be reported as statistically audited even though part of its claim inventory was never examined.
+
+**Solution:** Count all discovered matches before applying limits. Preserve omitted-claim counts and page references. Prioritize primary outcomes, Results and critical tables. Any undisclosed truncation should prevent a claim of complete quantitative coverage.
+
+### **P1-05 — Narrative report sections are still silently shortened during cloud saving**
+
+**Source:** [Firestore report payload](https://github.com/Kasi72/Paper-Critc/blob/fd34c94e5c073ec2541c3684b68b3af09169af3b/app/src/main/java/com/example/data/repository/ReviewRepository.kt?utm_source=chatgpt.com#L463-L523)
+
+The structured evidence ledger is now stored losslessly. But `formattedDossier`, `mathAuditReport`, `redTeamCritique`, `codeAuditReport` and other narrative fields still undergo fixed-length `.take(...)` operations.
+
+This can cut away entire paragraphs of technical reasoning without notifying the user.
+
+**Solution:** Apply the lossless chunking approach to long narrative sections as well, or store those sections as separate documents. A successfully synchronized report must preserve its full substantive text.
+
+### **P1-06 — Account-switch safety is incomplete for secondary cloud operations**
+
+**Source:** [Bookmark, notes and delete operations](https://github.com/Kasi72/Paper-Critc/blob/fd34c94e5c073ec2541c3684b68b3af09169af3b/app/src/main/java/com/example/ui/viewmodel/PaperCriticViewModel.kt?utm_source=chatgpt.com#L1082-L1174)
+
+The main analysis pipeline now captures the initiating account and session generation. This is a valuable fix.
+
+But secondary operations for bookmarking, notes and deletion launch coroutines that call repository methods resolving the currently signed-in user when the coroutine executes.
+
+An account transition between launching the coroutine and making the Firestore request can make the request target a different account's collection than intended.
+
+**Solution:** Require an expected account ID at the repository boundary and verify it before every remote mutation. Apply the same session-generation protection to all account-scoped work, including deletion and file imports.
+
+### **P1-07 — Legacy API keys can become inaccessible after the account-isolation migration**
+
+**Source:** [Room v5-to-v6 migration](https://github.com/Kasi72/Paper-Critc/blob/fd34c94e5c073ec2541c3684b68b3af09169af3b/app/src/main/java/com/example/data/local/PaperCriticSqlDatabase.kt?utm_source=chatgpt.com#L419-L469)
+
+The migration puts existing API provider records into an anonymous ownership scope. Afterward, the signed-in user's provider list only queries that user's account scope.
+
+This safely avoids silently assigning old credentials to the wrong person, but it can also make previously configured providers disappear after an upgrade.
+
+**Solution:** Provide a one-time credential recovery or reassociation flow. Require explicit user confirmation before moving any legacy credential into an authenticated account.
+
+## **5. Additional defects and incomplete safeguards**
+
+| Priority | Finding                                                                                                                                                                                                                                                                                                         | Recommended correction                                                                                                                      |
+| -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| P1       | [ReviewFindingCodec.decode()](https://github.com/Kasi72/Paper-Critc/blob/fd34c94e5c073ec2541c3684b68b3af09169af3b/app/src/main/java/com/example/data/model/PaperReview.kt?utm_source=chatgpt.com#L123-L151) converts malformed JSON into an empty finding list without raising an error                         | Make decoding return explicit success/failure, and mark damaged ledgers corrupt rather than empty                                           |
+| P1       | [Cloud ledger packaging](https://github.com/Kasi72/Paper-Critc/blob/fd34c94e5c073ec2541c3684b68b3af09169af3b/app/src/main/java/com/example/data/model/PaperReview.kt?utm_source=chatgpt.com#L272-L294) does not validate small inline JSON before saving                                                        | Validate every ledger regardless of whether it requires chunks                                                                              |
+| P1       | [Actual PDF export functions](https://github.com/Kasi72/Paper-Critc/blob/fd34c94e5c073ec2541c3684b68b3af09169af3b/app/src/main/java/com/example/util/PdfReportExporter.kt?utm_source=chatgpt.com#L252-L330) writes and shares PDFs without invoking the new PDF diagnostic routine                              | Run the final integrity check on real exported files, not just test-only rendering                                                          |
+| P1       | [PDF clean-status logic](https://github.com/Kasi72/Paper-Critc/blob/fd34c94e5c073ec2541c3684b68b3af09169af3b/app/src/main/java/com/example/util/PdfReportExporter.kt?utm_source=chatgpt.com#L66-L76) can return `isClean=true` when actual PDF byte extraction failed and the fallback text stream was used     | Require successful examination of finished PDF bytes before certifying the export                                                           |
+| P2       | [Cloud archive hydration](https://github.com/Kasi72/Paper-Critc/blob/fd34c94e5c073ec2541c3684b68b3af09169af3b/app/src/main/java/com/example/data/repository/ReviewRepository.kt?utm_source=chatgpt.com#L144-L171) sequentially hydrates chunked ledgers for each archive record                                 | Load summary records first and hydrate findings on demand, with bounded concurrency                                                         |
+| P2       | [Android CI workflow](https://github.com/Kasi72/Paper-Critc/blob/fd34c94e5c073ec2541c3684b68b3af09169af3b/.github/workflows/android-ci.yml?utm_source=chatgpt.com) does not run the included Firestore emulator rules test suite                                                                                | Add a dedicated Firebase rules/emulator CI job                                                                                              |
+| P2       | [Local-only storage behavior](https://github.com/Kasi72/Paper-Critc/blob/fd34c94e5c073ec2541c3684b68b3af09169af3b/app/src/main/java/com/example/ui/viewmodel/PaperCriticViewModel.kt?utm_source=chatgpt.com#L960-L1009) sends manuscripts to remote AI inference even when local-only report storage is enabled | Explicitly disclose that local-only governs storage, not model processing; require informed provider selection for confidential manuscripts |
+
+There is also a **possible transient account-switch UI race**: `archiveState` merges cached Flow values without independently checking ownership at the final presentation boundary. The new Room filters significantly reduce the risk, but delayed-emission tests are needed to establish whether an old account's last cached value can momentarily remain visible during a switch.
+
+## **6. Why the existing regression tests are not enough**
+
+The latest commit adds tests covering account isolation, missing API keys, oversized JSON chunking, polarity checks, GRADE applicability, scanned PDFs, and PDF rendering.
+
+However, several of those tests exercise isolated functions rather than the complete failure path. For example, the oversized-ledger test verifies the chunking codec, but not cloud-read failure followed by archive hydration. The session-switch test verifies the commit-guard function, but not an actual import or Firestore mutation suspended across an account change.
+
+The next test suite should exercise these end-to-end scenarios:
+
+| Priority | Reproduction test                                                                         | Required result                                          |
+| -------- | ----------------------------------------------------------------------------------------- | -------------------------------------------------------- |
+| Critical | Import A's unpublished PDF, then switch to B                                              | B never sees A's document or page images                 |
+| Critical | Complete an A-owned import after B signs in                                               | Late extraction result is discarded                      |
+| Critical | Provide an underpowered RCT that merely mentions placebo, CI and publication-bias methods | GRADE does not default to high certainty                 |
+| Critical | Generate AI prose with the opposite meaning of a verified finding                         | Opposing sentence never receives a verified badge        |
+| Critical | Trigger document-readiness failure                                                        | No fabricated numerical credibility score                |
+| High     | Fail a chunk-read request for a `VERIFIED` cloud review                                   | Ledger marked unavailable; no false verification claim   |
+| High     | Fail subcollection enumeration during delete                                              | Parent is not reported fully deleted while chunks remain |
+| High     | Edit offline notes, then deliver an older cloud snapshot                                  | Newer local annotation survives                          |
+| High     | Submit more than 500 statistical claims                                                   | Omitted count is accurate and displayed                  |
+| High     | Generate and save a report with exceptionally long narrative sections                     | No text is silently lost                                 |
+| High     | Corrupt the actual PDF and re-run export validation                                       | Diagnostic fails, sharing is blocked                     |
+| High     | Switch accounts while a bookmark/delete coroutine is queued                               | Mutation cannot affect a different account               |
+
+For scientific calibration, I would use the complete original psychiatric-bed meta-analysis alongside separate valid and deliberately flawed RCTs, observational studies, diagnostic-accuracy papers and systematic reviews. The test must score not just whether known errors were detected, but how many false accusations were produced.
+
+## **7. Prioritized remediation plan**
+
+**Phase A — Release blockers**
+
+Repair GitHub CI, isolate manuscript draft/import state across accounts, remove invented scores for blocked analyses, and strengthen GRADE and report-verification semantics.
+
+**Acceptance:** CI is green and no confidential document or unsupported authoritative verdict crosses these safeguards.
+
+**Phase B — Data preservation**
+
+Make ledger-loading failures explicit, guarantee deletion of evidence chunks, prevent stale cloud snapshots from overwriting local work, and preserve all report narrative content.
+
+**Acceptance:** Cloud refresh, sync, interruption and deletion tests pass without silent data loss.
+
+**Phase C — Scientific validation**
+
+Replace keyword-based certainty shortcuts with an outcome-specific appraisal model and enforce semantic consistency between findings and final prose.
+
+**Acceptance:** Adversarial and expert-annotated manuscripts demonstrate acceptable false-positive rates and calibrated abstention.
+
+**Phase D — Production hardening**
+
+Expand CI to Firebase rules, migration and integration testing; validate final PDF bytes; address statistical parser caps and archive-loading performance.
+
+**Acceptance:** Every release has passing automated checks and an independently reviewed sample of real PDF outputs.
+
+## **Final assessment**
+
+CURRENT RELEASE READINESS
+
+# **Not release-ready**
+
+for confidential or professionally relied-upon manuscript appraisal
+
+The latest revision shows genuine progress. The previous broad account-cache isolation and JSON truncation problems have received substantial fixes.
+
+The remaining danger is concentrated in **raw manuscript handling during account changes, failure recovery for evidence storage, and scientific conclusions that can still be certified by relatively superficial text matching**.
+
+There is also a straightforward immediate blocker: GitHub's own Android CI is red because of the missing debug keystore.
+
+**Verification boundary:** This audit is grounded in the exact `fd34c94` source and actual GitHub Actions logs. The CI failure is observed. The other findings identify concrete code paths and failure conditions, but I have not executed a patched Android build, simulated account switching on a device, or performed a complete live-model benchmark. Those reproductions remain necessary before declaring the repairs successful.

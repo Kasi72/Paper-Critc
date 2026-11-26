@@ -93,6 +93,7 @@ import com.example.data.ai.GroundedWebSource
 import com.example.data.ai.epistemic.FlawSeverityTier
 import com.example.data.ai.epistemic.ReportingStatus
 import com.example.data.model.FindingStatus
+import com.example.data.model.LedgerLoadState
 import com.example.data.model.PaperReview
 import com.example.data.model.ReviewFinding
 import com.example.ui.components.IosCredibilityArcGauge
@@ -151,7 +152,9 @@ fun OutputTabScreen(
   onUpdateChatPersona: (ChatbotRolePersona) -> Unit = {},
   onUpdateChatModelTier: (GeminiModelTier) -> Unit = {},
   onUpdateChatSearchGrounding: (Boolean) -> Unit = {},
-  onRunGoogleSearchVerification: (PaperReview) -> Unit = {}
+  onRunGoogleSearchVerification: (PaperReview) -> Unit = {},
+  isRetryingHydration: Boolean = false,
+  onRetryHydration: (PaperReview) -> Unit = {}
 ) {
   val activeReview = review ?: allReviews.firstOrNull()
   var emptyModeTab by rememberSaveable { mutableIntStateOf(0) }
@@ -252,7 +255,9 @@ fun OutputTabScreen(
     onUpdateChatPersona = onUpdateChatPersona,
     onUpdateChatModelTier = onUpdateChatModelTier,
     onUpdateChatSearchGrounding = onUpdateChatSearchGrounding,
-    onRunGoogleSearchVerification = { onRunGoogleSearchVerification(activeReview) }
+    onRunGoogleSearchVerification = { onRunGoogleSearchVerification(activeReview) },
+    isRetryingHydration = isRetryingHydration,
+    onRetryHydration = { onRetryHydration(activeReview) }
   )
 }
 
@@ -277,7 +282,9 @@ fun DossierDetailView(
   onUpdateChatPersona: (ChatbotRolePersona) -> Unit = {},
   onUpdateChatModelTier: (GeminiModelTier) -> Unit = {},
   onUpdateChatSearchGrounding: (Boolean) -> Unit = {},
-  onRunGoogleSearchVerification: () -> Unit = {}
+  onRunGoogleSearchVerification: () -> Unit = {},
+  isRetryingHydration: Boolean = false,
+  onRetryHydration: () -> Unit = {}
 ) {
   BackHandler { onBackToAnalyze() }
 
@@ -335,7 +342,7 @@ fun DossierDetailView(
   }
 
   val sectionTabs = listOf(
-    IosSubTabEntry("Rubric", Icons.Default.Gavel, "${review.credibilityScore}%"),
+    IosSubTabEntry("Rubric", Icons.Default.Gavel, if (review.isUnassessed()) "N/A" else "${review.credibilityScore}%"),
     IosSubTabEntry("Red/Blue", Icons.Default.Security, "01a–03c"),
     IosSubTabEntry("Quant", Icons.Default.Functions, "01e/02a"),
     IosSubTabEntry("Editor", Icons.Default.EditNote, "08b/09c"),
@@ -587,6 +594,52 @@ fun DossierDetailView(
           }
         }
 
+        if (review.ledgerLoadState != LedgerLoadState.COMPLETE) {
+          Spacer(modifier = Modifier.height(6.dp))
+          val degradedShape = SquircleShape(cornerRadius = 8.dp, smoothing = 0.88f)
+          val degradedColor = if (review.ledgerLoadState == LedgerLoadState.CORRUPT) CupertinoRed else CupertinoAmber
+          Column(
+            modifier = Modifier
+              .fillMaxWidth()
+              .clip(degradedShape)
+              .background(degradedColor.copy(alpha = 0.10f))
+              .border(0.75.dp, degradedColor.copy(alpha = 0.40f), degradedShape)
+              .padding(horizontal = 10.dp, vertical = 8.dp)
+              .testTag("dossier_degraded_ledger_banner"),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+          ) {
+            Text(
+              text = when (review.ledgerLoadState) {
+                LedgerLoadState.TEMPORARILY_UNAVAILABLE ->
+                  "CLOUD FINDINGS TEMPORARILY UNAVAILABLE — NOT VERIFIED"
+                LedgerLoadState.INCOMPLETE ->
+                  "INCOMPLETE CLOUD CHUNKS — FINDINGS LEDGER PARTIAL"
+                LedgerLoadState.CORRUPT ->
+                  "CORRUPT LEDGER CHECKSUM / JSON — FINDINGS QUARANTINED"
+                LedgerLoadState.COMPLETE -> ""
+              },
+              style = MaterialTheme.typography.labelSmall,
+              fontFamily = JetBrainsMonoFamily,
+              fontSize = 9.5.sp,
+              fontWeight = FontWeight.ExtraBold,
+              color = degradedColor
+            )
+            Text(
+              text = "This dossier cannot be treated as fully verified until all structured findings and narrative chunks re-hydrate cleanly from cloud storage.",
+              style = MaterialTheme.typography.labelSmall,
+              color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            if (review.id.isNotBlank() && !review.id.startsWith("local_") && !review.id.startsWith("sql_")) {
+              IosSecondarySquircleButton(
+                text = if (isRetryingHydration) "Re-Fetching Cloud Findings..." else "Retry Cloud Hydration",
+                onClick = onRetryHydration,
+                tintColor = degradedColor,
+                modifier = Modifier.testTag("retry_hydrate_dossier_button")
+              )
+            }
+          }
+        }
+
         Spacer(modifier = Modifier.height(8.dp))
 
         val normalizedDisplayTitle = remember(review.title) {
@@ -622,7 +675,7 @@ fun DossierDetailView(
 
         Spacer(modifier = Modifier.height(10.dp))
 
-        val rubric = remember(review.id, review.editorNote, review.credibilityScore) {
+        val rubric = remember(review.id, review.editorNote, review.credibilityScore, review.verdict) {
           review.toRubric()
         }
         Row(
@@ -633,7 +686,8 @@ fun DossierDetailView(
           IosCredibilityArcGauge(
             score = rubric.overallCredibilityScore,
             label = "CREDIBILITY",
-            size = 76.dp
+            size = 76.dp,
+            isAssessed = rubric.isAssessed
           )
           Column(
             modifier = Modifier.weight(1f),
@@ -647,18 +701,21 @@ fun DossierDetailView(
                 label = "METHODOLOGY",
                 score = rubric.methodology,
                 max = 10,
+                isAssessed = rubric.isAssessed,
                 modifier = Modifier.weight(1f)
               )
               IosScorePill(
                 label = "SIGNIFICANCE",
                 score = rubric.significance,
                 max = 10,
+                isAssessed = rubric.isAssessed,
                 modifier = Modifier.weight(1f)
               )
               IosScorePill(
                 label = "CLARITY",
                 score = rubric.clarity,
                 max = 10,
+                isAssessed = rubric.isAssessed,
                 modifier = Modifier.weight(1f)
               )
             }
@@ -670,18 +727,21 @@ fun DossierDetailView(
                 label = "ORIGINALITY",
                 score = rubric.originality,
                 max = 10,
+                isAssessed = rubric.isAssessed,
                 modifier = Modifier.weight(1f)
               )
               IosScorePill(
                 label = "MATH RIGOR",
                 score = rubric.mathematicalRigor,
                 max = 10,
+                isAssessed = rubric.isAssessed,
                 modifier = Modifier.weight(1f)
               )
               IosScorePill(
                 label = "REPRODUCIBLE",
                 score = rubric.reproducibility,
                 max = 10,
+                isAssessed = rubric.isAssessed,
                 modifier = Modifier.weight(1f)
               )
             }
@@ -1708,7 +1768,8 @@ private fun IosScorePill(
   score: Int,
   max: Int,
   modifier: Modifier = Modifier,
-  isPrimary: Boolean = false
+  isPrimary: Boolean = false,
+  isAssessed: Boolean = true
 ) {
   val palette = LocalNeumorphicPalette.current
   Column(
@@ -1732,11 +1793,15 @@ private fun IosScorePill(
     )
     Spacer(modifier = Modifier.height(2.dp))
     Text(
-      text = "$score/$max",
+      text = if (isAssessed) "$score/$max" else "N/A",
       style = MaterialTheme.typography.titleSmall,
       fontFamily = JetBrainsMonoFamily,
       fontWeight = FontWeight.ExtraBold,
-      color = if (isPrimary) CupertinoBlue else MaterialTheme.colorScheme.onSurface
+      color = when {
+        !isAssessed -> CupertinoAmber
+        isPrimary -> CupertinoBlue
+        else -> MaterialTheme.colorScheme.onSurface
+      }
     )
   }
 }
@@ -1749,7 +1814,8 @@ private fun RefereeDimensionBreakdownCard(review: PaperReview) {
     review.credibilityScore,
     review.methodologyScore,
     review.mathRigorScore,
-    review.reproducibilityScore
+    review.reproducibilityScore,
+    review.verdict
   ) {
     review.toRubric()
   }
@@ -1764,11 +1830,11 @@ private fun RefereeDimensionBreakdownCard(review: PaperReview) {
       verticalAlignment = Alignment.CenterVertically
     ) {
       Text(
-        text = "WEIGHTED ${rubric.overallCredibilityScore}/100",
+        text = if (rubric.isAssessed) "WEIGHTED ${rubric.overallCredibilityScore}/100" else "NOT ASSESSED (READINESS BLOCKED)",
         style = MaterialTheme.typography.labelSmall,
         fontFamily = JetBrainsMonoFamily,
         fontWeight = FontWeight.Bold,
-        color = CupertinoBlue
+        color = if (rubric.isAssessed) CupertinoBlue else CupertinoAmber
       )
       Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
         Box(
@@ -1806,6 +1872,7 @@ private fun RefereeDimensionBreakdownCard(review: PaperReview) {
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
       criteria.forEach { criterion ->
         val barColor = when {
+          !rubric.isAssessed -> CupertinoAmber
           criterion.score >= 8 -> CupertinoGreen
           criterion.score >= 6 -> CupertinoBlue
           criterion.score >= 4 -> CupertinoAmber
@@ -1824,7 +1891,7 @@ private fun RefereeDimensionBreakdownCard(review: PaperReview) {
               modifier = Modifier.weight(1f)
             )
             Text(
-              text = "${criterion.score} / ${criterion.maxScore}",
+              text = if (rubric.isAssessed) "${criterion.score} / ${criterion.maxScore}" else "N/A",
               style = MaterialTheme.typography.labelSmall,
               fontFamily = JetBrainsMonoFamily,
               fontWeight = FontWeight.Bold,
@@ -1832,7 +1899,9 @@ private fun RefereeDimensionBreakdownCard(review: PaperReview) {
             )
           }
           LinearProgressIndicator(
-            progress = { (criterion.score.toFloat() / criterion.maxScore.toFloat()).coerceIn(0f, 1f) },
+            progress = {
+              if (rubric.isAssessed) (criterion.score.toFloat() / criterion.maxScore.toFloat()).coerceIn(0f, 1f) else 0f
+            },
             modifier = Modifier
               .fillMaxWidth()
               .height(6.dp)

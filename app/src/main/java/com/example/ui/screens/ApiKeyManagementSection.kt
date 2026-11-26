@@ -71,6 +71,8 @@ fun ApiKeysAndProvidersSettingsContent(
   apiProviders: List<AiApiProviderEntry>,
   isTestingApiKey: Boolean,
   apiTestResultMessage: String?,
+  anonymousCustomProviderCount: Int = 0,
+  onAdoptAnonymousApiProviders: () -> Unit = {},
   onUpdateSettings: ((AppSettingsState) -> AppSettingsState) -> Unit,
   onSelectActiveProvider: (String) -> Unit,
   onSaveProvider: (AiApiProviderEntry) -> Unit,
@@ -93,6 +95,29 @@ fun ApiKeysAndProvidersSettingsContent(
   val vaultAvailable = remember { com.example.data.local.ApiKeyVault.isHardwareVaultAvailable() }
 
   Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+    if (anonymousCustomProviderCount > 0) {
+      IosGroupedCard(
+        header = "Legacy Signed-Out API Credentials Detected ($anonymousCustomProviderCount)"
+      ) {
+        Text(
+          text = "Found $anonymousCustomProviderCount encrypted API provider configuration(s) created before sign-in or prior to account-scoped storage. For cross-account security, they are not imported automatically.",
+          style = MaterialTheme.typography.bodySmall,
+          color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Spacer(modifier = Modifier.height(8.dp))
+        IosSecondarySquircleButton(
+          text = "Recover $anonymousCustomProviderCount Legacy API Key(s) to This Account",
+          onClick = onAdoptAnonymousApiProviders,
+          icon = Icons.Default.Key,
+          tintColor = CupertinoBlue,
+          cornerRadius = 9.dp,
+          modifier = Modifier
+            .fillMaxWidth()
+            .testTag("recover_legacy_api_providers_button")
+        )
+      }
+    }
+
     if (!vaultAvailable) {
       val warnShape = SquircleShape(cornerRadius = 10.dp, smoothing = 0.88f)
       Box(

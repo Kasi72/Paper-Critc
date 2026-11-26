@@ -874,16 +874,18 @@ fun IosCredibilityArcGauge(
   score: Int,
   modifier: Modifier = Modifier,
   size: Dp = 84.dp,
-  label: String = "CREDIBILITY"
+  label: String = "CREDIBILITY",
+  isAssessed: Boolean = true
 ) {
   val palette = LocalNeumorphicPalette.current
-  val clampedScore = score.coerceIn(0, 100)
+  val clampedScore = if (isAssessed) score.coerceIn(0, 100) else 0
   val animatedSweep by animateFloatAsState(
-    targetValue = (clampedScore / 100f) * 240f,
+    targetValue = if (isAssessed) (clampedScore / 100f) * 240f else 0f,
     animationSpec = spring(stiffness = Spring.StiffnessLow),
     label = "neuCredibilitySweep"
   )
   val arcColor = when {
+    !isAssessed -> CupertinoAmber
     clampedScore >= 75 -> CupertinoGreen
     clampedScore >= 55 -> CupertinoBlue
     clampedScore >= 40 -> CupertinoAmber
@@ -925,7 +927,7 @@ fun IosCredibilityArcGauge(
         val dotX = centerX + (tickRadius * cos(rad)).toFloat()
         val dotY = centerY + (tickRadius * sin(rad)).toFloat()
         drawCircle(
-          color = if (i * 100 / 16 <= clampedScore) arcColor.copy(alpha = 0.80f) else tickColor,
+          color = if (isAssessed && i * 100 / 16 <= clampedScore) arcColor.copy(alpha = 0.80f) else tickColor,
           radius = if (i % 4 == 0) 1.5.dp.toPx() else 0.9.dp.toPx(),
           center = Offset(dotX, dotY)
         )
@@ -941,29 +943,31 @@ fun IosCredibilityArcGauge(
         style = Stroke(width = strokePx, cap = StrokeCap.Round)
       )
 
-      drawArc(
-        brush = Brush.sweepGradient(
-          colors = listOf(arcColor.copy(alpha = 0.82f), arcColor, CupertinoIndigo)
-        ),
-        startAngle = 150f,
-        sweepAngle = animatedSweep,
-        useCenter = false,
-        topLeft = topLeft,
-        size = arcSize,
-        style = Stroke(width = strokePx, cap = StrokeCap.Round)
-      )
+      if (isAssessed && animatedSweep > 0f) {
+        drawArc(
+          brush = Brush.sweepGradient(
+            colors = listOf(arcColor.copy(alpha = 0.82f), arcColor, CupertinoIndigo)
+          ),
+          startAngle = 150f,
+          sweepAngle = animatedSweep,
+          useCenter = false,
+          topLeft = topLeft,
+          size = arcSize,
+          style = Stroke(width = strokePx, cap = StrokeCap.Round)
+        )
+      }
     }
 
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
       Text(
-        text = "$clampedScore",
+        text = if (isAssessed) "$clampedScore" else "N/A",
         style = MaterialTheme.typography.titleMedium,
         fontFamily = JetBrainsMonoFamily,
         fontWeight = FontWeight.ExtraBold,
         color = arcColor
       )
       Text(
-        text = label,
+        text = if (isAssessed) label else "UNASSESSED",
         style = MaterialTheme.typography.labelSmall,
         fontSize = 7.sp,
         letterSpacing = 0.5.sp,

@@ -25,6 +25,7 @@ service cloud.firestore {
         'refereeConfidence', 'extractionConfidence', 'reviewMode',
         'coverageDisclosure', 'validationStatus', 'structuredFindingsJson',
         'schemaVersion', 'findingsChunkCount', 'findingsChecksum',
+        'narrativeChunkCount', 'narrativeChecksum',
         'abstractSummary', 'researchQuestion', 'keyMethodology', 'coreContributions',
         'redTeamCritique', 'blueTeamVerification', 'mathAuditReport',
         'codeAuditReport', 'editorNote', 'copyeditSuggestions',
@@ -54,13 +55,16 @@ service cloud.firestore {
       let o = d.originalityScore;
       let r = d.mathRigorScore;
       let p = d.reproducibilityScore;
-      return m is int && m >= 1 && m <= 10 &&
-             s is int && s >= 1 && s <= 10 &&
-             c is int && c >= 1 && c <= 10 &&
-             o is int && o >= 1 && o <= 10 &&
-             r is int && r >= 1 && r <= 10 &&
-             p is int && p >= 1 && p <= 10 &&
-             d.credibilityScore == int((m * 25 + s * 20 + c * 15 + o * 15 + r * 15 + p * 10 + 5) / 10);
+      return (d.verdict == 'INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT' &&
+              d.credibilityScore == 0 &&
+              m == 0 && s == 0 && c == 0 && o == 0 && r == 0 && p == 0) ||
+             (m is int && m >= 1 && m <= 10 &&
+              s is int && s >= 1 && s <= 10 &&
+              c is int && c >= 1 && c <= 10 &&
+              o is int && o >= 1 && o <= 10 &&
+              r is int && r >= 1 && r <= 10 &&
+              p is int && p >= 1 && p <= 10 &&
+              d.credibilityScore == int((m * 25 + s * 20 + c * 15 + o * 15 + r * 15 + p * 10 + 5) / 10));
     }
 
     function isValidCoreReview(d) {
@@ -112,19 +116,19 @@ service cloud.firestore {
     function isValidAuditMeta(d) {
       let rc = d.get('refereeConfidence', 3);
       let ec = d.get('extractionConfidence', 3);
-      let cd = d.get('coverageDisclosure', '');
       let sf = d.get('structuredFindingsJson', '');
-      let sv = d.get('schemaVersion', 5);
       let fc = d.get('findingsChunkCount', 0);
-      let cs = d.get('findingsChecksum', '');
+      let nc = d.get('narrativeChunkCount', 0);
       return rc is int && rc >= 1 && rc <= 5 &&
              ec is int && ec >= 1 && ec <= 5 &&
-             cd is string && cd.size() <= 2000 &&
+             d.get('coverageDisclosure', '') is string && d.get('coverageDisclosure', '').size() <= 2000 &&
              d.get('validationStatus', 'LEGACY_UNVALIDATED') in ['VERIFIED', 'ADJUDICATED_WITH_CAVEATS', 'PARTIALLY_VALIDATED', 'PROVISIONAL', 'UNVERIFIED', 'LEGACY_UNVALIDATED', 'REQUIRES_REANALYSIS'] &&
              sf is string && sf.size() <= 60000 &&
-             sv is int && sv >= 1 && sv <= 20 &&
+             d.get('schemaVersion', 5) is int && d.get('schemaVersion', 5) >= 1 && d.get('schemaVersion', 5) <= 20 &&
              fc is int && fc >= 0 && fc <= 64 &&
-             cs is string && cs.size() <= 128;
+             d.get('findingsChecksum', '') is string && d.get('findingsChecksum', '').size() <= 128 &&
+             nc is int && nc >= 0 && nc <= 64 &&
+             d.get('narrativeChecksum', '') is string && d.get('narrativeChecksum', '').size() <= 128;
     }
 
     function isValidPartialFieldUpdate(next, prev) {
@@ -172,6 +176,16 @@ service cloud.firestore {
       allow delete: if isOwner(userId) && isValidId(reviewId) && resource.data.userId == request.auth.uid;
 
       match /findings_chunks/{chunkId} {
+        allow get: if isOwner(userId) && isValidId(reviewId) && isValidId(chunkId) && resource.data.userId == request.auth.uid;
+        allow list: if isOwner(userId) && isValidId(reviewId);
+        allow create: if isOwner(userId) && isValidId(reviewId) && isValidId(chunkId) && isValidFindingsChunk(request.resource.data);
+        allow update: if isOwner(userId) && isValidId(reviewId) && isValidId(chunkId) &&
+                         isValidFindingsChunk(request.resource.data) &&
+                         request.resource.data.userId == resource.data.userId;
+        allow delete: if isOwner(userId) && isValidId(reviewId) && isValidId(chunkId) && resource.data.userId == request.auth.uid;
+      }
+
+      match /narrative_chunks/{chunkId} {
         allow get: if isOwner(userId) && isValidId(reviewId) && isValidId(chunkId) && resource.data.userId == request.auth.uid;
         allow list: if isOwner(userId) && isValidId(reviewId);
         allow create: if isOwner(userId) && isValidId(reviewId) && isValidId(chunkId) && isValidFindingsChunk(request.resource.data);

@@ -1,6 +1,7 @@
 package com.example
 
 import android.content.Context
+import android.graphics.Bitmap
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import com.example.data.ai.ManuscriptForensicEngine
@@ -10,6 +11,7 @@ import com.example.data.ai.StudyDesignArchetype
 import com.example.data.ai.epistemic.BidirectionalAdjudicator
 import com.example.data.ai.epistemic.EpistemicSafeguardEngine
 import com.example.data.ai.stats.AdjustmentStatus
+import com.example.data.ai.stats.AnalysisHierarchy
 import com.example.data.ai.stats.EvidenceDerivedScoreGate
 import com.example.data.ai.stats.IntervalType
 import com.example.data.ai.stats.MetaStudyEffectClaim
@@ -28,6 +30,8 @@ import com.example.data.model.AiApiProviderEntry
 import com.example.data.model.ApiProtocolType
 import com.example.data.model.EvidenceAnchor
 import com.example.data.model.FindingStatus
+import com.example.data.model.LedgerLoadState
+import com.example.data.model.NarrativeSectionCodec
 import com.example.data.model.PaperReview
 import com.example.data.model.ReviewFinding
 import com.example.data.model.ReviewFindingCodec
@@ -40,11 +44,19 @@ import com.example.ui.viewmodel.AppSettingsState
 import com.example.ui.viewmodel.PaperCriticViewModel
 import com.example.util.DocumentCoverageReport
 import com.example.util.DossierFormattingEngine
+import com.example.util.ExtractedManuscriptFile
 import com.example.util.ManuscriptExtractor
+import com.example.util.ManuscriptInputFormat
 import com.example.util.PdfExportScope
 import com.example.util.PdfReportExporter
 import com.example.util.ReportBlock
+import com.google.firebase.FirebaseApp
+import com.google.firebase.FirebaseOptions
+import com.google.firebase.Timestamp
+import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.firestore.FirebaseFirestore
 import java.io.ByteArrayOutputStream
+import java.util.Date
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 import javax.crypto.KeyGenerator
@@ -452,7 +464,7 @@ class EnterpriseAndScientificTruthGateTest {
     val rctText = """
       [PAGE 1]
       A Double-Blind Randomized Controlled Trial of Drug X vs Placebo in Acute Heart Failure
-      Methods: Patients (N = 640) were randomized 1:1 to Drug X (n = 320) or placebo (n = 320).
+      Methods: This prospectively registered trial (NCT04123456) used centralized concealed allocation and double-blind outcome adjudication. Patients (N = 640; powered at 80% for 60 events) were randomized 1:1 to Drug X (n = 320) or placebo (n = 320) with low risk of bias and intention-to-treat analysis.
       Results: Primary mortality endpoint occurred in 24/320 vs 42/320 (HR = 0.56, 95% CI 0.34 to 0.92, p = 0.02).
     """.trimIndent()
     val rctForensics = ManuscriptForensicEngine.analyzeManuscript(
@@ -467,7 +479,7 @@ class EnterpriseAndScientificTruthGateTest {
       adjudicatedFindings = emptyList(),
       extractionConfidence = 5
     )
-    assertTrue("Clean RCT should be GRADE assessable", cleanRctGrade.isAssessable)
+    assertTrue("Clean RCT with RoB, precision, and registration evidence should be GRADE assessable", cleanRctGrade.isAssessable)
     assertEquals("HIGH_CERTAINTY", cleanRctGrade.verdictEnum)
   }
 
@@ -1260,6 +1272,475 @@ class EnterpriseAndScientificTruthGateTest {
       assertTrue("Header must parse into OPEN QUESTIONS SubHeader", header != null && header.tag == "OPEN QUESTIONS")
       assertFalse("Header title must have no outer brackets", header!!.title.contains("[") || header.title.contains("]"))
     } finally {
+      db.close()
+    }
+  }
+
+  // =========================================================================
+  // FRESH GITHUB AUDIT REPRODUCTION SUITE (ALL 12 END-TO-END FAILURE PATHS)
+  // =========================================================================
+
+  private fun buildTestViewModel(
+    context: Context,
+    db: PaperCriticSqlDatabase,
+    initialUserId: String?
+  ): PaperCriticViewModel {
+    val app = FirebaseApp.getApps(context).firstOrNull() ?: FirebaseApp.initializeApp(
+      context,
+      FirebaseOptions.Builder()
+        .setApplicationId("1:1234567890:android:testpapercritic")
+        .setApiKey("test-api-key")
+        .setProjectId("paper-critic-test-proj")
+        .build()
+    )!!
+    val repo = ReviewRepository(
+      db = FirebaseFirestore.getInstance(app),
+      auth = FirebaseAuth.getInstance(app)
+    )
+    return PaperCriticViewModel(
+      repository = repo,
+      localRepository = LocalReviewRepository(db.sqlDao()),
+      pipelineService = Reviewer2PipelineService(),
+      prefs = context.getSharedPreferences("test_vm_prefs_${System.nanoTime()}", Context.MODE_PRIVATE),
+      initialUserId = initialUserId
+    )
+  }
+
+  @Test
+  fun freshAudit01_accountSwitchClearsConfidentialWorkbenchTextCodeAndBitmaps() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val db = Room.inMemoryDatabaseBuilder(context, PaperCriticSqlDatabase::class.java)
+      .allowMainThreadQueries()
+      .build()
+    try {
+      val vm = buildTestViewModel(context, db, initialUserId = "uid_user_a")
+      val secretBitmap = Bitmap.createBitmap(8, 8, Bitmap.Config.ARGB_8888)
+      val extractedA = ExtractedManuscriptFile(
+        fileName = "secret_trial_a.pdf",
+        format = ManuscriptInputFormat.PDF,
+        inferredTitle = "Confidential Phase III Drug Z Trial",
+        extractedText = "CONFIDENTIAL UNPUBLISHED MANUSCRIPT DATA FOR ACCOUNT A ONLY.",
+        wordCount = 9,
+        pageCount = 1,
+        pdfPageBitmaps = listOf(secretBitmap),
+        coverageReport = DocumentCoverageReport.forCompleteText("CONFIDENTIAL UNPUBLISHED MANUSCRIPT DATA FOR ACCOUNT A ONLY."),
+        summaryNotice = "Loaded secret_trial_a.pdf"
+      )
+      assertTrue(vm.applyExtractedManuscriptIfSessionValid(extractedA, vm.currentOwnerScope(), vm.currentSessionGeneration()))
+      assertTrue(vm.applyExtractedCodeIfSessionValid("analysis_a.py", "secret_key = 'A_ONLY'", vm.currentOwnerScope(), vm.currentSessionGeneration()))
+
+      assertEquals("Confidential Phase III Drug Z Trial", vm.formState.value.title)
+      assertTrue(vm.formState.value.manuscriptText.contains("ACCOUNT A ONLY"))
+      assertEquals(1, vm.formState.value.pdfPageBitmaps.size)
+      assertTrue(vm.formState.value.replicationCodeText.contains("A_ONLY"))
+
+      // Switch to Account B -> workbench MUST be wiped completely
+      vm.onAuthenticatedUserChanged("uid_user_b")
+
+      val formAfterSwitch = vm.formState.value
+      assertEquals("", formAfterSwitch.title)
+      assertEquals("", formAfterSwitch.manuscriptText)
+      assertEquals("", formAfterSwitch.replicationCodeText)
+      assertEquals(null, formAfterSwitch.importedFileName)
+      assertEquals(null, formAfterSwitch.replicationCodeFileName)
+      assertTrue("PDF page bitmaps must be cleared on account switch", formAfterSwitch.pdfPageBitmaps.isEmpty())
+    } finally {
+      db.close()
+    }
+  }
+
+  @Test
+  fun freshAudit02_lateAsyncDocumentAndCodeImportAfterAccountSwitchIsDiscarded() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val db = Room.inMemoryDatabaseBuilder(context, PaperCriticSqlDatabase::class.java)
+      .allowMainThreadQueries()
+      .build()
+    try {
+      val vm = buildTestViewModel(context, db, initialUserId = "uid_user_a")
+      val ownerAtStart = vm.currentOwnerScope()
+      val genAtStart = vm.currentSessionGeneration()
+
+      // Account B signs in while Account A's PDF extraction is still running
+      vm.onAuthenticatedUserChanged("uid_user_b")
+
+      val lateExtractedA = ExtractedManuscriptFile(
+        fileName = "late_secret_a.pdf",
+        format = ManuscriptInputFormat.PDF,
+        inferredTitle = "Late Arriving Secret Manuscript A",
+        extractedText = "MUST NEVER APPEAR IN USER B WORKBENCH",
+        wordCount = 7,
+        pageCount = 1,
+        pdfPageBitmaps = listOf(Bitmap.createBitmap(4, 4, Bitmap.Config.ARGB_8888)),
+        coverageReport = DocumentCoverageReport.forCompleteText("MUST NEVER APPEAR IN USER B WORKBENCH"),
+        summaryNotice = "Loaded late_secret_a.pdf"
+      )
+      assertFalse(
+        "Late manuscript extraction from Account A must be rejected after Account B signs in",
+        vm.applyExtractedManuscriptIfSessionValid(lateExtractedA, ownerAtStart, genAtStart)
+      )
+      assertFalse(
+        "Late replication code extraction from Account A must be rejected after Account B signs in",
+        vm.applyExtractedCodeIfSessionValid("late_a.R", "secret_a <- 1", ownerAtStart, genAtStart)
+      )
+      assertEquals("", vm.formState.value.manuscriptText)
+      assertEquals("", vm.formState.value.replicationCodeText)
+      assertTrue(vm.formState.value.pdfPageBitmaps.isEmpty())
+    } finally {
+      db.close()
+    }
+  }
+
+  @Test
+  fun freshAudit03_gradeDoesNotAwardHighCertaintyOnBareKeywordsOrNegatedPublicationBias() {
+    val weakRct = """
+      [PAGE 1]
+      A Small Randomized Controlled Trial of Supplement Y vs Placebo in Adults
+      Methods: Twenty-four participants (N = 24) were randomized to Supplement Y (n = 12) or placebo (n = 12).
+      Publication bias was not assessed.
+      Results: Primary outcome showed OR = 1.45 (95% CI 0.42 to 4.98, p = 0.56).
+    """.trimIndent()
+    val forensics = ManuscriptForensicEngine.analyzeManuscript(
+      text = weakRct,
+      isEmpiricalTrack = true,
+      replicationCode = "",
+      coverageReport = DocumentCoverageReport.forCompleteText(weakRct)
+    )
+    val grade = Reviewer2PipelineService.evaluateClinicalGradeCertainty(
+      manuscriptText = weakRct,
+      forensicReport = forensics,
+      adjudicatedFindings = emptyList(),
+      extractionConfidence = 5
+    )
+    assertNotEquals(
+      "Underpowered RCT mentioning bare placebo/CI and 'publication bias was not assessed' must NEVER receive HIGH_CERTAINTY",
+      "HIGH_CERTAINTY",
+      grade.verdictEnum
+    )
+    assertEquals(
+      "Negated 'publication bias was not assessed' must mark domain NOT_ASSESSABLE",
+      Reviewer2PipelineService.Companion.GradeDomainConcern.NOT_ASSESSABLE,
+      grade.publicationBias
+    )
+    assertNotEquals(
+      "Null-crossing wide CI (0.42 to 4.98) with N=24 must NOT pass imprecision as NOT_SERIOUS",
+      Reviewer2PipelineService.Companion.GradeDomainConcern.NOT_SERIOUS,
+      grade.imprecision
+    )
+  }
+
+  @Test
+  fun freshAudit04_opposingProseCannotInheritVerifiedBadgeViaCitationOrLexicalOverlap() {
+    val verifiedFinding = ReviewFinding(
+      id = "R-01",
+      title = "No sensitivity analysis performed for attrition",
+      allegation = "Authors did not perform sensitivity analysis for 35% outcome attrition in the primary endpoint.",
+      severity = "MAJOR",
+      status = FindingStatus.VERIFIED
+    )
+    val contradictoryProse = """
+      [R-01] Authors performed sensitivity analysis for 35% outcome attrition in the primary endpoint and confirmed results remained significant.
+      Sensitivity analysis for 35% outcome attrition in the primary endpoint was properly conducted and validated.
+    """.trimIndent()
+
+    val governed = Reviewer2PipelineService.buildEvidenceGovernedReportSection(
+      title = "Red Team",
+      rawProse = contradictoryProse,
+      adjudicatedFindings = listOf(verifiedFinding)
+    )
+    assertTrue(
+      "Contradictory prose citing [R-01] or overlapping lexically must NEVER enter verifiedStatements",
+      governed.verifiedStatements.isEmpty()
+    )
+    assertTrue(
+      "Contradictory prose must be quarantined into openQuestionsForInvestigation without [R-01] badge",
+      governed.openQuestionsForInvestigation.isNotEmpty()
+    )
+    assertFalse(
+      "Quarantined opposing prose must have false [R-01] citation tag stripped",
+      governed.openQuestionsForInvestigation.any { it.contains("[R-01]") }
+    )
+  }
+
+  @Test
+  fun freshAudit05_readinessBlockedDraftHasZeroScoreUnassessedFlagAndNaInPdf() {
+    val unassessedReview = PaperReview(
+      id = "rev_blocked_01",
+      title = "Unreadable Scanned Manuscript",
+      publicationYear = "",
+      verdict = "INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT",
+      credibilityScore = 0L,
+      methodologyScore = 0,
+      significanceScore = 0,
+      clarityScore = 0,
+      originalityScore = 0,
+      mathRigorScore = 0,
+      reproducibilityScore = 0,
+      refereeConfidence = 1,
+      extractionConfidence = 1,
+      validationStatus = "UNVERIFIED",
+      schemaVersion = 5,
+      abstractSummary = "Document readiness gate blocked automated assessment due to unreadable scanned pages."
+    )
+    assertTrue(unassessedReview.isUnassessed())
+    val rubric = unassessedReview.toRubric()
+    assertFalse("Rubric must report isAssessed = false for readiness-blocked draft", rubric.isAssessed)
+    assertEquals(0, rubric.overallCredibilityScore)
+    assertEquals(0, rubric.methodology)
+
+    val rendered = PdfReportExporter.renderAndInspectPdf(
+      review = unassessedReview,
+      scope = PdfExportScope.SCIENTIFIC_APPRAISAL_REPORT
+    )
+    assertTrue("PDF must display N/A or NOT ASSESSED for unassessed draft", rendered.renderedText.contains("N/A") || rendered.renderedText.contains("NOT ASSESSED"))
+    assertFalse("PDF must NEVER display fabricated 50/100 score for blocked draft", rendered.renderedText.contains("50/100"))
+  }
+
+  @Test
+  fun freshAudit06_failedChunkHydrationDowngradesVerifiedStatusAndSetsDegradedLoadState() {
+    val verifiedCloudDoc = PaperReview(
+      id = "cloud_rev_01",
+      title = "Cloud Verified Paper",
+      validationStatus = "VERIFIED",
+      findingsChunkCount = 3,
+      findingsChecksum = "a".repeat(64),
+      structuredFindingsJson = ""
+    )
+    val degraded = ReviewRepository.applyHydrationFailureState(
+      review = verifiedCloudDoc,
+      error = RuntimeException("Simulated offline chunk read failure")
+    )
+    assertEquals(LedgerLoadState.TEMPORARILY_UNAVAILABLE, degraded.ledgerLoadState)
+    assertNotEquals(
+      "Unhydrated cloud document MUST NEVER retain VERIFIED validationStatus",
+      "VERIFIED",
+      degraded.validationStatus
+    )
+    assertEquals("PROVISIONAL", degraded.validationStatus)
+
+    // Also verify corrupt inline JSON fails decodeResult & packageForCloud validation
+    val corruptInline = PaperReview(
+      id = "corrupt_inline_1",
+      validationStatus = "VERIFIED",
+      structuredFindingsJson = "{not_valid_json_array"
+    )
+    val checkedCorrupt = ReviewRepository.inspectInlineLedgerIntegrity(corruptInline)
+    assertEquals(LedgerLoadState.CORRUPT, checkedCorrupt.ledgerLoadState)
+    assertNotEquals("VERIFIED", checkedCorrupt.validationStatus)
+    assertEquals("REQUIRES_REANALYSIS", checkedCorrupt.validationStatus)
+    assertTrue(ReviewFindingCodec.decodeResult("{not_valid_json_array").isFailure)
+    val rejectedPackage = runCatching { ReviewFindingCodec.packageForCloud("{not_valid_json_array") }
+    assertTrue("Malformed small inline JSON must be rejected before Firestore write", rejectedPackage.isFailure)
+  }
+
+  @Test
+  fun freshAudit07_failedSubcollectionEnumerationAbortsParentDeleteToPreventOrphans() = runBlocking {
+    var parentDeleted = false
+    val result = ReviewRepository.deleteReviewAtomically(
+      enumerateFindingsChunks = { throw RuntimeException("Simulated network drop during findings_chunks query") },
+      enumerateNarrativeChunks = { emptyList<String>() },
+      commitDeleteRefs = {
+        parentDeleted = true
+      }
+    )
+    assertTrue("Failed child enumeration must return Result.failure", result.isFailure)
+    assertFalse("Parent review MUST NOT be deleted when child chunk enumeration fails", parentDeleted)
+
+    val narrativeFailResult = ReviewRepository.deleteReviewAtomically(
+      enumerateFindingsChunks = { listOf("f_0") },
+      enumerateNarrativeChunks = { throw RuntimeException("Simulated permission error on narrative_chunks") },
+      commitDeleteRefs = {
+        parentDeleted = true
+      }
+    )
+    assertTrue(narrativeFailResult.isFailure)
+    assertFalse("Parent review MUST NOT be deleted when narrative_chunks enumeration fails", parentDeleted)
+  }
+
+  @Test
+  fun freshAudit08_dirtyOfflineNotesAndBookmarksSurviveStaleCloudSnapshotAndSearchGrounding() = runBlocking {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val db = Room.inMemoryDatabaseBuilder(context, PaperCriticSqlDatabase::class.java)
+      .allowMainThreadQueries()
+      .build()
+    try {
+      val localRepo = LocalReviewRepository(db.sqlDao())
+      val baseReview = PaperReview(
+        id = "cloud_sync_doc_1",
+        userId = "uid_alpha",
+        title = "Sync Conflict Test Paper",
+        bookmarked = false,
+        personalNotes = "Initial cloud note",
+        updatedAt = Timestamp(Date(System.currentTimeMillis() - 60_000L))
+      )
+      localRepo.cacheReviewOffline(baseReview, ownerScope = "uid_alpha")
+
+      // User edits notes & stars offline
+      localRepo.updateBookmark(baseReview, bookmarked = true, ownerScope = "uid_alpha")
+      localRepo.updatePersonalNotes(baseReview, personalNotes = "Offline critical follow-up note", ownerScope = "uid_alpha")
+
+      // Stale cloud snapshot arrives with older values
+      val staleCloudSnapshot = baseReview.copy(
+        bookmarked = false,
+        personalNotes = "Initial cloud note",
+        updatedAt = Timestamp(Date(System.currentTimeMillis() - 30_000L))
+      )
+      localRepo.cacheReviewsOffline(listOf(staleCloudSnapshot), ownerScope = "uid_alpha")
+
+      // Field-level Stage 03b search grounding completes concurrently
+      localRepo.updateSearchGroundingReport(
+        review = baseReview,
+        report = "Verified 3 citations via Google Search.",
+        ownerScope = "uid_alpha"
+      )
+
+      val saved = localRepo.getCachedReviewsOnce("uid_alpha").first()
+      assertTrue("Dirty offline bookmark must survive stale cloud snapshot and search grounding", saved.bookmarked)
+      assertEquals("Offline critical follow-up note", saved.personalNotes)
+      val dirtyRows = localRepo.getDirtyAnnotationReviews("uid_alpha")
+      assertEquals(1, dirtyRows.size)
+      assertTrue(dirtyRows.first().bookmarkDirty && dirtyRows.first().personalNotesDirty)
+    } finally {
+      db.close()
+    }
+  }
+
+  @Test
+  fun freshAudit09_statisticalSaturationOver500ClaimsRecordsExactTruncationAndPrioritizesPrimary() {
+    val hugeManuscript = buildString {
+      appendLine("[PAGE 1]")
+      appendLine("Appendix")
+      for (i in 1..280) {
+        appendLine("Exploratory appendix check $i had OR = 1.15 (95% CI 1.01 to 1.31, p = 0.038).")
+      }
+      appendLine("[PAGE 2]")
+      appendLine("Appendix")
+      for (i in 281..540) {
+        appendLine("Secondary subgroup $i showed OR = 1.25 (95% CI 1.05 to 1.49, p = 0.012).")
+      }
+      appendLine("[PAGE 3]")
+      appendLine("Results")
+      appendLine("Primary endpoint showed HR = 0.72 (95% CI 0.58 to 0.89, p = 0.002).")
+    }
+    val ledger = StatisticalClaimParser.parse(hugeManuscript)
+    assertTrue("Total discovered claims must count all >500 claims before capping (got ${ledger.totalDiscoveredClaims})", ledger.totalDiscoveredClaims > 500)
+    assertTrue("truncatedClaimCount must accurately report omitted claims (got ${ledger.truncatedClaimCount})", ledger.truncatedClaimCount > 0)
+    assertEquals(ledger.totalDiscoveredClaims - ledger.claims.size, ledger.truncatedClaimCount)
+    assertTrue(
+      "Primary endpoint from Results (even on Page 3 after 540 exploratory claims) must be prioritized and retained",
+      ledger.claims.any {
+        it.effectMeasure.equals("HR", ignoreCase = true) &&
+          it.pointEstimate == 0.72 &&
+          it.hierarchy == AnalysisHierarchy.PRIMARY
+      }
+    )
+    assertTrue(
+      "Truncation must be explicitly disclosed in unsupportedDisclosures",
+      ledger.unsupportedDisclosures.any { it.contains("TRUNCATION", ignoreCase = true) || it.contains("omitted", ignoreCase = true) }
+    )
+  }
+
+  @Test
+  fun freshAudit10_oversizedNarrativeSectionsChunkAndReassembleLosslessly() {
+    val hugeRedTeam = (1..900).joinToString("\n") { idx ->
+      "Critique point #$idx: Detailed methodological analysis with preserved trailing marker END_$idx."
+    }
+    val hugeEditorNote = (1..700).joinToString("\n") { idx ->
+      "Editorial memo paragraph #$idx: Actionable revision requirement ITEM_$idx."
+    }
+    val review = PaperReview(
+      id = "long_narrative_1",
+      title = "Exceptionally Long Peer Review",
+      redTeamCritique = hugeRedTeam,
+      editorNote = hugeEditorNote,
+      abstractSummary = "Concise abstract."
+    )
+    assertTrue(hugeRedTeam.length > 40_000)
+
+    val packaged = NarrativeSectionCodec.packageOverflowNarratives(review)
+    assertTrue("Oversized narrative must be chunked into narrative_chunks", packaged.chunks.size >= 2)
+    assertEquals(64, packaged.checksumSha256.length)
+    assertTrue("Overflow set must identify redTeamCritique & editorNote", "redTeamCritique" in packaged.overflowFieldNames && "editorNote" in packaged.overflowFieldNames)
+
+    val truncatedParent = review.copy(
+      redTeamCritique = review.redTeamCritique.take(12_000),
+      editorNote = review.editorNote.take(8_000)
+    )
+    val reassembled = NarrativeSectionCodec.reassembleAndApply(truncatedParent, packaged.chunks, packaged.checksumSha256)
+    assertTrue("Lossless narrative reassembly must succeed", reassembled.isSuccess)
+    val restored = reassembled.getOrThrow()
+    assertEquals("Zero characters lost from redTeamCritique", hugeRedTeam, restored.redTeamCritique)
+    assertEquals("Zero characters lost from editorNote", hugeEditorNote, restored.editorNote)
+    assertEquals("Concise abstract.", restored.abstractSummary)
+
+    // Tampered narrative chunk must fail SHA-256 verification
+    val tampered = packaged.chunks.toMutableList().apply { this[0] = this[0] + "X" }
+    assertTrue(NarrativeSectionCodec.reassembleAndApply(truncatedParent, tampered, packaged.checksumSha256).isFailure)
+  }
+
+  @Test
+  fun freshAudit11_corruptPdfBytesFailExportValidationAndBlockSharing() {
+    val corruptBytes = "NOT_A_REAL_PDF_BINARY_CORRUPT_HEADER_12345".toByteArray()
+    val diagnostics = PdfReportExporter.validateExportedPdfBytes(corruptBytes)
+    assertTrue("Corrupt PDF bytes must set pdfByteIntegrityFailed = true", diagnostics.pdfByteIntegrityFailed)
+    assertFalse("Corrupt PDF bytes MUST fail isClean", diagnostics.isClean)
+    assertTrue(diagnostics.verificationFailureReason.orEmpty().isNotBlank())
+
+    val emptyDiagnostics = PdfReportExporter.validateExportedPdfBytes(ByteArray(0))
+    assertTrue("Empty PDF bytes must fail byte integrity validation", emptyDiagnostics.pdfByteIntegrityFailed)
+    assertFalse(emptyDiagnostics.isClean)
+  }
+
+  @Test
+  fun freshAudit12_repositoryAccountMismatchBlocksMutationAndOptInRecoversLegacyApiKeys() = runBlocking {
+    // 1. P1-06: Repository boundary throws SecurityException when active account != expectedUserId
+    val mismatch = runCatching {
+      ReviewRepository.verifyExpectedAccountOrThrow(activeUid = "uid_user_b", expectedUid = "uid_user_a")
+    }
+    assertTrue("Cross-account mutation must be blocked", mismatch.isFailure)
+    assertTrue(mismatch.exceptionOrNull() is SecurityException)
+
+    assertEquals(
+      "uid_user_a",
+      ReviewRepository.verifyExpectedAccountOrThrow(activeUid = "uid_user_a", expectedUid = "uid_user_a")
+    )
+
+    // 2. P1-07: Legacy/anonymous custom API provider stays isolated until explicit opt-in recovery
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val db = Room.inMemoryDatabaseBuilder(context, PaperCriticSqlDatabase::class.java)
+      .allowMainThreadQueries()
+      .build()
+    val testSecretKey = KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
+    ApiKeyVault.keyProviderOverride = { testSecretKey }
+    try {
+      val localRepo = LocalReviewRepository(db.sqlDao())
+      localRepo.upsertApiProvider(
+        AiApiProviderEntry(
+          id = "legacy_openrouter",
+          serviceName = "Legacy OpenRouter",
+          protocolType = ApiProtocolType.OPENAI_COMPATIBLE_REST,
+          baseUrl = "https://openrouter.ai/api/v1/chat/completions",
+          modelId = "deepseek/deepseek-r1:free",
+          apiKey = "sk-legacy-anon-key-123",
+          isFreeTierPreset = false,
+          enabled = true,
+          notes = "Pre-sign-in key"
+        ),
+        ownerScope = ANONYMOUS_OWNER_SCOPE
+      )
+
+      // Before opt-in: signed-in account does NOT see legacy anonymous key, count == 1
+      assertEquals(1, localRepo.observeAnonymousCustomProviderCount().first())
+      assertTrue(localRepo.observeApiProviders("uid_user_a").first().isEmpty())
+
+      // Explicit opt-in recovery migrates provider cleanly to uid_user_a and removes anonymous copy
+      val moved = localRepo.adoptAnonymousApiProvidersToAccount("uid_user_a")
+      assertEquals(1, moved)
+      assertEquals(0, localRepo.observeAnonymousCustomProviderCount().first())
+      val recovered = localRepo.observeApiProviders("uid_user_a").first()
+      assertEquals(1, recovered.size)
+      assertEquals("sk-legacy-anon-key-123", recovered.first().toDomain().apiKey)
+    } finally {
+      ApiKeyVault.keyProviderOverride = null
       db.close()
     }
   }

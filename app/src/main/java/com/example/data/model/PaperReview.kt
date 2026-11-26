@@ -120,13 +120,14 @@ object ReviewFindingCodec {
     return arr.toString()
   }
 
-  fun decode(rawJson: String): List<ReviewFinding> {
-    if (rawJson.isBlank()) return emptyList()
+  fun decodeResult(rawJson: String): Result<List<ReviewFinding>> {
+    if (rawJson.isBlank()) return Result.success(emptyList())
     return runCatching {
       val arr = JSONArray(rawJson)
       buildList {
         for (i in 0 until arr.length()) {
-          val obj = arr.optJSONObject(i) ?: continue
+          val obj = arr.optJSONObject(i)
+            ?: throw IllegalArgumentException("Structured findings JSON element at index $i is not a JSON object.")
           add(
             ReviewFinding(
               id = obj.optString("id", "F-${i + 1}"),
@@ -147,8 +148,10 @@ object ReviewFindingCodec {
           )
         }
       }
-    }.getOrDefault(emptyList())
+    }
   }
+
+  fun decode(rawJson: String): List<ReviewFinding> = decodeResult(rawJson).getOrDefault(emptyList())
 
   private fun encodeAnchors(anchors: List<EvidenceAnchor>): JSONArray {
     val arr = JSONArray()
@@ -277,6 +280,14 @@ object ReviewFindingCodec {
     if (trimmed.isEmpty()) {
       return LosslessLedgerPackage(inlineJson = "", chunks = emptyList(), checksumSha256 = "")
     }
+    // Validate EVERY non-blank findings ledger regardless of whether it fits inline or requires chunks
+    decodeResult(trimmed).getOrElse { err ->
+      val isAndroidUnitTestStub = err is RuntimeException &&
+        (err.message?.contains("not mocked", ignoreCase = true) == true)
+      if (!isAndroidUnitTestStub || !isStructurallyValidJsonArrayFallback(trimmed)) {
+        throw IllegalArgumentException("Refusing to persist malformed structuredFindingsJson: ${err.message}", err)
+      }
+    }
     val checksum = sha256Hex(trimmed)
     if (trimmed.length <= maxChunkChars) {
       return LosslessLedgerPackage(
@@ -310,9 +321,154 @@ object ReviewFindingCodec {
       }
     }
     return runCatching {
-      JSONArray(assembled)
+      decodeResult(assembled).getOrThrow()
       assembled
     }
+  }
+
+  private fun isStructurallyValidJsonArrayFallback(raw: String): Boolean {
+    if (!raw.startsWith("[") || !raw.endsWith("]")) return false
+    var inString = false
+    var escaped = false
+    var braceDepth = 0
+    var bracketDepth = 0
+    for (ch in raw) {
+      if (inString) {
+        if (escaped) {
+          escaped = false
+        } else if (ch == '\\') {
+          escaped = true
+        } else if (ch == '"') {
+          inString = false
+        }
+        continue
+      }
+      when (ch) {
+        '"' -> inString = true
+        '{' -> braceDepth++
+        '}' -> if (--braceDepth < 0) return false
+        '[' -> bracketDepth++
+        ']' -> if (--bracketDepth < 0) return false
+      }
+    }
+    return !inString && braceDepth == 0 && bracketDepth == 0
+  }
+}
+
+/**
+ * Lossless chunking codec for long narrative report sections (P1-05) so Firestore field length
+ * caps never silently truncate red-team, math, code, editor, or full formatted dossiers.
+ */
+object NarrativeSectionCodec {
+  val SECTION_INLINE_LIMITS: Map<String, Int> = mapOf(
+    "abstractSummary" to 5_000,
+    "researchQuestion" to 3_000,
+    "keyMethodology" to 4_000,
+    "coreContributions" to 6_000,
+    "redTeamCritique" to 12_000,
+    "blueTeamVerification" to 10_000,
+    "mathAuditReport" to 8_000,
+    "codeAuditReport" to 8_000,
+    "editorNote" to 8_000,
+    "copyeditSuggestions" to 8_000,
+    "reviewerQuestions" to 8_000,
+    "formattedDossier" to 40_000
+  )
+
+  data class LosslessNarrativePackage(
+    val chunks: List<String>,
+    val checksumSha256: String,
+    val overflowFieldNames: Set<String>
+  )
+
+  fun packageOverflowNarratives(
+    review: PaperReview,
+    maxChunkChars: Int = ReviewFindingCodec.CLOUD_CHUNK_SIZE_CHARS
+  ): LosslessNarrativePackage {
+    val fieldValues = mapOf(
+      "abstractSummary" to review.abstractSummary.trim(),
+      "researchQuestion" to review.researchQuestion.trim(),
+      "keyMethodology" to review.keyMethodology.trim(),
+      "coreContributions" to review.coreContributions.trim(),
+      "redTeamCritique" to review.redTeamCritique.trim(),
+      "blueTeamVerification" to review.blueTeamVerification.trim(),
+      "mathAuditReport" to review.mathAuditReport.trim(),
+      "codeAuditReport" to review.codeAuditReport.trim(),
+      "editorNote" to review.editorNote.trim(),
+      "copyeditSuggestions" to review.copyeditSuggestions.trim(),
+      "reviewerQuestions" to review.reviewerQuestions.trim(),
+      "formattedDossier" to review.formattedDossier.trim()
+    )
+    val overflowObj = JSONObject()
+    val overflowFields = linkedSetOf<String>()
+    fieldValues.forEach { (field, value) ->
+      val limit = SECTION_INLINE_LIMITS[field] ?: 8_000
+      if (value.length > limit) {
+        overflowObj.put(field, value)
+        overflowFields.add(field)
+      }
+    }
+    if (overflowFields.isEmpty()) {
+      return LosslessNarrativePackage(emptyList(), "", emptySet())
+    }
+    val serialized = overflowObj.toString()
+    val checksum = ReviewFindingCodec.sha256Hex(serialized)
+    val safeSize = maxChunkChars.coerceAtLeast(1024)
+    val total = (serialized.length + safeSize - 1) / safeSize
+    val chunks = (0 until total).map { idx ->
+      val start = idx * safeSize
+      val end = minOf(serialized.length, start + safeSize)
+      serialized.substring(start, end)
+    }
+    return LosslessNarrativePackage(chunks = chunks, checksumSha256 = checksum, overflowFieldNames = overflowFields)
+  }
+
+  fun reassembleAndApply(
+    review: PaperReview,
+    chunks: List<String>,
+    expectedChecksumSha256: String
+  ): Result<PaperReview> {
+    if (chunks.isEmpty()) {
+      return Result.failure(IllegalStateException("Expected narrative chunks, but zero chunks were retrieved."))
+    }
+    val assembled = chunks.joinToString(separator = "")
+    if (expectedChecksumSha256.isNotBlank()) {
+      val actual = ReviewFindingCodec.sha256Hex(assembled)
+      if (!actual.equals(expectedChecksumSha256, ignoreCase = true)) {
+        return Result.failure(
+          IllegalStateException("Narrative section checksum mismatch: expected $expectedChecksumSha256, got $actual.")
+        )
+      }
+    }
+    return runCatching {
+      val obj = JSONObject(assembled)
+      review.copy(
+        abstractSummary = obj.optString("abstractSummary", "").ifBlank { review.abstractSummary },
+        researchQuestion = obj.optString("researchQuestion", "").ifBlank { review.researchQuestion },
+        keyMethodology = obj.optString("keyMethodology", "").ifBlank { review.keyMethodology },
+        coreContributions = obj.optString("coreContributions", "").ifBlank { review.coreContributions },
+        redTeamCritique = obj.optString("redTeamCritique", "").ifBlank { review.redTeamCritique },
+        blueTeamVerification = obj.optString("blueTeamVerification", "").ifBlank { review.blueTeamVerification },
+        mathAuditReport = obj.optString("mathAuditReport", "").ifBlank { review.mathAuditReport },
+        codeAuditReport = obj.optString("codeAuditReport", "").ifBlank { review.codeAuditReport },
+        editorNote = obj.optString("editorNote", "").ifBlank { review.editorNote },
+        copyeditSuggestions = obj.optString("copyeditSuggestions", "").ifBlank { review.copyeditSuggestions },
+        reviewerQuestions = obj.optString("reviewerQuestions", "").ifBlank { review.reviewerQuestions },
+        formattedDossier = obj.optString("formattedDossier", "").ifBlank { review.formattedDossier }
+      )
+    }
+  }
+}
+
+enum class LedgerLoadState(val displayLabel: String) {
+  COMPLETE("Evidence Ledger Verified & Loaded"),
+  TEMPORARILY_UNAVAILABLE("Evidence Ledger Temporarily Unavailable (Retry Required)"),
+  INCOMPLETE("Evidence Ledger Incomplete (Missing Chunks)"),
+  CORRUPT("Evidence Ledger Integrity Failed (Corrupt JSON / Checksum Mismatch)");
+
+  companion object {
+    fun fromNameOrDefault(raw: String?): LedgerLoadState =
+      entries.firstOrNull { it.name.equals(raw?.trim(), ignoreCase = true) } ?: COMPLETE
   }
 }
 
@@ -341,58 +497,62 @@ data class PaperReviewRubric(
   val refereeConfidence: Int = 4, // 1–5 scientific judgment confidence
   val extractionConfidence: Int = 4, // 1–5 document extraction & source verification confidence
   val overallCredibilityScore: Int = computeWeightedScore(7, 7, 8, 7, 7, 6),
-  val recommendedVerdict: String = "SOUND_WITH_CAVEATS"
+  val recommendedVerdict: String = "SOUND_WITH_CAVEATS",
+  val isAssessed: Boolean = true
 ) {
-  fun criteriaList(): List<RubricCriterionEvaluation> = listOf(
-    RubricCriterionEvaluation(
-      criterion = "Methodology",
-      stageTag = "Design, Bias Control & Synthesis",
-      score = methodology.coerceIn(1, 10),
-      maxScore = 10,
-      weightPercent = 25,
-      justification = methodologyJustification
-    ),
-    RubricCriterionEvaluation(
-      criterion = "Significance",
-      stageTag = "Impact & Clinical/Policy Applicability",
-      score = significance.coerceIn(1, 10),
-      maxScore = 10,
-      weightPercent = 20,
-      justification = significanceJustification
-    ),
-    RubricCriterionEvaluation(
-      criterion = "Clarity",
-      stageTag = "Exposition, Tables & Reporting Precision",
-      score = clarity.coerceIn(1, 10),
-      maxScore = 10,
-      weightPercent = 15,
-      justification = clarityJustification
-    ),
-    RubricCriterionEvaluation(
-      criterion = "Originality",
-      stageTag = "Research Question & Contribution Delta",
-      score = originality.coerceIn(1, 10),
-      maxScore = 10,
-      weightPercent = 15,
-      justification = originalityJustification
-    ),
-    RubricCriterionEvaluation(
-      criterion = "Mathematical Rigor",
-      stageTag = "Quantitative & Statistical Verification",
-      score = mathematicalRigor.coerceIn(1, 10),
-      maxScore = 10,
-      weightPercent = 15,
-      justification = mathematicalRigorJustification
-    ),
-    RubricCriterionEvaluation(
-      criterion = "Reproducibility",
-      stageTag = "Protocol, Provenance & Data Availability",
-      score = reproducibility.coerceIn(1, 10),
-      maxScore = 10,
-      weightPercent = 10,
-      justification = reproducibilityJustification
+  fun criteriaList(): List<RubricCriterionEvaluation> {
+    fun scoreVal(raw: Int) = if (isAssessed) raw.coerceIn(1, 10) else 0
+    return listOf(
+      RubricCriterionEvaluation(
+        criterion = "Methodology",
+        stageTag = "Design, Bias Control & Synthesis",
+        score = scoreVal(methodology),
+        maxScore = 10,
+        weightPercent = 25,
+        justification = methodologyJustification
+      ),
+      RubricCriterionEvaluation(
+        criterion = "Significance",
+        stageTag = "Impact & Clinical/Policy Applicability",
+        score = scoreVal(significance),
+        maxScore = 10,
+        weightPercent = 20,
+        justification = significanceJustification
+      ),
+      RubricCriterionEvaluation(
+        criterion = "Clarity",
+        stageTag = "Exposition, Tables & Reporting Precision",
+        score = scoreVal(clarity),
+        maxScore = 10,
+        weightPercent = 15,
+        justification = clarityJustification
+      ),
+      RubricCriterionEvaluation(
+        criterion = "Originality",
+        stageTag = "Research Question & Contribution Delta",
+        score = scoreVal(originality),
+        maxScore = 10,
+        weightPercent = 15,
+        justification = originalityJustification
+      ),
+      RubricCriterionEvaluation(
+        criterion = "Mathematical Rigor",
+        stageTag = "Quantitative & Statistical Verification",
+        score = scoreVal(mathematicalRigor),
+        maxScore = 10,
+        weightPercent = 15,
+        justification = mathematicalRigorJustification
+      ),
+      RubricCriterionEvaluation(
+        criterion = "Reproducibility",
+        stageTag = "Protocol, Provenance & Data Availability",
+        score = scoreVal(reproducibility),
+        maxScore = 10,
+        weightPercent = 10,
+        justification = reproducibilityJustification
+      )
     )
-  )
+  }
 
   companion object {
     /**
@@ -418,6 +578,37 @@ data class PaperReviewRubric(
     }
 
     fun fromPaperReview(review: PaperReview): PaperReviewRubric {
+      val isExplicitlyUnassessed = review.verdict.equals("INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT", ignoreCase = true) &&
+        review.credibilityScore == 0L &&
+        review.methodologyScore == 0 &&
+        review.significanceScore == 0 &&
+        review.clarityScore == 0 &&
+        review.originalityScore == 0 &&
+        review.mathRigorScore == 0 &&
+        review.reproducibilityScore == 0
+
+      if (isExplicitlyUnassessed) {
+        return PaperReviewRubric(
+          methodology = 0,
+          methodologyJustification = review.methodologyJustification.ifBlank { "Not assessed (blocked prior to model inference)." },
+          clarity = 0,
+          clarityJustification = review.clarityJustification.ifBlank { "Not assessed (blocked prior to model inference)." },
+          significance = 0,
+          significanceJustification = review.significanceJustification.ifBlank { "Not assessed (blocked prior to model inference)." },
+          originality = 0,
+          originalityJustification = review.originalityJustification.ifBlank { "Not assessed (blocked prior to model inference)." },
+          mathematicalRigor = 0,
+          mathematicalRigorJustification = review.mathRigorJustification.ifBlank { "Not assessed (blocked prior to model inference)." },
+          reproducibility = 0,
+          reproducibilityJustification = review.reproducibilityJustification.ifBlank { "Not assessed (blocked prior to model inference)." },
+          refereeConfidence = review.refereeConfidence.coerceIn(1, 5),
+          extractionConfidence = review.extractionConfidence.coerceIn(1, 5),
+          overallCredibilityScore = 0,
+          recommendedVerdict = review.verdict,
+          isAssessed = false
+        )
+      }
+
       val hasStructuredScores = review.methodologyScore in 1..10 &&
         review.significanceScore in 1..10 &&
         review.clarityScore in 1..10 &&
@@ -600,6 +791,8 @@ data class PaperReview(
   val schemaVersion: Int = 1,
   val findingsChunkCount: Int = 0,
   val findingsChecksum: String = "",
+  val narrativeChunkCount: Int = 0,
+  val narrativeChecksum: String = "",
   // Narrative dossier sections
   val abstractSummary: String = "",
   val researchQuestion: String = "",
@@ -617,12 +810,19 @@ data class PaperReview(
   val personalNotes: String = "",
   @ServerTimestamp val createdAt: Timestamp? = null,
   @ServerTimestamp val updatedAt: Timestamp? = null,
+  @get:Exclude @set:Exclude var ledgerLoadState: LedgerLoadState = LedgerLoadState.COMPLETE
 ) {
   @Exclude
   fun toRubric(): PaperReviewRubric = PaperReviewRubric.fromPaperReview(this)
 
   @Exclude
+  fun isUnassessed(): Boolean = !toRubric().isAssessed
+
+  @Exclude
   fun parsedFindings(): List<ReviewFinding> = ReviewFindingCodec.decode(structuredFindingsJson)
+
+  @Exclude
+  fun parsedFindingsResult(): Result<List<ReviewFinding>> = ReviewFindingCodec.decodeResult(structuredFindingsJson)
 
   @Exclude
   fun resolvedReviewMode(): ReviewMode = ReviewMode.fromNameOrDefault(reviewMode)

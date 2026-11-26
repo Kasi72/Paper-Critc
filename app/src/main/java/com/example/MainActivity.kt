@@ -270,6 +270,8 @@ fun PaperCriticAuthenticatedShell(
   val statusBanner by viewModel.statusBanner.collectAsStateWithLifecycle()
   val unsyncedLocalCount by viewModel.unsyncedLocalCount.collectAsStateWithLifecycle()
   val adoptableAnonymousReviews by viewModel.adoptableAnonymousReviews.collectAsStateWithLifecycle()
+  val anonymousCustomProviderCount by viewModel.anonymousCustomProviderCount.collectAsStateWithLifecycle()
+  val isRetryingHydration by viewModel.isRetryingHydration.collectAsStateWithLifecycle()
   val isSyncingPortfolio by viewModel.isSyncingPortfolio.collectAsStateWithLifecycle()
 
   var showCloudSyncDialog by remember { mutableStateOf(false) }
@@ -444,7 +446,9 @@ fun PaperCriticAuthenticatedShell(
                 onUpdateChatPersona = viewModel::updateChatPersona,
                 onUpdateChatModelTier = viewModel::updateChatModelTier,
                 onUpdateChatSearchGrounding = viewModel::updateChatSearchGrounding,
-                onRunGoogleSearchVerification = viewModel::runStage03bGoogleSearchVerification
+                onRunGoogleSearchVerification = viewModel::runStage03bGoogleSearchVerification,
+                isRetryingHydration = isRetryingHydration,
+                onRetryHydration = viewModel::retryHydrateSelectedDossier
               )
             }
 
@@ -478,9 +482,11 @@ fun PaperCriticAuthenticatedShell(
                 syncedReviewCount = allReviews.count { !it.id.startsWith("local_") && it.id.isNotBlank() },
                 unsyncedLocalCount = unsyncedLocalCount,
                 adoptableAnonymousCount = adoptableAnonymousReviews.size,
+                anonymousCustomProviderCount = anonymousCustomProviderCount,
                 isSyncingPortfolio = isSyncingPortfolio,
                 onSyncPortfolioNow = viewModel::syncPortfolioToCloud,
                 onAdoptAnonymousReviews = { viewModel.adoptAnonymousReviewsForCurrentUser() },
+                onAdoptAnonymousApiProviders = viewModel::adoptAnonymousApiProvidersForCurrentUser,
                 onUpdateSettings = viewModel::updateSettings,
                 onSelectActiveProvider = viewModel::selectActiveApiProvider,
                 onSaveProvider = viewModel::saveOrUpdateApiProvider,

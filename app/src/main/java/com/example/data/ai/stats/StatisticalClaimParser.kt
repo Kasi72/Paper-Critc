@@ -31,7 +31,8 @@ object StatisticalClaimParser {
     val globalAlpha: Double,
     val sanitizedResult: SemanticValidityEngine.SanitizedTextResult? = null,
     val totalDiscoveredClaims: Int = claims.size,
-    val truncatedClaimCount: Int = 0
+    val truncatedClaimCount: Int = 0,
+    val truncatedPages: List<Int> = emptyList()
   )
 
   private const val MAX_PER_FAMILY_DISCOVERY = 500
@@ -91,7 +92,7 @@ object StatisticalClaimParser {
   // Effect sizes with CIs (with or without explicit "95%" label), capturing exact interval type (CI/CrI/UI/PI):
   // OR 2.10 (1.30–3.40), aHR = 0.74 (95% CI 0.58-0.94), OR = 1.40 (95% CrI 0.95–2.10)
   private val effectCiFlexibleRegex = Regex(
-    """\b(aOR|OR|aRR|RR|aHR|HR|IRR|PR|SMD|MD|WMD|RD|ARR|AUC|AUROC|PR-AUC|AUPRC|C-statistic|beta|β|mean|median|rate|prevalence|pooled(?:\s+\w+)?)\s*(?:of\s*|was\s*|[=:]\s*)?\s*([-−+]?\d+(?:\.\d+)?)\s*\(\s*(?:(?:(\d{2})%\s*)?(CI|CrI|UI|PI|confidence\s+interval|credible\s+interval|uncertainty\s+interval|prediction\s+interval)\s*[:=]?\s*)?([-−+]?\d+(?:\.\d+)?)\s*(?:to|–|—|-|,)\s*([-−+]?\d+(?:\.\d+)?)\s*\)""",
+    """\b(aOR|OR|aRR|RR|aHR|HR|IRR|PR|SMD|MD|WMD|RD|ARR|AUC|AUROC|PR-AUC|AUPRC|C-statistic|beta|β|mean|median|rate|prevalence|pooled(?:\s+\w+)?)\s*(?:of\s*|was\s*|[=:]\s*)?\s*([-−+]?\d+(?:\.\d+)?)\s*\(\s*(?:(?:(\d{2})%\s*)?(CI|CrI|UI|PI|confidence\s+interval|credible\s+interval|uncertainty\s+interval|prediction\s+interval)\s*[:=,]?\s*)?([-−+]?\d+(?:\.\d+)?)\s*(?:to|–|—|-|,)\s*([-−+]?\d+(?:\.\d+)?)(?:\s*[,;]\s*p(?:-?value)?\s*[=<>≤≥]\s*$NUM_SCI)?\s*\)""",
     RegexOption.IGNORE_CASE
   )
 
@@ -225,8 +226,36 @@ object StatisticalClaimParser {
       return ContextInfo(page, section, tableFig, isCitedPrior, hierarchy, adj, tail, alpha, family, window, localLine)
     }
 
+    var totalDiscoveredCount = 0
+    var truncatedCount = 0
+    val truncatedPages = linkedSetOf<Int>()
+
+    fun prioritizeAndCap(matches: Sequence<MatchResult>, limit: Int): List<MatchResult> {
+      val all = matches.toList()
+      totalDiscoveredCount += all.size
+      if (all.size <= limit) return all
+      val ranked = all.sortedBy { m ->
+        val ctx = contextAt(m.range.first)
+        when {
+          ctx.isReferenceOrCitation -> 5
+          ctx.hierarchy == AnalysisHierarchy.PRIMARY -> 0
+          ctx.section.equals("Results", ignoreCase = true) || ctx.tableFig.isNotBlank() -> 1
+          ctx.section.equals("Abstract", ignoreCase = true) -> 2
+          ctx.section.equals("Methods", ignoreCase = true) -> 3
+          else -> 4
+        }
+      }
+      val omitted = ranked.drop(limit)
+      truncatedCount += omitted.size
+      omitted.forEach { m ->
+        val pg = contextAt(m.range.first).page
+        if (pg > 0) truncatedPages.add(pg)
+      }
+      return ranked.take(limit)
+    }
+
     // 1. Flexible Test-Statistic Claims (t, z, chi2, F, r)
-    tStatFlexibleRegex.findAll(clean).take(MAX_PER_FAMILY_DISCOVERY).forEach { m ->
+    prioritizeAndCap(tStatFlexibleRegex.findAll(clean), MAX_PER_FAMILY_DISCOVERY).forEach { m ->
       val dfStr = m.groupValues[1].ifBlank { m.groupValues[2] }
       val df = dfStr.toDoubleOrNull()
       val statVal = parseSignedDouble(m.groupValues[3])
@@ -262,7 +291,7 @@ object StatisticalClaimParser {
       )
     }
 
-    zStatFlexibleRegex.findAll(clean).take(MAX_PER_FAMILY_DISCOVERY).forEach { m ->
+    prioritizeAndCap(zStatFlexibleRegex.findAll(clean), MAX_PER_FAMILY_DISCOVERY).forEach { m ->
       val statVal = parseSignedDouble(m.groupValues[1])
       val op = m.groupValues[2]
       val pVal = parseScientificDouble(m.groupValues[3])
@@ -294,7 +323,7 @@ object StatisticalClaimParser {
       )
     }
 
-    chiSqFlexibleRegex.findAll(clean).take(MAX_PER_FAMILY_DISCOVERY).forEach { m ->
+    prioritizeAndCap(chiSqFlexibleRegex.findAll(clean), MAX_PER_FAMILY_DISCOVERY).forEach { m ->
       val df = m.groupValues[1].ifBlank { m.groupValues[2] }.toDoubleOrNull()
       val statVal = parseSignedDouble(m.groupValues[3])
       val op = m.groupValues[4]
@@ -328,7 +357,7 @@ object StatisticalClaimParser {
       )
     }
 
-    fStatFlexibleRegex.findAll(clean).take(MAX_PER_FAMILY_DISCOVERY).forEach { m ->
+    prioritizeAndCap(fStatFlexibleRegex.findAll(clean), MAX_PER_FAMILY_DISCOVERY).forEach { m ->
       val df1 = m.groupValues[1].ifBlank { m.groupValues[3] }.toDoubleOrNull()
       val df2 = m.groupValues[2].ifBlank { m.groupValues[4] }.toDoubleOrNull()
       val statVal = parseSignedDouble(m.groupValues[5])
@@ -363,7 +392,7 @@ object StatisticalClaimParser {
       )
     }
 
-    rStatFlexibleRegex.findAll(clean).take(MAX_PER_FAMILY_DISCOVERY).forEach { m ->
+    prioritizeAndCap(rStatFlexibleRegex.findAll(clean), MAX_PER_FAMILY_DISCOVERY).forEach { m ->
       val df = m.groupValues[1].toDoubleOrNull()
       val rVal = parseSignedDouble(m.groupValues[2])
       val op = m.groupValues[3]
@@ -399,7 +428,7 @@ object StatisticalClaimParser {
     }
 
     // 2. Regression β + SE (+ optional CI / p)
-    regressionBetaSeRegex.findAll(clean).take(MAX_PER_FAMILY_DISCOVERY).forEach { m ->
+    prioritizeAndCap(regressionBetaSeRegex.findAll(clean), MAX_PER_FAMILY_DISCOVERY).forEach { m ->
       val beta = parseSignedDouble(m.groupValues[2])
       val se = parseSignedDouble(m.groupValues[3])
       val ctx = contextAt(m.range.first)
@@ -454,7 +483,9 @@ object StatisticalClaimParser {
       val afterStart = m.range.last + 1
       val afterEnd = (afterStart + 45).coerceAtMost(clean.length)
       val afterText = clean.substring(afterStart, afterEnd)
-      val pMatch = standalonePRegex.find(afterText)
+      val pMatchInside = standalonePRegex.find(m.value)
+      val pMatchAfter = if (pMatchInside == null) standalonePRegex.find(afterText) else null
+      val pMatch = pMatchInside ?: pMatchAfter
       val hasExplicitIntervalLabel = intervalType != IntervalType.UNSPECIFIED
       val isAmbiguousInterval = !requireExplicitCiLabel && levelPct == null && !hasExplicitIntervalLabel &&
         (label.equals("mean", ignoreCase = true) || label.equals("median", ignoreCase = true))
@@ -468,8 +499,8 @@ object StatisticalClaimParser {
         label.startsWith("a", ignoreCase = true) && label.length in 3..4 -> AdjustmentStatus.ADJUSTED
         else -> ctx.adjustment
       }
-      val quoteEnd = if (pMatch != null) {
-        (afterStart + pMatch.range.last + 1).coerceAtMost(clean.length)
+      val quoteEnd = if (pMatchAfter != null) {
+        (afterStart + pMatchAfter.range.last + 1).coerceAtMost(clean.length)
       } else {
         m.range.last + 1
       }
@@ -505,11 +536,11 @@ object StatisticalClaimParser {
       )
     }
 
-    effectCiFlexibleRegex.findAll(clean).take(MAX_PER_FAMILY_DISCOVERY).forEach { recordEffectCiMatch(it, requireExplicitCiLabel = false) }
-    effectCiNarrativeRegex.findAll(clean).take(MAX_PER_FAMILY_DISCOVERY).forEach { recordEffectCiMatch(it, requireExplicitCiLabel = true) }
+    prioritizeAndCap(effectCiFlexibleRegex.findAll(clean), MAX_PER_FAMILY_DISCOVERY).forEach { recordEffectCiMatch(it, requireExplicitCiLabel = false) }
+    prioritizeAndCap(effectCiNarrativeRegex.findAll(clean), MAX_PER_FAMILY_DISCOVERY).forEach { recordEffectCiMatch(it, requireExplicitCiLabel = true) }
 
     // 4. Proportions (x / n (pct%))
-    proportionRegex.findAll(clean).take(MAX_PER_FAMILY_DISCOVERY).forEach { m ->
+    prioritizeAndCap(proportionRegex.findAll(clean), MAX_PER_FAMILY_DISCOVERY).forEach { m ->
       val num = m.groupValues[1].toDoubleOrNull()
       val den = m.groupValues[2].toDoubleOrNull()
       val pct = m.groupValues[3].toDoubleOrNull()
@@ -541,7 +572,7 @@ object StatisticalClaimParser {
     }
 
     // 5. Mean ± SD claims
-    meanSdRegex.findAll(clean).take(MAX_PER_FAMILY_DISCOVERY).forEach { m ->
+    prioritizeAndCap(meanSdRegex.findAll(clean), MAX_PER_FAMILY_DISCOVERY).forEach { m ->
       val mean = parseSignedDouble(m.groupValues[1])
       val sd = parseSignedDouble(m.groupValues[2])
       val ctx = contextAt(m.range.first)
@@ -642,7 +673,8 @@ object StatisticalClaimParser {
 
     // 9. Standalone p-values not already captured by test-statistic claims (for family-scoped FDR/FWER)
     val capturedOffsets = claims.map { it.startOffset..it.endOffset }
-    standalonePRegex.findAll(clean).take(MAX_PER_FAMILY_DISCOVERY).forEach { m ->
+    val uncapturedStandaloneP = standalonePRegex.findAll(clean).filter { m -> capturedOffsets.none { m.range.first in it } }
+    prioritizeAndCap(uncapturedStandaloneP, MAX_PER_FAMILY_DISCOVERY).forEach { m ->
       if (capturedOffsets.any { m.range.first in it }) return@forEach
       val op = m.groupValues[1]
       val pVal = parseScientificDouble(m.groupValues[2]) ?: return@forEach
@@ -678,8 +710,18 @@ object StatisticalClaimParser {
     // 11. Cross-section linkage & contradiction checks
     val crossLinks = buildCrossSectionLinks(clean, claims, sampleFlow, lower)
 
-    // 12. Unsupported input disclosures (transparently flag missing raw tables/SEs/denominators)
+    // 12. Unsupported input disclosures (transparently flag missing raw tables/SEs/denominators & any cap truncation)
     detectUnsupportedInputs(clean, lower, claims, twoByTwoTables, metaStudies, unsupportedDisclosures)
+    if (truncatedCount > 0) {
+      val pageLabel = if (truncatedPages.isNotEmpty()) {
+        " on page(s) ${truncatedPages.sorted().joinToString(", ")}"
+      } else {
+        ""
+      }
+      unsupportedDisclosures.add(
+        "Quantitative claim discovery cap reached: $truncatedCount additional claim(s)$pageLabel were omitted beyond the $MAX_PER_FAMILY_DISCOVERY-per-family cap (total discovered: $totalDiscoveredCount); quantitative coverage is incomplete."
+      )
+    }
 
     return ParsedManuscriptLedger(
       claims = claims,
@@ -690,7 +732,10 @@ object StatisticalClaimParser {
       unsupportedDisclosures = unsupportedDisclosures.distinct(),
       globalTailSpec = globalTailSpec,
       globalAlpha = globalAlpha,
-      sanitizedResult = sanitized
+      sanitizedResult = sanitized,
+      totalDiscoveredClaims = maxOf(totalDiscoveredCount, claims.size),
+      truncatedClaimCount = truncatedCount,
+      truncatedPages = truncatedPages.sorted()
     )
   }
 

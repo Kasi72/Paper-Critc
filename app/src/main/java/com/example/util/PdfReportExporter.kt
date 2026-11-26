@@ -20,6 +20,7 @@ import com.example.data.ai.epistemic.ReportingStatus
 import com.example.data.model.FindingStatus
 import com.example.data.model.PaperReview
 import com.example.data.model.ReviewFinding
+import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
 import com.tom_roush.pdfbox.pdmodel.PDDocument
 import com.tom_roush.pdfbox.text.PDFTextStripper
 import java.io.ByteArrayInputStream
@@ -69,10 +70,16 @@ data class PdfRenderDiagnostics(
   val internalEnumCount: Int,
   val clippedContentDetected: Boolean,
   val extractedFromPdfBytes: Boolean = false,
-  val pageCount: Int = 1
+  val pageCount: Int = 1,
+  val pdfByteIntegrityFailed: Boolean = false,
+  val verificationFailureReason: String? = null
 ) {
   val isClean: Boolean
-    get() = rawHeaderCount == 0 && rawMarkdownRowCount == 0 && internalEnumCount == 0 && !clippedContentDetected
+    get() = rawHeaderCount == 0 &&
+      rawMarkdownRowCount == 0 &&
+      internalEnumCount == 0 &&
+      !clippedContentDetected &&
+      !pdfByteIntegrityFailed
 }
 
 /**
@@ -145,10 +152,66 @@ object PdfReportExporter {
     val diagnostics: PdfRenderDiagnostics
   )
 
+  /**
+   * Validates actual exported PDF bytes via PDFBox.
+   * - If [pdfBytes] are corrupted / unreadable / non-PDF when [requireByteExtraction] is true
+   *   (or whenever non-empty bytes fail PDFBox parsing), sets [PdfRenderDiagnostics.pdfByteIntegrityFailed] = true
+   *   so [PdfRenderDiagnostics.isClean] is GUARANTEED to be false and sharing/saving is blocked!
+   */
+  fun validateExportedPdfBytes(
+    pdfBytes: ByteArray,
+    fallbackText: String = "",
+    clippedContentDetected: Boolean = false,
+    fallbackPageCount: Int = 1,
+    requireByteExtraction: Boolean = true
+  ): PdfRenderDiagnostics {
+    val pdfBoxExtracted = extractTextFromPdfBytes(pdfBytes)
+    if (pdfBoxExtracted != null) {
+      val (text, pages) = pdfBoxExtracted
+      val base = inspectRenderedText(
+        extractedText = text,
+        clippedContentDetected = clippedContentDetected,
+        extractedFromPdfBytes = true,
+        pageCount = pages
+      )
+      return base.copy(
+        pdfByteIntegrityFailed = false,
+        verificationFailureReason = if (base.isClean) null else "Exported PDF contains raw markup or clipped layout."
+      )
+    }
+    // Whenever byte extraction is required (all production exports & integrity checks),
+    // or when no canvas fallback text exists, unreadable/empty bytes MUST fail the gate!
+    if (requireByteExtraction || fallbackText.isBlank()) {
+      val reason = if (pdfBytes.isEmpty()) {
+        "Exported PDF payload is empty (0 bytes)."
+      } else {
+        "Exported PDF bytes failed PDFBox structural/text verification (corrupted or unreadable PDF)."
+      }
+      val base = inspectRenderedText(
+        extractedText = fallbackText,
+        clippedContentDetected = clippedContentDetected,
+        extractedFromPdfBytes = false,
+        pageCount = fallbackPageCount.coerceAtLeast(1)
+      )
+      return base.copy(
+        pdfByteIntegrityFailed = true,
+        verificationFailureReason = reason
+      )
+    }
+    // Headless Robolectric shadow PdfDocument fallback (only when requireByteExtraction = false)
+    return inspectRenderedText(
+      extractedText = fallbackText,
+      clippedContentDetected = clippedContentDetected,
+      extractedFromPdfBytes = false,
+      pageCount = fallbackPageCount.coerceAtLeast(1)
+    )
+  }
+
   fun renderAndInspectPdf(
     review: PaperReview,
     scope: PdfExportScope = PdfExportScope.SCIENTIFIC_APPRAISAL_REPORT,
-    precomputedQuantBlocks: List<ReportBlock>? = null
+    precomputedQuantBlocks: List<ReportBlock>? = null,
+    requireByteExtraction: Boolean = false
   ): RenderedPdfResult {
     val baos = ByteArrayOutputStream()
     val textSink = StringBuilder()
@@ -164,15 +227,14 @@ object PdfReportExporter {
       pageCountTracker = pageCountTracker
     )
     val bytes = baos.toByteArray()
-    val pdfBoxExtracted = extractTextFromPdfBytes(bytes)
-    val inspectedText = pdfBoxExtracted?.first ?: textSink.toString()
-    val resolvedPages = pdfBoxExtracted?.second ?: pageCountTracker[0].coerceAtLeast(1)
-    val diag = inspectRenderedText(
-      extractedText = inspectedText,
+    val diag = validateExportedPdfBytes(
+      pdfBytes = bytes,
+      fallbackText = textSink.toString(),
       clippedContentDetected = clipTracker[0],
-      extractedFromPdfBytes = pdfBoxExtracted != null,
-      pageCount = resolvedPages
+      fallbackPageCount = pageCountTracker[0].coerceAtLeast(1),
+      requireByteExtraction = requireByteExtraction
     )
+    val inspectedText = extractTextFromPdfBytes(bytes)?.first ?: textSink.toString()
     return RenderedPdfResult(
       pdfBytes = bytes,
       renderedText = inspectedText,
@@ -263,8 +325,20 @@ object PdfReportExporter {
     val outFile = File(exportsDir, finalName)
     val tempFile = File(exportsDir, "$finalName.tmp")
     try {
+      runCatching { PDFBoxResourceLoader.init(context.applicationContext) }
+      val rendered = renderAndInspectPdf(
+        review = review,
+        scope = scope,
+        requireByteExtraction = true
+      )
+      if (!rendered.diagnostics.isClean) {
+        throw IllegalStateException(
+          "PDF export blocked by integrity gate: ${rendered.diagnostics.verificationFailureReason ?: "raw markup or byte verification failure"} " +
+            "(headers=${rendered.diagnostics.rawHeaderCount}, tables=${rendered.diagnostics.rawMarkdownRowCount}, enums=${rendered.diagnostics.internalEnumCount}, byteFailed=${rendered.diagnostics.pdfByteIntegrityFailed})"
+        )
+      }
       FileOutputStream(tempFile).use { stream ->
-        renderReviewToPdfStream(review, stream, scope)
+        stream.write(rendered.pdfBytes)
       }
       if (!tempFile.renameTo(outFile)) {
         tempFile.copyTo(outFile, overwrite = true)
@@ -290,13 +364,18 @@ object PdfReportExporter {
     val uri = createShareablePdfUri(context, review, scope)
     val normalizedTitle = DossierFormattingEngine.normalizeTitle(review.title)
     val rubric = review.toRubric()
+    val scoreSummary = if (rubric.isAssessed) {
+      "Weighted Score: ${rubric.overallCredibilityScore}/100"
+    } else {
+      "Score: Not Assessed"
+    }
     val shareIntent = Intent(Intent.ACTION_SEND).apply {
       type = "application/pdf"
       putExtra(Intent.EXTRA_SUBJECT, "Paper Critic ${scope.displayName}: $normalizedTitle")
       putExtra(
         Intent.EXTRA_TEXT,
         "Attached is the Paper Critic ${scope.displayName} for \"$normalizedTitle\" " +
-          "(Weighted Score: ${rubric.overallCredibilityScore}/100 • Assessment: ${review.verdict.replace('_', ' ')})."
+          "($scoreSummary • Assessment: ${review.verdict.replace('_', ' ')})."
       )
       putExtra(Intent.EXTRA_STREAM, uri)
       addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
@@ -318,8 +397,19 @@ object PdfReportExporter {
     scope: PdfExportScope = PdfExportScope.SCIENTIFIC_APPRAISAL_REPORT
   ): Result<Unit> = withContext(Dispatchers.IO) {
     try {
+      runCatching { PDFBoxResourceLoader.init(context.applicationContext) }
+      val rendered = renderAndInspectPdf(
+        review = review,
+        scope = scope,
+        requireByteExtraction = true
+      )
+      if (!rendered.diagnostics.isClean) {
+        throw IllegalStateException(
+          "PDF save blocked by integrity gate: ${rendered.diagnostics.verificationFailureReason ?: "raw markup or byte verification failure"}"
+        )
+      }
       context.contentResolver.openOutputStream(targetUri)?.use { out ->
-        renderReviewToPdfStream(review, out, scope)
+        out.write(rendered.pdfBytes)
       } ?: throw IllegalStateException("Could not open destination output stream for PDF.")
       Result.success(Unit)
     } catch (e: CancellationException) {
@@ -1285,12 +1375,17 @@ object PdfReportExporter {
       scoreAccentPaint
     )
 
-    val scoreText = "$authoritativeScore"
+    val scoreText = if (rubric.isAssessed) "$authoritativeScore" else "N/A"
     val scoreW = scoreBigPaint.measureText(scoreText)
     canvas.drawText(scoreText, scoreBoxLeft + (scoreBoxW - scoreW) / 2f, scoreBoxTop + 33f, scoreBigPaint)
-    val subScoreText = if (isProvisionalVerdict) "/ 100 PROVISIONAL" else "/ 100 WEIGHTED"
+    val subScoreText = when {
+      !rubric.isAssessed -> "NOT ASSESSED"
+      isProvisionalVerdict -> "/ 100 PROVISIONAL"
+      else -> "/ 100 WEIGHTED"
+    }
     val subW = scoreSubPaint.measureText(subScoreText)
     canvas.drawText(subScoreText, scoreBoxLeft + (scoreBoxW - subW) / 2f, scoreBoxTop + 49f, scoreSubPaint)
+    recordText("Score: $scoreText $subScoreText")
 
     cursorY += bannerH + 12f
 
@@ -1450,9 +1545,9 @@ object PdfReportExporter {
         barFillPaint
       )
 
-      val scoreLabel = "${item.score}/${item.maxScore}"
+      val scoreLabel = if (rubric.isAssessed) "${item.score}/${item.maxScore}" else "N/A"
       val scoreLabelPaint = TextPaint(monoPaint).apply {
-        color = axisScoreColor(item.score)
+        color = if (rubric.isAssessed) axisScoreColor(item.score) else Color.rgb(100, 116, 139)
         typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
       }
       canvas.drawText(scoreLabel, barStartX + barW + 12f, rowBaseline, scoreLabelPaint)

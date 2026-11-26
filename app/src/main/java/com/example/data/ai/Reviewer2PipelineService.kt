@@ -829,7 +829,7 @@ class Reviewer2PipelineService {
         title.ifBlank { "Unreadable / Incomplete Manuscript" }
       )
       val safeAuthors = authors.trim().ifBlank { "Authors Not Disclosed" }
-      val safeYear = year.trim().ifBlank { "2026" }
+      val safeYear = year.trim()
       val safeVenue = venueOrCitation.trim().ifBlank { options.targetVenue }
       val gateReason = readinessGate.blockingReasons.joinToString("; ")
       val gateFinding = ReviewFinding(
@@ -846,39 +846,40 @@ class Reviewer2PipelineService {
         overturnEvidence = "Upload a text-searchable PDF, OCR-processed PDF, Word (.docx), or plain-text version with Methods, Results, and tables."
       )
       val gateNote = buildString {
-        appendLine("PRE-INFERENCE DOCUMENT-READINESS GATE — APPRAISAL PAUSED")
+        appendLine("PRE-INFERENCE DOCUMENT-READINESS GATE — APPRAISAL PAUSED (NOT ASSESSED)")
         appendLine("Blocking issues: $gateReason")
         appendLine()
         appendLine("Required actions before full appraisal:")
         readinessGate.requestedActions.forEach { act -> appendLine("• $act") }
       }.trim()
-      val disclosure = "${effectiveCoverageReport.toDisclosureLine(overrideExtractionConfidence = 1)} • Pre-inference gate: paused (0 LLM passes executed)"
+      val disclosure = "${effectiveCoverageReport.toDisclosureLine(overrideExtractionConfidence = 1)} • Pre-inference gate: paused (0 LLM passes executed; scores Not Assessed)"
       return PaperReview(
         title = safeTitle,
         authors = safeAuthors,
         publicationYear = safeYear,
         venueOrCitation = safeVenue,
         isEmpirical = options.isEmpirical,
-        credibilityScore = 50L,
+        credibilityScore = 0L,
         verdict = "INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT",
-        methodologyScore = 5,
-        significanceScore = 5,
-        clarityScore = 5,
-        originalityScore = 5,
-        mathRigorScore = 5,
-        reproducibilityScore = 5,
-        methodologyJustification = "Not assessable prior to searchable full-text ingestion.",
-        significanceJustification = "Not assessable prior to searchable full-text ingestion.",
-        clarityJustification = "Not assessable prior to searchable full-text ingestion.",
-        originalityJustification = "Not assessable prior to searchable full-text ingestion.",
-        mathRigorJustification = "Not assessable prior to searchable full-text ingestion.",
-        reproducibilityJustification = "Not assessable prior to searchable full-text ingestion.",
+        methodologyScore = 0,
+        significanceScore = 0,
+        clarityScore = 0,
+        originalityScore = 0,
+        mathRigorScore = 0,
+        reproducibilityScore = 0,
+        methodologyJustification = "Not assessed prior to searchable full-text ingestion.",
+        significanceJustification = "Not assessed prior to searchable full-text ingestion.",
+        clarityJustification = "Not assessed prior to searchable full-text ingestion.",
+        originalityJustification = "Not assessed prior to searchable full-text ingestion.",
+        mathRigorJustification = "Not assessed prior to searchable full-text ingestion.",
+        reproducibilityJustification = "Not assessed prior to searchable full-text ingestion.",
         refereeConfidence = 1,
         extractionConfidence = 1,
         reviewMode = options.reviewMode.name,
         coverageDisclosure = disclosure,
-        validationStatus = "PROVISIONAL",
+        validationStatus = "UNVERIFIED",
         structuredFindingsJson = ReviewFindingCodec.encode(listOf(gateFinding)),
+        schemaVersion = 5,
         abstractSummary = gateNote,
         researchQuestion = "Unavailable due to incomplete/unsearchable document input.",
         keyMethodology = "Unavailable due to incomplete/unsearchable document input.",
@@ -3541,6 +3542,97 @@ class Reviewer2PipelineService {
       }.trim()
     }
 
+    private enum class ClaimPolarity {
+      ABSENT_OR_DEFICIENT,
+      PRESENT_OR_ADEQUATE,
+      NEUTRAL
+    }
+
+    private fun classifyClaimPolarity(text: String): ClaimPolarity {
+      val absentRegex = Regex(
+        """(?i)\b(?:absent|missing|omitted|not\s+(?:properly\s+|adequately\s+|fully\s+)?(?:performed|conducted|reported|assessed|included|adjusted|blinded|registered|validated|verified)|(?:was|were)\s+(?:not|never)\s+(?:properly\s+|adequately\s+|fully\s+)?(?:performed|conducted|reported|assessed|included|adjusted|blinded|registered|validated|verified)|did\s+not\s+(?:perform|conduct|report|assess|include|adjust|control|blind|preregister|validate|verify)|never\s+(?:performed|conducted|reported|assessed|blinded|adjusted|validated)|no\s+(?:sensitivity\s+analysis|blinding|allocation\s+concealment|adjustment|control|protocol|preregistration|calibration|external\s+validation)|failed\s+to|lacks?|lacked|without\s+(?:sensitivity|blinding|adjustment|control|calibration|correction)|unadjusted|unblinded|open[\s-]?label|unregistered|contradict(?:s|ed|ion)?|discrepancy|miscalculat(?:ed|ion)|invalid(?:ate|ated)?|arithmetic\s+error|leakage|overfit(?:ting)?|violat(?:es|ed|ion)|flaw(?:ed|s)?|bias(?:ed)?)\b"""
+      )
+      val presentRegex = Regex(
+        """(?i)\b(?:(?:was|were)\s+(?:(?:properly|adequately|fully|rigorously|thoroughly|explicitly|appropriately|formally|successfully|clearly)\s+)?(?:performed|conducted|reported|assessed|included|adjusted|blinded|preregistered|registered|verified|confirmed|validated|implemented|executed)|(?:authors|study|investigators|trial)\s+(?:(?:properly|adequately|fully|rigorously|explicitly)\s+)?(?:performed|conducted|reported|included|adjusted|controlled|blinded|assessed|validated|verified|confirmed)|performed\s+(?:a\s+|an\s+|the\s+)?(?:sensitivity|blinding|adjustment|calibration|external\s+validation|funnel|egger)|conducted\s+(?:a\s+|an\s+|the\s+)?(?:sensitivity|blinding|adjustment|calibration|external\s+validation)|confirmed\s+(?:robustness|consistency|validity|results)|adequately\s+(?:reported|controlled|adjusted|blinded|powered|conducted|performed|validated)|properly\s+(?:blinded|controlled|adjusted|randomized|conducted|performed|validated|assessed|reported)|no\s+(?:discrepancy|contradiction|bias|leakage|error|flaw)|fully\s+(?:consistent|reproducible|transparent|adjusted|validated)|well[\s-]?controlled|robust\s+to\s+sensitivity)\b"""
+      )
+      val hasAbsent = absentRegex.containsMatchIn(text)
+      val hasPresent = presentRegex.containsMatchIn(text)
+      return when {
+        hasAbsent && !hasPresent -> ClaimPolarity.ABSENT_OR_DEFICIENT
+        hasPresent && !hasAbsent -> ClaimPolarity.PRESENT_OR_ADEQUATE
+        hasAbsent && hasPresent -> {
+          // Compare which cue appears closer to the main verb/clause: explicit negation ("not performed") dominates
+          if (Regex("""(?i)\b(?:not\s+(?:properly\s+|adequately\s+|fully\s+)?(?:performed|conducted|reported|assessed|validated)|did\s+not|was\s+(?:not|never)|were\s+(?:not|never)|absent|omitted|missing|failed\s+to|lacks?)\b""").containsMatchIn(text)) {
+            ClaimPolarity.ABSENT_OR_DEFICIENT
+          } else {
+            ClaimPolarity.NEUTRAL
+          }
+        }
+        else -> ClaimPolarity.NEUTRAL
+      }
+    }
+
+    /**
+     * P0-04 Semantic Consistency Gate:
+     * Treats finding IDs as pointers, NOT proof. Verifies that an AI prose sentence expresses a
+     * proposition consistent in polarity, method-status, direction/significance, and domain scope
+     * with the referenced verified [ReviewFinding] before it can ever be promoted as verified.
+     */
+    internal fun isProseSemanticallyConsistentWithFinding(
+      sentence: String,
+      finding: ReviewFinding
+    ): Boolean {
+      val cleanSentence = sentence.replace(Regex("""\[[A-Z]-\d{1,3}\]"""), " ").trim()
+      if (cleanSentence.length < 8) return false
+      val findingText = "${finding.title}. ${finding.allegation}"
+
+      // 1. Polarity / Method-Status opposition check (e.g., "absent" vs "was performed")
+      val sentPolarity = classifyClaimPolarity(cleanSentence)
+      val findingPolarity = classifyClaimPolarity(findingText)
+      if ((sentPolarity == ClaimPolarity.PRESENT_OR_ADEQUATE && findingPolarity == ClaimPolarity.ABSENT_OR_DEFICIENT) ||
+        (sentPolarity == ClaimPolarity.ABSENT_OR_DEFICIENT && findingPolarity == ClaimPolarity.PRESENT_OR_ADEQUATE)
+      ) {
+        return false
+      }
+
+      // 2. Significance & directional opposition check
+      val sentSig = Regex("""(?i)\bstatistically\s+significant\b""").containsMatchIn(cleanSentence) &&
+        !Regex("""(?i)\b(?:not|non)[\s-]+(?:statistically\s+)?significant\b""").containsMatchIn(cleanSentence)
+      val sentNonSig = Regex("""(?i)\b(?:not|non)[\s-]+(?:statistically\s+)?significant\b""").containsMatchIn(cleanSentence)
+      val findSig = Regex("""(?i)\bstatistically\s+significant\b""").containsMatchIn(findingText) &&
+        !Regex("""(?i)\b(?:not|non)[\s-]+(?:statistically\s+)?significant\b""").containsMatchIn(findingText)
+      val findNonSig = Regex("""(?i)\b(?:not|non)[\s-]+(?:statistically\s+)?significant\b""").containsMatchIn(findingText)
+      if ((sentSig && findNonSig) || (sentNonSig && findSig)) return false
+
+      val upRegex = Regex("""(?i)\b(?:overestimat\w*|inflat\w*|higher|increas\w*|positive\s+effect)\b""")
+      val downRegex = Regex("""(?i)\b(?:underestimat\w*|deflat\w*|lower|decreas\w*|negative\s+effect)\b""")
+      val sUp = upRegex.containsMatchIn(cleanSentence) && !downRegex.containsMatchIn(cleanSentence)
+      val sDown = downRegex.containsMatchIn(cleanSentence) && !upRegex.containsMatchIn(cleanSentence)
+      val fUp = upRegex.containsMatchIn(findingText) && !downRegex.containsMatchIn(findingText)
+      val fDown = downRegex.containsMatchIn(findingText) && !upRegex.containsMatchIn(findingText)
+      if ((sUp && fDown) || (sDown && fUp)) return false
+
+      // 3. Domain / Subject scope overlap: prevent unrelated prose from borrowing a verified ID
+      val stopWords = setOf(
+        "the", "and", "for", "with", "that", "this", "from", "were", "was", "are", "not", "but",
+        "have", "has", "had", "into", "their", "they", "study", "paper", "authors", "reported",
+        "analysis", "results", "data", "model", "method", "methods"
+      )
+      fun contentTokens(s: String): Set<String> = s.lowercase(Locale.US)
+        .split(Regex("""[^a-z0-9²]+"""))
+        .filter { it.length >= 4 && it !in stopWords }
+        .toSet()
+      val sentTokens = contentTokens(cleanSentence)
+      val findTokens = contentTokens(findingText)
+      val numericRegex = Regex("""\b\d+(?:\.\d+)?%?\b""")
+      val sentNums = numericRegex.findAll(cleanSentence).map { it.value }.toSet()
+      val findNums = numericRegex.findAll(findingText).map { it.value }.toSet()
+      val sharedNums = sentNums.intersect(findNums).size
+      val sharedTokens = sentTokens.intersect(findTokens).size
+
+      return sharedTokens >= 2 || (sharedTokens >= 1 && sharedNums >= 1)
+    }
+
     internal fun buildEvidenceGovernedReportSection(
       title: String,
       rawProse: String,
@@ -3557,7 +3649,7 @@ class Reviewer2PipelineService {
       val unverifiedOrPartialFindings = adjudicatedFindings.filter {
         it.status == FindingStatus.UNVERIFIED || it.status == FindingStatus.PARTIALLY_SUPPORTED
       }
-      val verifiedIdSet = verifiedFindings.map { it.id.uppercase(Locale.US) }.toSet()
+      val verifiedById = verifiedFindings.associateBy { it.id.uppercase(Locale.US) }
       val unverifiedIdSet = unverifiedOrPartialFindings.map { it.id.uppercase(Locale.US) }.toSet()
       val findingIdRegex = Regex("""\[([A-Z]-\d{1,3})\]""")
       val allegationCueRegex = Regex(
@@ -3585,20 +3677,33 @@ class Reviewer2PipelineService {
           return@forEach
         }
         val explicitIds = findingIdRegex.findAll(line).map { it.groupValues[1].uppercase(Locale.US) }.distinct().toList()
-        val matchedVerifiedIds = explicitIds.filter { it in verifiedIdSet }.toMutableList()
+        val explicitVerifiedIds = explicitIds.filter { it in verifiedById }
         val matchedUnverifiedIds = explicitIds.filter { it in unverifiedIdSet }
 
-        if (matchedVerifiedIds.isEmpty() && matchedUnverifiedIds.isEmpty() && adjudicatedFindings.isNotEmpty()) {
+        // P0-04: Explicit finding IDs are pointers, NOT proof — verify semantic consistency!
+        val semanticallyConsistentVerifiedIds = explicitVerifiedIds.filter { id ->
+          val target = verifiedById[id]
+          target != null && isProseSemanticallyConsistentWithFinding(line, target)
+        }.toMutableList()
+        val hadContradictedExplicitPointer = explicitVerifiedIds.isNotEmpty() && semanticallyConsistentVerifiedIds.isEmpty()
+
+        var hadContradictedImplicitOverlap = false
+        if (explicitVerifiedIds.isEmpty() && matchedUnverifiedIds.isEmpty() && adjudicatedFindings.isNotEmpty()) {
           val lineTokens = tokenize(line)
           verifiedTokenMap.forEach { (id, fTokens) ->
             if (fTokens.size >= 2) {
               val hits = lineTokens.intersect(fTokens).size
               if (hits >= 3 && hits.toDouble() / fTokens.size.toDouble() >= 0.40) {
-                matchedVerifiedIds.add(id)
+                val target = verifiedById[id.uppercase(Locale.US)]
+                if (target != null && isProseSemanticallyConsistentWithFinding(line, target)) {
+                  semanticallyConsistentVerifiedIds.add(id)
+                } else {
+                  hadContradictedImplicitOverlap = true
+                }
               }
             }
           }
-          if (matchedVerifiedIds.isEmpty()) {
+          if (semanticallyConsistentVerifiedIds.isEmpty() && !hadContradictedImplicitOverlap) {
             val matchesUnverified = unverifiedTokenMap.values.any { uTokens ->
               if (uTokens.size < 2) false
               else {
@@ -3614,9 +3719,9 @@ class Reviewer2PipelineService {
         }
 
         when {
-          matchedVerifiedIds.isNotEmpty() -> {
-            val idsSorted = matchedVerifiedIds.distinct()
-            val anchoredLine = if (explicitIds.any { it in verifiedIdSet }) {
+          semanticallyConsistentVerifiedIds.isNotEmpty() -> {
+            val idsSorted = semanticallyConsistentVerifiedIds.distinct()
+            val anchoredLine = if (explicitVerifiedIds.any { it in idsSorted }) {
               line
             } else {
               "[${idsSorted.joinToString(", ")}] $line"
@@ -3629,13 +3734,17 @@ class Reviewer2PipelineService {
               )
             )
           }
+          hadContradictedExplicitPointer || hadContradictedImplicitOverlap -> {
+            // Quarantine opposing/misaligned prose as provisional open question and strip false verified ID tag
+            val strippedLine = findingIdRegex.replace(line, "").replace(Regex("""\s+"""), " ").trim()
+            openQuestions.add("Provisional / Semantic Conflict Requiring Verification: $strippedLine")
+          }
           matchedUnverifiedIds.isNotEmpty() -> {
             openQuestions.add(line)
           }
           adjudicatedFindings.isNotEmpty() && allegationCueRegex.containsMatchIn(line) &&
             !line.contains("dismissed", ignoreCase = true) &&
             !line.contains("counterevidence", ignoreCase = true) -> {
-            // Unanchored substantive criticism -> quarantine as open question instead of verified fact
             openQuestions.add(line)
           }
           else -> {
@@ -3970,7 +4079,6 @@ class Reviewer2PipelineService {
       val refCut = Regex("""(?im)^\s*(?:\d+(?:\.\d+)*\.?\s+)?(references|bibliography|works\s+cited)\s*$""")
         .find(manuscriptText)?.range?.first ?: manuscriptText.length
       val bodyText = manuscriptText.substring(0, refCut)
-      val lower = bodyText.lowercase(Locale.US)
 
       // Determine GRADE starting level strictly from study design (RCT=High(3), Observational=Low(1))
       val (startingLevel, startingRank) = when (subDesign) {
@@ -3987,17 +4095,22 @@ class Reviewer2PipelineService {
         else -> "Not Assessable (Non-Clinical / Uncertain Design)" to -1
       }
 
-      val hasOutcomeEffectEvidence = (statAudit?.claims?.isNotEmpty() == true) ||
+      // P0-03: Require structured clinical PICO + quantitative outcome effect profile
+      val hasPopulation = Regex("""(?i)\b(?:patients?|participants?|subjects?|adults?|children|infants?|cohorts?|individuals?)\b""").containsMatchIn(bodyText)
+      val hasComparator = Regex("""(?i)\b(?:placebo|control\s+(?:group|arm)|standard\s+of\s+care|usual\s+care|comparator|versus|vs\.?\s+(?:standard|usual|placebo|control|sham)|randomized\s+to\s+[^.\n]{1,60}\bor\b)\b""").containsMatchIn(bodyText)
+      val hasOutcomeEffectEvidence = (statAudit?.claims?.any { !it.isFromReferenceOrCitation && (it.ciLower != null || it.pointEstimate != null) } == true) ||
         Regex(
           """(?i)\b(?:hr|or|rr|irr|md|smd|ard|arr|nnt|risk\s+ratio|odds\s+ratio|hazard\s+ratio|mean\s+difference|mortality|survival|remission|hospitalization|event\s+rate)\b[^.\n]{0,80}(?:\d+(?:\.\d+)?|\bci\b|\bp\s*[=<>])"""
         ).containsMatchIn(bodyText) ||
         Regex("""\b\d+\s*/\s*\d+\b[^.\n]{0,40}\b(?:vs\.?|versus)\b[^.\n]{0,40}\b\d+\s*/\s*\d+\b""", RegexOption.IGNORE_CASE).containsMatchIn(bodyText)
 
-      if (startingRank < 0 || extractionConfidence <= 2 || statAudit?.designClassification?.abstained == true || !hasOutcomeEffectEvidence) {
-        val reason = if (!hasOutcomeEffectEvidence && startingRank >= 0) {
-          "GRADE certainty cannot be rated because no explicit clinical outcome effect profile (effect estimate, confidence interval, or comparative event counts) was extracted from the supplied text."
-        } else {
-          "GRADE certainty cannot be rated because study design, outcome-specific bias domains, or source extraction are insufficient."
+      if (startingRank < 0 || extractionConfidence <= 2 || statAudit?.designClassification?.abstained == true || !hasOutcomeEffectEvidence || !hasPopulation || !hasComparator) {
+        val missingParts = buildList {
+          if (startingRank < 0) add("clinical study design")
+          if (extractionConfidence <= 2) add("sufficient extraction confidence")
+          if (!hasPopulation) add("target clinical population")
+          if (!hasComparator) add("explicit comparator/control arm")
+          if (!hasOutcomeEffectEvidence) add("outcome-specific quantitative effect estimate")
         }
         return GradeCertaintyAssessment(
           startingLevel = startingLevel,
@@ -4009,7 +4122,7 @@ class Reviewer2PipelineService {
           publicationBias = GradeDomainConcern.NOT_ASSESSABLE,
           verdictEnum = "INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT",
           isAssessable = false,
-          rationale = reason
+          rationale = "GRADE certainty withheld because structured outcome-specific PICO/evidence inputs are missing: ${missingParts.joinToString(", ")}."
         )
       }
 
@@ -4024,34 +4137,61 @@ class Reviewer2PipelineService {
         txt.contains("bias") || txt.contains("confound") || txt.contains("attrition") ||
           txt.contains("blinding") || txt.contains("allocation") || txt.contains("leakage") || txt.contains("contradiction")
       }
-      val hasExplicitBiasControls = Regex(
-        """(?i)\b(?:double[\s-]?blind|single[\s-]?blind|masked|allocation\s+concealment|randomiz(?:ed|ation)\s+1:1|placebo|intention[\s-]?to[\s-]?treat|rob[\s-]?2|robins[\s-]?i|newcastle[\s-]?ottawa|propensity\s+score|multivariable\s+(?:cox|logistic|regression)|adjusted\s+for)\b"""
+
+      // 1. Risk of Bias — NEVER treat mere mention of "placebo" as adequate RoB!
+      val hasNegativeRobCue = Regex(
+        """(?i)\b(?:open[\s-]?label|unblinded|no\s+blinding|not\s+blinded|without\s+allocation\s+concealment|allocation\s+concealment\s+was\s+not|high\s+risk\s+of\s+bias|unadjusted\s+for\s+confound|risk\s+of\s+bias\s+(?:was\s+)?not\s+(?:assessed|evaluated))\b"""
       ).containsMatchIn(bodyText)
+      val hasRobNotAssessed = Regex(
+        """(?i)\b(?:risk\s+of\s+bias|quality)\s+(?:was\s+|were\s+)?not\s+(?:assessed|evaluated|performed)\b"""
+      ).containsMatchIn(bodyText)
+      val hasAllocationConcealment = Regex(
+        """(?i)\b(?:allocation\s+concealment|concealed\s+allocation|central\s+(?:web[\s-]?based\s+)?randomiz(?:ation|ed)|interactive\s+web[\s-]?response|sealed\s+opaque\s+envelopes?)\b"""
+      ).containsMatchIn(bodyText) && !Regex("""(?i)\b(?:no|without|lacked)\s+allocation\s+concealment\b""").containsMatchIn(bodyText)
+      val hasFormalBlinding = Regex(
+        """(?i)\b(?:double[\s-]?blind|triple[\s-]?blind|outcome\s+assessors?\s+(?:were\s+)?(?:blinded|masked)|masked\s+outcome\s+adjudication)\b"""
+      ).containsMatchIn(bodyText) && !Regex("""(?i)\b(?:not\s+double[\s-]?blind|unblinded|open[\s-]?label)\b""").containsMatchIn(bodyText)
+      val hasFormalLowRobJudgment = Regex(
+        """(?i)\b(?:rob[\s-]?2|robins[\s-]?i|newcastle[\s-]?ottawa|quadas[\s-]?2)\b[^.\n]{0,90}\b(?:low\s+risk\s+of\s+bias|low[\s-]to[\s-]moderate\s+risk|high\s+quality)\b"""
+      ).containsMatchIn(bodyText)
+      val hasObservationalConfoundControl = Regex(
+        """(?i)\b(?:propensity\s+score\s+(?:matching|weighting)|inverse\s+probability\s+weighting|multivariable\s+(?:cox|logistic|regression)\s+adjusted\s+for|target\s+trial\s+emulation)\b"""
+      ).containsMatchIn(bodyText)
+
+      val adequateStructuredRob = when (subDesign) {
+        AuditSubDesign.RCT -> (hasAllocationConcealment && hasFormalBlinding) || hasFormalLowRobJudgment
+        AuditSubDesign.META_ANALYSIS, AuditSubDesign.SYSTEMATIC_REVIEW -> hasFormalLowRobJudgment
+        else -> hasFormalLowRobJudgment || hasObservationalConfoundControl
+      }
       val riskOfBias = when {
         verifiedCriticalCount >= 2 || biasFindingsCount >= 3 -> GradeDomainConcern.VERY_SERIOUS
-        verifiedCriticalCount == 1 || biasFindingsCount >= 1 -> GradeDomainConcern.SERIOUS
-        hasExplicitBiasControls -> GradeDomainConcern.NOT_SERIOUS
+        verifiedCriticalCount == 1 || biasFindingsCount >= 1 || (hasNegativeRobCue && !hasRobNotAssessed) -> GradeDomainConcern.SERIOUS
+        hasRobNotAssessed -> GradeDomainConcern.NOT_ASSESSABLE
+        adequateStructuredRob -> GradeDomainConcern.NOT_SERIOUS
         else -> GradeDomainConcern.NOT_ASSESSABLE
       }
 
+      // 2. Inconsistency
       val highHeterogeneity = statAudit?.reconstructions?.any {
         it.detail.contains("I²=", ignoreCase = true) &&
           Regex("""I²\s*=\s*([5-9]\d|100)""").containsMatchIn(it.detail)
       } == true || Regex("""I[²2]\s*[=≥>]\s*(?:[6-9]\d|100)\s*%""").containsMatchIn(bodyText)
+      val hasHeterogeneityNotAssessed = Regex("""(?i)\bheterogeneity\s+(?:was\s+)?not\s+(?:assessed|evaluated|quantified)\b""").containsMatchIn(bodyText)
       val hasHeterogeneityEvidence = subDesign == AuditSubDesign.RCT ||
-        Regex("""(?i)(?:I[²2]\s*[=<>≤≥]\s*\d|heterogeneity|tau[\s-]?squared|cochran|consistent\s+across)""").containsMatchIn(bodyText)
+        (Regex("""(?i)(?:I[²2]\s*[=<>≤≥]\s*\d|tau[\s-]?squared|cochran(?:'s)?\s+q|prediction\s+interval)""").containsMatchIn(bodyText) && !hasHeterogeneityNotAssessed)
       val inconsistency = when {
         highHeterogeneity -> GradeDomainConcern.SERIOUS
         hasHeterogeneityEvidence -> GradeDomainConcern.NOT_SERIOUS
         else -> GradeDomainConcern.NOT_ASSESSABLE
       }
 
+      // 3. Indirectness
       val indirectnessCues = activeFindings.any { f ->
         val txt = "${f.title} ${f.allegation}".lowercase(Locale.US)
         txt.contains("surrogate") || txt.contains("indirect") || txt.contains("generalizab") || txt.contains("external validity")
-      }
+      } || Regex("""(?i)\b(?:surrogate\s+(?:outcome|endpoint)|biomarker\s+endpoint\s+only|indirect\s+comparison)\b""").containsMatchIn(bodyText)
       val hasDirectClinicalOutcome = Regex(
-        """(?i)\b(?:mortality|death|survival|heart\s+failure|stroke|myocardial|hospitalization|clinical\s+endpoint|primary\s+(?:outcome|endpoint)|patients?)\b"""
+        """(?i)\b(?:all[\s-]?cause\s+mortality|mortality|death|overall\s+survival|heart\s+failure|stroke|myocardial\s+infarction|hospitalization|clinical\s+remission|primary\s+clinical\s+(?:outcome|endpoint))\b"""
       ).containsMatchIn(bodyText)
       val indirectness = when {
         indirectnessCues -> GradeDomainConcern.SERIOUS
@@ -4059,27 +4199,63 @@ class Reviewer2PipelineService {
         else -> GradeDomainConcern.NOT_ASSESSABLE
       }
 
-      val imprecisionCues = statAudit?.reconstructions?.any {
+      // 4. Imprecision — NEVER treat bare presence of "CI" or small "N = 40" as NOT_SERIOUS!
+      val activeClaims = statAudit?.claims?.filter { !it.isFromReferenceOrCitation }.orEmpty()
+      val ciClaims = activeClaims.filter { it.ciLower != null && it.ciUpper != null }
+      val anyCiCrossesNull = ciClaims.any { c ->
+        val lo = c.ciLower ?: return@any false
+        val hi = c.ciUpper ?: return@any false
+        val isRatio = c.effectMeasure.uppercase(Locale.US) in setOf("OR", "RR", "HR", "IRR", "PR", "AOR", "ARR_RATIO", "AHR")
+        if (isRatio) lo <= 1.0 && hi >= 1.0 else lo <= 0.0 && hi >= 0.0
+      }
+      val anyRatioCiVeryWide = ciClaims.any { c ->
+        val lo = c.ciLower ?: return@any false
+        val hi = c.ciUpper ?: return@any false
+        val isRatio = c.effectMeasure.uppercase(Locale.US) in setOf("OR", "RR", "HR", "IRR", "PR", "AOR", "AHR")
+        isRatio && lo > 0.0 && (hi / lo) > 3.0
+      }
+      val maxSampleN = Regex("""(?i)\b(?:n\s*=\s*|total\s+of\s+|enrolled\s+|randomized\s+)(\d{2,6})\s*(?:patients?|participants?|subjects?|individuals?)?\b""")
+        .findAll(bodyText)
+        .mapNotNull { it.groupValues[1].toIntOrNull() }
+        .maxOrNull()
+      val explicitUnderpoweredCue = Regex(
+        """(?i)\b(?:underpowered|not\s+powered|insufficient\s+power|pilot\s+(?:trial|study|rct)|feasibility\s+(?:trial|study)|small\s+sample\s+size|wide\s+confidence\s+interval|few\s+events)\b"""
+      ).containsMatchIn(bodyText)
+      val hasPowerOrOisEvidence = Regex(
+        """(?i)\b(?:(?:80|85|90|95)\s*%\s*power|powered\s+at\s+(?:80|85|90|95)\s*%|power\s+of\s+(?:0\.[89]\d?|(?:80|85|90|95)\s*%)|optimal\s+information\s+size|sample\s+size\s+calculation\s+indicated)\b"""
+      ).containsMatchIn(bodyText)
+      val imprecisionFindings = statAudit?.reconstructions?.any {
         it.findingType == StatisticalFindingType.IMPRECISION_OR_HIGH_VARIANCE
       } == true || activeFindings.any { f ->
         "${f.title} ${f.allegation}".lowercase(Locale.US).let { it.contains("imprecis") || it.contains("underpower") || it.contains("wide ci") }
       }
-      val hasPrecisionEvidence = Regex("""(?i)(?:95%\s*ci|confidence\s+interval|credible\s+interval|\bn\s*=\s*\d+)""").containsMatchIn(bodyText)
+      val smallSample = maxSampleN != null && maxSampleN < 100
       val imprecision = when {
-        imprecisionCues -> GradeDomainConcern.SERIOUS
-        hasPrecisionEvidence -> GradeDomainConcern.NOT_SERIOUS
+        explicitUnderpoweredCue || imprecisionFindings || (smallSample && anyCiCrossesNull) -> GradeDomainConcern.VERY_SERIOUS
+        anyCiCrossesNull || anyRatioCiVeryWide || smallSample -> GradeDomainConcern.SERIOUS
+        ciClaims.isNotEmpty() && (maxSampleN != null && maxSampleN >= 100 || hasPowerOrOisEvidence) -> GradeDomainConcern.NOT_SERIOUS
         else -> GradeDomainConcern.NOT_ASSESSABLE
       }
 
-      val pubBiasCues = activeFindings.any { f ->
+      // 5. Publication Bias — Guard against negated mentions ("publication bias was not assessed", "not registered")!
+      val pubBiasNotAssessed = Regex(
+        """(?i)\b(?:publication\s+bias\s+(?:was\s+|could\s+)?not\s+(?:be\s+)?(?:assessed|evaluated|tested|examined)|did\s+not\s+(?:assess|evaluate|test)\s+publication\s+bias|too\s+few\s+studies\s+to\s+(?:assess|evaluate)\s+publication\s+bias|not\s+(?:pre)?registered|unregistered\s+(?:trial|protocol|review)|no\s+protocol\s+registration)\b"""
+      ).containsMatchIn(bodyText)
+      val pubBiasDetected = activeFindings.any { f ->
         "${f.title} ${f.allegation}".lowercase(Locale.US).let { it.contains("publication bias") || it.contains("funnel") || it.contains("selective reporting") }
-      }
-      val hasPubBiasAssessment = Regex(
-        """(?i)\b(?:nct\d{6,}|prospero|isrctn|clinicaltrials\.gov|registered\s+protocol|funnel\s+plot|egger|begg|trim[\s-]?and[\s-]?fill|publication\s+bias)\b"""
+      } || Regex(
+        """(?i)\b(?:asymmetric(?:al)?\s+funnel|evidence\s+of\s+publication\s+bias|significant\s+egger(?:'s)?\s+test|egger(?:'s)?[^.\n]{0,30}p\s*[<≤=]\s*0\.0\d|selective\s+outcome\s+reporting\s+detected)\b"""
+      ).containsMatchIn(bodyText)
+      val hasAffirmativeRegistration = Regex(
+        """(?i)\b(?:nct\d{6,}|isrctn\d{6,}|prospero\s*(?:crd)?\d{5,}|crd4\d{7,}|prospectively\s+registered\s+at\s+clinicaltrials\.gov)\b"""
+      ).containsMatchIn(bodyText) && !Regex("""(?i)\b(?:not\s+registered|unregistered)\b""").containsMatchIn(bodyText)
+      val hasNegativeFunnelTest = Regex(
+        """(?i)\b(?:no\s+evidence\s+of\s+publication\s+bias|symmetrical\s+funnel\s+plot|egger(?:'s)?[^.\n]{0,30}p\s*[=>]\s*0\.[1-9]\d*)\b"""
       ).containsMatchIn(bodyText)
       val publicationBias = when {
-        pubBiasCues -> GradeDomainConcern.SERIOUS
-        hasPubBiasAssessment -> GradeDomainConcern.NOT_SERIOUS
+        pubBiasDetected -> GradeDomainConcern.SERIOUS
+        pubBiasNotAssessed -> GradeDomainConcern.NOT_ASSESSABLE
+        hasAffirmativeRegistration || hasNegativeFunnelTest -> GradeDomainConcern.NOT_SERIOUS
         else -> GradeDomainConcern.NOT_ASSESSABLE
       }
 
@@ -4099,18 +4275,35 @@ class Reviewer2PipelineService {
           publicationBias = publicationBias,
           verdictEnum = "INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT",
           isAssessable = false,
-          rationale = "GRADE certainty withheld: $unassessedCount domain(s) could not be assessed from supplied text (Risk of Bias=${riskOfBias.label}, Imprecision=${imprecision.label})."
+          rationale = "GRADE certainty withheld: $unassessedCount domain(s) lack structured evidence (RoB=${riskOfBias.label}, Imprecision=${imprecision.label}, Publication Bias=${publicationBias.label})."
         )
       }
 
+      val downgradeReasons = buildList {
+        if (riskOfBias.downgradeSteps > 0) add("Risk of Bias (-${riskOfBias.downgradeSteps})")
+        if (inconsistency.downgradeSteps > 0) add("Inconsistency (-${inconsistency.downgradeSteps})")
+        if (indirectness.downgradeSteps > 0) add("Indirectness (-${indirectness.downgradeSteps})")
+        if (imprecision.downgradeSteps > 0) add("Imprecision (-${imprecision.downgradeSteps})")
+        if (publicationBias.downgradeSteps > 0) add("Publication Bias (-${publicationBias.downgradeSteps})")
+      }
       val totalDowngrade = riskOfBias.downgradeSteps + inconsistency.downgradeSteps +
         indirectness.downgradeSteps + imprecision.downgradeSteps + publicationBias.downgradeSteps
-      val finalRank = (startingRank - totalDowngrade).coerceIn(0, 3)
-      val verdictEnum = when (finalRank) {
+      // Never award HIGH_CERTAINTY unless every single domain is affirmatively NOT_SERIOUS
+      val cappedRank = if (unassessedCount > 0) {
+        minOf(2, (startingRank - totalDowngrade).coerceIn(0, 3))
+      } else {
+        (startingRank - totalDowngrade).coerceIn(0, 3)
+      }
+      val verdictEnum = when (cappedRank) {
         3 -> "HIGH_CERTAINTY"
         2 -> "MODERATE_CERTAINTY"
         1 -> "LOW_CERTAINTY"
         else -> "VERY_LOW_CERTAINTY"
+      }
+      val reasonDetail = if (downgradeReasons.isEmpty()) {
+        if (unassessedCount > 0) "capped at Moderate due to 1 unassessed domain" else "all 5 GRADE domains affirmatively supported with zero downgrades"
+      } else {
+        "downgraded for ${downgradeReasons.joinToString(", ")}"
       }
       return GradeCertaintyAssessment(
         startingLevel = startingLevel,
@@ -4122,7 +4315,7 @@ class Reviewer2PipelineService {
         publicationBias = publicationBias,
         verdictEnum = verdictEnum,
         isAssessable = true,
-        rationale = "Started at $startingLevel; total GRADE domain downgrade = -$totalDowngrade step(s) across RoB/Inconsistency/Indirectness/Imprecision/Publication Bias."
+        rationale = "Started at $startingLevel; $reasonDetail."
       )
     }
 

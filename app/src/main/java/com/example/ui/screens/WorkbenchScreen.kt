@@ -1310,11 +1310,16 @@ fun WorkbenchScreen(
                 modifier = Modifier.padding(12.dp)
               ) {
                 Column(modifier = Modifier.weight(1f)) {
+                  val isCompletedUnassessed = pipelineState.review.isUnassessed()
                   Text(
-                    text = "OUTPUT READY • SCORE ${pipelineState.review.credibilityScore}/100",
+                    text = if (isCompletedUnassessed) {
+                      "READINESS BLOCKED • NOT ASSESSED"
+                    } else {
+                      "OUTPUT READY • SCORE ${pipelineState.review.credibilityScore}/100"
+                    },
                     style = MaterialTheme.typography.labelSmall,
                     fontFamily = JetBrainsMonoFamily,
-                    color = CupertinoGreen,
+                    color = if (isCompletedUnassessed) CupertinoAmber else CupertinoGreen,
                     fontWeight = FontWeight.Bold
                   )
                   Text(

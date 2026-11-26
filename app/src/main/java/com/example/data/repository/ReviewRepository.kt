@@ -1,8 +1,8 @@
 package com.example.data.repository
 
-import android.content.Context
 import android.util.Log
-import com.example.R
+import com.example.data.model.LedgerLoadState
+import com.example.data.model.NarrativeSectionCodec
 import com.example.data.model.PaperReview
 import com.example.data.model.ReviewFindingCodec
 import com.example.data.model.ReviewMode
@@ -10,6 +10,7 @@ import com.example.util.OperationType
 import com.example.util.handleFirestoreError
 import com.google.firebase.Firebase
 import com.google.firebase.Timestamp
+import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.auth.auth
 import com.google.firebase.firestore.DocumentReference
 import com.google.firebase.firestore.DocumentSnapshot
@@ -17,60 +18,97 @@ import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.FirebaseFirestoreException
 import com.google.firebase.firestore.Query
+import com.google.firebase.firestore.firestore
 import com.google.firebase.firestore.snapshots
 import java.util.Locale
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.tasks.await
 
 private const val REPO_TAG = "ReviewRepository"
 private const val FINDINGS_CHUNKS_COLLECTION = "findings_chunks"
+private const val NARRATIVE_CHUNKS_COLLECTION = "narrative_chunks"
+private const val MAX_HYDRATION_CONCURRENCY = 4
 
-class ReviewRepository(private val db: FirebaseFirestore) {
+class ReviewRepository(
+  private val db: FirebaseFirestore = Firebase.firestore,
+  private val auth: FirebaseAuth = Firebase.auth
+) {
 
-  constructor(context: Context) : this(
-    FirebaseFirestore.getInstance(
-      context.applicationContext.getString(R.string.firestore_database_id)
-    )
-  )
-
-  private val auth = Firebase.auth
-
-  private fun requireUserId(): String {
-    return auth.currentUser?.uid
-      ?: throw IllegalStateException("User must be signed in with Google before accessing Firestore.")
-  }
-
-  private suspend fun hydrateChunkedFindings(review: PaperReview, ownerUid: String): PaperReview {
-    if (review.findingsChunkCount <= 0 || review.id.isBlank()) {
-      return review
-    }
-    val chunksSnap = db.collection("users")
-      .document(ownerUid)
-      .collection("reviews")
-      .document(review.id)
-      .collection(FINDINGS_CHUNKS_COLLECTION)
-      .orderBy("chunkIndex", Query.Direction.ASCENDING)
-      .get()
-      .await()
-
-    val orderedPayloads = chunksSnap.documents.mapNotNull { doc ->
-      doc.getString("payload")
-    }
-    if (orderedPayloads.size < review.findingsChunkCount) {
-      throw IllegalStateException(
-        "Incomplete findings ledger chunks for ${review.id}: found ${orderedPayloads.size}/${review.findingsChunkCount}."
+  private fun requireUserId(expectedUserId: String? = null): String {
+    val activeUid = auth.currentUser?.uid
+      ?: throw IllegalStateException("User must be signed in to access Cloud Paper Reviews.")
+    if (!expectedUserId.isNullOrBlank() && activeUid != expectedUserId) {
+      throw SecurityException(
+        "Active authenticated account ($activeUid) no longer matches operation owner ($expectedUserId); aborting cloud mutation."
       )
     }
-    val reassembled = ReviewFindingCodec.reassembleAndVerify(
-      chunks = orderedPayloads,
-      expectedChecksumSha256 = review.findingsChecksum
-    ).getOrThrow()
-    return review.copy(structuredFindingsJson = reassembled)
+    return activeUid
+  }
+
+  private suspend fun hydrateReviewChunks(review: PaperReview, ownerUid: String): PaperReview {
+    if (review.id.isBlank()) return inspectInlineLedgerIntegrity(review)
+    val docRef = db.collection("users").document(ownerUid).collection("reviews").document(review.id)
+    var current = review
+
+    // 1. Hydrate chunked findings ledger if present
+    if (current.findingsChunkCount > 0) {
+      val chunksSnap = docRef
+        .collection(FINDINGS_CHUNKS_COLLECTION)
+        .orderBy("chunkIndex", Query.Direction.ASCENDING)
+        .get()
+        .await()
+
+      val orderedPayloads = chunksSnap.documents.mapNotNull { doc -> doc.getString("payload") }
+      if (orderedPayloads.size < current.findingsChunkCount) {
+        throw IncompleteLedgerException(
+          "Incomplete findings ledger chunks for ${current.id}: found ${orderedPayloads.size}/${current.findingsChunkCount}."
+        )
+      }
+      val reassembled = ReviewFindingCodec.reassembleAndVerify(
+        chunks = orderedPayloads,
+        expectedChecksumSha256 = current.findingsChecksum
+      ).getOrElse { err ->
+        throw CorruptLedgerException("Corrupt findings ledger for ${current.id}: ${err.message}", err)
+      }
+      current = current.copy(structuredFindingsJson = reassembled)
+    } else {
+      current = inspectInlineLedgerIntegrity(current)
+    }
+
+    // 2. Hydrate lossless narrative section chunks if present (P1-05)
+    if (current.narrativeChunkCount > 0) {
+      val narrativeSnap = docRef
+        .collection(NARRATIVE_CHUNKS_COLLECTION)
+        .orderBy("chunkIndex", Query.Direction.ASCENDING)
+        .get()
+        .await()
+
+      val orderedNarratives = narrativeSnap.documents.mapNotNull { doc -> doc.getString("payload") }
+      if (orderedNarratives.size < current.narrativeChunkCount) {
+        throw IncompleteLedgerException(
+          "Incomplete narrative chunks for ${current.id}: found ${orderedNarratives.size}/${current.narrativeChunkCount}."
+        )
+      }
+      current = NarrativeSectionCodec.reassembleAndApply(
+        review = current,
+        chunks = orderedNarratives,
+        expectedChecksumSha256 = current.narrativeChecksum
+      ).getOrElse { err ->
+        throw CorruptLedgerException("Corrupt narrative chunks for ${current.id}: ${err.message}", err)
+      }
+    }
+
+    return current
   }
 
   private suspend fun writeDocumentWithLosslessChunks(
@@ -81,34 +119,51 @@ class ReviewRepository(private val db: FirebaseFirestore) {
     updatedAtValue: Any,
     cleanupPreviousChunks: Boolean
   ) {
-    val packaged = ReviewFindingCodec.packageForCloud(review.structuredFindingsJson)
-    if (packaged.chunks.isNotEmpty()) {
+    // Validate & package structured findings (both inline AND chunked validated inside packageForCloud)
+    val packagedFindings = ReviewFindingCodec.packageForCloud(review.structuredFindingsJson)
+    if (packagedFindings.chunks.isNotEmpty()) {
       val verifiedJson = ReviewFindingCodec.reassembleAndVerify(
-        chunks = packaged.chunks,
-        expectedChecksumSha256 = packaged.checksumSha256
+        chunks = packagedFindings.chunks,
+        expectedChecksumSha256 = packagedFindings.checksumSha256
       ).getOrThrow()
-      val originalDecoded = ReviewFindingCodec.decode(review.structuredFindingsJson)
-      val verifiedDecoded = ReviewFindingCodec.decode(verifiedJson)
+      val originalDecoded = ReviewFindingCodec.decodeResult(review.structuredFindingsJson).getOrThrow()
+      val verifiedDecoded = ReviewFindingCodec.decodeResult(verifiedJson).getOrThrow()
       if (originalDecoded.size != verifiedDecoded.size ||
         originalDecoded.map { it.id } != verifiedDecoded.map { it.id }
       ) {
         throw IllegalStateException(
-          "Pre-commit lossless chunk verification failed: finding ledger count/IDs diverged (${originalDecoded.size} vs ${verifiedDecoded.size})."
+          "Pre-commit lossless findings chunk verification failed: count/IDs diverged (${originalDecoded.size} vs ${verifiedDecoded.size})."
         )
       }
     }
+
+    // Package overflowed long narrative sections losslessly into narrative_chunks (P1-05)
+    val packagedNarratives = NarrativeSectionCodec.packageOverflowNarratives(review)
+    if (packagedNarratives.chunks.isNotEmpty()) {
+      NarrativeSectionCodec.reassembleAndApply(
+        review = review,
+        chunks = packagedNarratives.chunks,
+        expectedChecksumSha256 = packagedNarratives.checksumSha256
+      ).getOrThrow()
+    }
+
     val payload = buildFirestorePayload(
       review = review,
       uid = uid,
       createdAtValue = createdAtValue,
       updatedAtValue = updatedAtValue,
-      packagedLedger = packaged
+      packagedLedger = packagedFindings,
+      packagedNarratives = packagedNarratives
     )
 
-    val existingChunkRefs = if (cleanupPreviousChunks) {
-      runCatching {
-        docRef.collection(FINDINGS_CHUNKS_COLLECTION).get().await().documents.map { it.reference }
-      }.getOrDefault(emptyList())
+    // P1-02: NEVER swallow enumeration errors during stale-chunk cleanup!
+    val existingFindingChunkRefs = if (cleanupPreviousChunks) {
+      docRef.collection(FINDINGS_CHUNKS_COLLECTION).get().await().documents.map { it.reference }
+    } else {
+      emptyList()
+    }
+    val existingNarrativeChunkRefs = if (cleanupPreviousChunks) {
+      docRef.collection(NARRATIVE_CHUNKS_COLLECTION).get().await().documents.map { it.reference }
     } else {
       emptyList()
     }
@@ -116,22 +171,41 @@ class ReviewRepository(private val db: FirebaseFirestore) {
     val batch = db.batch()
     batch.set(docRef, payload)
 
-    // Remove stale excess chunks if new chunk count is smaller
-    existingChunkRefs.forEach { oldRef ->
+    existingFindingChunkRefs.forEach { oldRef ->
       val idx = oldRef.id.removePrefix("chunk_").toIntOrNull()
-      if (idx == null || idx >= packaged.chunks.size) {
+      if (idx == null || idx >= packagedFindings.chunks.size) {
+        batch.delete(oldRef)
+      }
+    }
+    existingNarrativeChunkRefs.forEach { oldRef ->
+      val idx = oldRef.id.removePrefix("chunk_").toIntOrNull()
+      if (idx == null || idx >= packagedNarratives.chunks.size) {
         batch.delete(oldRef)
       }
     }
 
-    packaged.chunks.forEachIndexed { index, chunkPayload ->
+    packagedFindings.chunks.forEachIndexed { index, chunkPayload ->
       val chunkRef = docRef.collection(FINDINGS_CHUNKS_COLLECTION).document("chunk_$index")
       batch.set(
         chunkRef,
         mapOf(
           "userId" to uid,
           "chunkIndex" to index,
-          "totalChunks" to packaged.chunks.size,
+          "totalChunks" to packagedFindings.chunks.size,
+          "payload" to chunkPayload,
+          "checksum" to ReviewFindingCodec.sha256Hex(chunkPayload)
+        )
+      )
+    }
+
+    packagedNarratives.chunks.forEachIndexed { index, chunkPayload ->
+      val chunkRef = docRef.collection(NARRATIVE_CHUNKS_COLLECTION).document("chunk_$index")
+      batch.set(
+        chunkRef,
+        mapOf(
+          "userId" to uid,
+          "chunkIndex" to index,
+          "totalChunks" to packagedNarratives.chunks.size,
           "payload" to chunkPayload,
           "checksum" to ReviewFindingCodec.sha256Hex(chunkPayload)
         )
@@ -154,19 +228,27 @@ class ReviewRepository(private val db: FirebaseFirestore) {
             PaperReview::class.java,
             DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
           ).sortedByDescending { it.createdAt ?: Timestamp(0, 0) }
-          rawReviews.map { review ->
-            if (review.findingsChunkCount > 0) {
-              try {
-                hydrateChunkedFindings(review, userId)
-              } catch (e: CancellationException) {
-                throw e
-              } catch (e: Exception) {
-                Log.w(REPO_TAG, "Failed to hydrate chunked findings for ${review.id}", e)
-                review
+          // Bounded-concurrency hydration so large archives never stall sequentially
+          val semaphore = Semaphore(MAX_HYDRATION_CONCURRENCY)
+          coroutineScope {
+            rawReviews.map { review ->
+              async {
+                if (review.findingsChunkCount > 0 || review.narrativeChunkCount > 0) {
+                  semaphore.withPermit {
+                    try {
+                      hydrateReviewChunks(review, userId)
+                    } catch (e: CancellationException) {
+                      throw e
+                    } catch (e: Throwable) {
+                      Log.w(REPO_TAG, "Failed to hydrate chunks for ${review.id}", e)
+                      applyHydrationFailureState(review, e)
+                    }
+                  }
+                } else {
+                  inspectInlineLedgerIntegrity(review)
+                }
               }
-            } else {
-              review
-            }
+            }.awaitAll()
           }
         }
         .catch { error ->
@@ -183,9 +265,28 @@ class ReviewRepository(private val db: FirebaseFirestore) {
     )
   }
 
-  suspend fun getUserReviews(): Result<List<PaperReview>> {
+  /**
+   * Explicitly retries chunk hydration on demand for a review whose evidence ledger was
+   * temporarily unavailable during archive observation.
+   */
+  suspend fun retryHydrateReview(review: PaperReview, expectedUserId: String): Result<PaperReview> {
     val uid = try {
-      requireUserId()
+      requireUserId(expectedUserId)
+    } catch (e: Exception) {
+      return Result.failure(e)
+    }
+    return try {
+      Result.success(hydrateReviewChunks(review, uid))
+    } catch (e: CancellationException) {
+      throw e
+    } catch (e: Exception) {
+      Result.failure(e)
+    }
+  }
+
+  suspend fun getUserReviews(expectedUserId: String? = null): Result<List<PaperReview>> {
+    val uid = try {
+      requireUserId(expectedUserId)
     } catch (e: Exception) {
       return Result.failure(e)
     }
@@ -197,13 +298,30 @@ class ReviewRepository(private val db: FirebaseFirestore) {
         .whereEqualTo("userId", uid)
         .get()
         .await()
-      val reviews = snapshot.toObjects(
+      val rawReviews = snapshot.toObjects(
         PaperReview::class.java,
         DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
       ).sortedByDescending { it.createdAt ?: Timestamp(0, 0) }
-        .map { review ->
-          if (review.findingsChunkCount > 0) hydrateChunkedFindings(review, uid) else review
-        }
+      val semaphore = Semaphore(MAX_HYDRATION_CONCURRENCY)
+      val reviews = coroutineScope {
+        rawReviews.map { review ->
+          async {
+            if (review.findingsChunkCount > 0 || review.narrativeChunkCount > 0) {
+              semaphore.withPermit {
+                try {
+                  hydrateReviewChunks(review, uid)
+                } catch (e: CancellationException) {
+                  throw e
+                } catch (e: Throwable) {
+                  applyHydrationFailureState(review, e)
+                }
+              }
+            } else {
+              inspectInlineLedgerIntegrity(review)
+            }
+          }
+        }.awaitAll()
+      }
       Result.success(reviews)
     } catch (e: CancellationException) {
       throw e
@@ -215,7 +333,7 @@ class ReviewRepository(private val db: FirebaseFirestore) {
 
   suspend fun getReviewById(reviewId: String, ownerUserId: String? = null): Result<PaperReview> {
     val resolvedOwner = try {
-      ownerUserId?.takeIf { it.isNotBlank() } ?: requireUserId()
+      requireUserId(ownerUserId)
     } catch (e: Exception) {
       return Result.failure(e)
     }
@@ -226,10 +344,10 @@ class ReviewRepository(private val db: FirebaseFirestore) {
         PaperReview::class.java,
         DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
       ) ?: throw IllegalStateException("Review document $reviewId not found")
-      val hydrated = if (review.findingsChunkCount > 0) {
-        hydrateChunkedFindings(review, resolvedOwner)
+      val hydrated = if (review.findingsChunkCount > 0 || review.narrativeChunkCount > 0) {
+        hydrateReviewChunks(review, resolvedOwner)
       } else {
-        review
+        inspectInlineLedgerIntegrity(review)
       }
       Result.success(hydrated)
     } catch (e: CancellationException) {
@@ -240,9 +358,9 @@ class ReviewRepository(private val db: FirebaseFirestore) {
     }
   }
 
-  suspend fun createReview(review: PaperReview): Result<String> {
+  suspend fun createReview(review: PaperReview, expectedUserId: String? = null): Result<String> {
     val uid = try {
-      requireUserId()
+      requireUserId(expectedUserId)
     } catch (e: Exception) {
       return Result.failure(e)
     }
@@ -265,9 +383,9 @@ class ReviewRepository(private val db: FirebaseFirestore) {
     }
   }
 
-  suspend fun updateReview(review: PaperReview): Result<Unit> {
+  suspend fun updateReview(review: PaperReview, expectedUserId: String? = null): Result<Unit> {
     val uid = try {
-      requireUserId()
+      requireUserId(expectedUserId)
     } catch (e: Exception) {
       return Result.failure(e)
     }
@@ -296,12 +414,16 @@ class ReviewRepository(private val db: FirebaseFirestore) {
   }
 
   /**
-   * Field-level partial update for bookmark state so concurrent edits to personalNotes or
-   * other fields never clobber one another.
+   * Field-level partial update for bookmark state with explicit account-ownership enforcement
+   * so concurrent edits never clobber notes and account switches never target another account.
    */
-  suspend fun updateBookmark(reviewId: String, bookmarked: Boolean): Result<Unit> {
+  suspend fun updateBookmark(
+    reviewId: String,
+    bookmarked: Boolean,
+    expectedUserId: String? = null
+  ): Result<Unit> {
     val uid = try {
-      requireUserId()
+      requireUserId(expectedUserId)
     } catch (e: Exception) {
       return Result.failure(e)
     }
@@ -321,12 +443,15 @@ class ReviewRepository(private val db: FirebaseFirestore) {
   }
 
   /**
-   * Field-level partial update for personalNotes so concurrent edits to bookmark or other fields
-   * never overwrite each other.
+   * Field-level partial update for personalNotes with explicit account-ownership enforcement.
    */
-  suspend fun updatePersonalNotes(reviewId: String, notes: String): Result<Unit> {
+  suspend fun updatePersonalNotes(
+    reviewId: String,
+    notes: String,
+    expectedUserId: String? = null
+  ): Result<Unit> {
     val uid = try {
-      requireUserId()
+      requireUserId(expectedUserId)
     } catch (e: Exception) {
       return Result.failure(e)
     }
@@ -345,9 +470,15 @@ class ReviewRepository(private val db: FirebaseFirestore) {
     }
   }
 
-  suspend fun deleteReview(reviewId: String): Result<Unit> {
+  /**
+   * P1-02 Fail-Visible Recursive Deletion:
+   * Enumerates ALL child chunks (`findings_chunks` and `narrative_chunks`) WITHOUT swallowing
+   * errors. If chunk enumeration fails (e.g., offline or permission-denied), the parent review
+   * document is NOT deleted so confidential subcollection chunks are NEVER orphaned in Firestore.
+   */
+  suspend fun deleteReview(reviewId: String, expectedUserId: String? = null): Result<Unit> {
     val uid = try {
-      requireUserId()
+      requireUserId(expectedUserId)
     } catch (e: Exception) {
       return Result.failure(e)
     }
@@ -355,22 +486,35 @@ class ReviewRepository(private val db: FirebaseFirestore) {
       return Result.failure(IllegalArgumentException("Review ID must not be blank for delete"))
     }
     val docRef = db.collection("users").document(uid).collection("reviews").document(reviewId)
-    return try {
-      val chunkDocs = runCatching {
-        docRef.collection(FINDINGS_CHUNKS_COLLECTION).get().await().documents
-      }.getOrDefault(emptyList())
-      val batch = db.batch()
-      chunkDocs.forEach { batch.delete(it.reference) }
-      batch.delete(docRef)
-      batch.commit().await()
-      Result.success(Unit)
-    } catch (e: CancellationException) {
-      throw e
-    } catch (e: Exception) {
-      handleFirestoreError(e, OperationType.DELETE, docRef.path)
-      Result.failure(e)
-    }
+    return deleteReviewAtomically(
+      enumerateFindingsChunks = {
+        docRef.collection(FINDINGS_CHUNKS_COLLECTION).get().await().documents.map { it.reference }
+      },
+      enumerateNarrativeChunks = {
+        docRef.collection(NARRATIVE_CHUNKS_COLLECTION).get().await().documents.map { it.reference }
+      },
+      commitDeleteRefs = { childRefs ->
+        // Firestore batch limit is 500 ops; delete children in chunks of 450, then parent in final batch
+        val chunkedChildren = childRefs.chunked(450)
+        if (chunkedChildren.isEmpty()) {
+          docRef.delete().await()
+        } else {
+          chunkedChildren.forEachIndexed { idx, group ->
+            val batch = db.batch()
+            group.forEach { batch.delete(it) }
+            if (idx == chunkedChildren.lastIndex) {
+              batch.delete(docRef)
+            }
+            batch.commit().await()
+          }
+        }
+      },
+      onError = { e -> handleFirestoreError(e, OperationType.DELETE, docRef.path) }
+    )
   }
+
+  class IncompleteLedgerException(message: String) : IllegalStateException(message)
+  class CorruptLedgerException(message: String, cause: Throwable? = null) : IllegalStateException(message, cause)
 
   companion object {
     private val POST_PUB_VERDICTS = setOf(
@@ -390,6 +534,74 @@ class ReviewRepository(private val db: FirebaseFirestore) {
       "VERIFIED", "ADJUDICATED_WITH_CAVEATS", "PARTIALLY_VALIDATED", "PROVISIONAL",
       "UNVERIFIED", "LEGACY_UNVALIDATED", "REQUIRES_REANALYSIS"
     )
+
+    internal fun verifyExpectedAccountOrThrow(activeUid: String?, expectedUid: String?): String {
+      val cleanActive = activeUid?.takeIf { it.isNotBlank() }
+        ?: throw IllegalStateException("User must be signed in to access Cloud Paper Reviews.")
+      if (!expectedUid.isNullOrBlank() && cleanActive != expectedUid) {
+        throw SecurityException(
+          "Account mismatch: active account ($cleanActive) != expected account ($expectedUid)."
+        )
+      }
+      return cleanActive
+    }
+
+    /**
+     * Inspects inline `structuredFindingsJson` on non-chunked reviews so corrupt JSON is marked
+     * [LedgerLoadState.CORRUPT] and NEVER presented as `VERIFIED`.
+     */
+    internal fun inspectInlineLedgerIntegrity(review: PaperReview): PaperReview {
+      if (review.structuredFindingsJson.isBlank()) {
+        return review.copy(ledgerLoadState = LedgerLoadState.COMPLETE)
+      }
+      val decoded = ReviewFindingCodec.decodeResult(review.structuredFindingsJson)
+      return if (decoded.isSuccess) {
+        review.copy(ledgerLoadState = LedgerLoadState.COMPLETE)
+      } else {
+        review.copy(
+          validationStatus = if (review.validationStatus == "VERIFIED") "REQUIRES_REANALYSIS" else review.validationStatus,
+          ledgerLoadState = LedgerLoadState.CORRUPT
+        )
+      }
+    }
+
+    /**
+     * P1-01: Explicitly transitions an unhydrated or corrupt review to a non-verified degraded
+     * [LedgerLoadState] so the UI/PDF NEVER presents a review with missing evidence as `VERIFIED`.
+     */
+    internal fun applyHydrationFailureState(review: PaperReview, error: Throwable): PaperReview {
+      val state = when (error) {
+        is IncompleteLedgerException -> LedgerLoadState.INCOMPLETE
+        is CorruptLedgerException -> LedgerLoadState.CORRUPT
+        else -> LedgerLoadState.TEMPORARILY_UNAVAILABLE
+      }
+      val safeStatus = when {
+        state == LedgerLoadState.CORRUPT -> "REQUIRES_REANALYSIS"
+        review.validationStatus.equals("VERIFIED", ignoreCase = true) -> "PROVISIONAL"
+        else -> review.validationStatus
+      }
+      return review.copy(
+        validationStatus = safeStatus,
+        ledgerLoadState = state
+      )
+    }
+
+    internal suspend fun <T> deleteReviewAtomically(
+      enumerateFindingsChunks: suspend () -> List<T>,
+      enumerateNarrativeChunks: suspend () -> List<T>,
+      commitDeleteRefs: suspend (List<T>) -> Unit,
+      onError: (Exception) -> Unit = {}
+    ): Result<Unit> = try {
+      val findingRefs = enumerateFindingsChunks()
+      val narrativeRefs = enumerateNarrativeChunks()
+      commitDeleteRefs(findingRefs + narrativeRefs)
+      Result.success(Unit)
+    } catch (e: CancellationException) {
+      throw e
+    } catch (e: Exception) {
+      onError(e)
+      Result.failure(e)
+    }
 
     internal fun buildBookmarkPatchPayload(
       bookmarked: Boolean,
@@ -454,10 +666,9 @@ class ReviewRepository(private val db: FirebaseFirestore) {
 
     /**
      * Builds the complete, strictly self-consistent Firestore document payload:
-     * - Derives all 6 rubric dimensions (`1..10`) AND `credibilityScore` from a single reconciled
-     *   [PaperReviewRubric] instance so individual axes and the weighted composite can NEVER disagree.
-     * - Never truncates `structuredFindingsJson`: oversized ledgers are chunked losslessly via
-     *   [ReviewFindingCodec.packageForCloud] and stored in `findings_chunks`.
+     * - Supports unassessed `INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT` (0 scores) without inventing 50/100.
+     * - Never truncates `structuredFindingsJson` or long narrative sections: overflows are stored
+     *   losslessly in `findings_chunks` and `narrative_chunks` with SHA-256 verification.
      * - Never fabricates a default publication year ("2026") when year is absent/unverified.
      */
     internal fun buildFirestorePayload(
@@ -465,11 +676,18 @@ class ReviewRepository(private val db: FirebaseFirestore) {
       uid: String,
       createdAtValue: Any,
       updatedAtValue: Any,
-      packagedLedger: ReviewFindingCodec.LosslessLedgerPackage = ReviewFindingCodec.packageForCloud(review.structuredFindingsJson)
+      packagedLedger: ReviewFindingCodec.LosslessLedgerPackage = ReviewFindingCodec.packageForCloud(review.structuredFindingsJson),
+      packagedNarratives: NarrativeSectionCodec.LosslessNarrativePackage = NarrativeSectionCodec.packageOverflowNarratives(review)
     ): Map<String, Any> {
       val resolvedMode = review.resolvedReviewMode()
       val rubric = review.toRubric()
-      val authoritativeComposite = rubric.overallCredibilityScore.toLong().coerceIn(0L, 100L)
+      val isUnassessed = !rubric.isAssessed
+      val normalizedVerdict = if (isUnassessed) {
+        "INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT"
+      } else {
+        normalizeVerdict(review.verdict, resolvedMode)
+      }
+      val authoritativeComposite = if (isUnassessed) 0L else rubric.overallCredibilityScore.toLong().coerceIn(0L, 100L)
       return mapOf(
         "userId" to uid,
         "title" to review.title.trim().take(500).ifEmpty { "Untitled Manuscript" },
@@ -478,21 +696,21 @@ class ReviewRepository(private val db: FirebaseFirestore) {
         "venueOrCitation" to review.venueOrCitation.trim().take(500),
         "isEmpirical" to review.isEmpirical,
         "credibilityScore" to authoritativeComposite,
-        "verdict" to normalizeVerdict(review.verdict, resolvedMode),
-        // Structured 6-axis rubric (strictly 1..10, guaranteed consistent with credibilityScore)
-        "methodologyScore" to rubric.methodology.coerceIn(1, 10),
-        "significanceScore" to rubric.significance.coerceIn(1, 10),
-        "clarityScore" to rubric.clarity.coerceIn(1, 10),
-        "originalityScore" to rubric.originality.coerceIn(1, 10),
-        "mathRigorScore" to rubric.mathematicalRigor.coerceIn(1, 10),
-        "reproducibilityScore" to rubric.reproducibility.coerceIn(1, 10),
+        "verdict" to normalizedVerdict,
+        // Structured 6-axis rubric (0 if unassessed readiness block, otherwise strictly 1..10)
+        "methodologyScore" to if (isUnassessed) 0 else rubric.methodology.coerceIn(1, 10),
+        "significanceScore" to if (isUnassessed) 0 else rubric.significance.coerceIn(1, 10),
+        "clarityScore" to if (isUnassessed) 0 else rubric.clarity.coerceIn(1, 10),
+        "originalityScore" to if (isUnassessed) 0 else rubric.originality.coerceIn(1, 10),
+        "mathRigorScore" to if (isUnassessed) 0 else rubric.mathematicalRigor.coerceIn(1, 10),
+        "reproducibilityScore" to if (isUnassessed) 0 else rubric.reproducibility.coerceIn(1, 10),
         "methodologyJustification" to review.methodologyJustification.trim().take(4000),
         "significanceJustification" to review.significanceJustification.trim().take(4000),
         "clarityJustification" to review.clarityJustification.trim().take(4000),
         "originalityJustification" to review.originalityJustification.trim().take(4000),
         "mathRigorJustification" to review.mathRigorJustification.trim().take(4000),
         "reproducibilityJustification" to review.reproducibilityJustification.trim().take(4000),
-        // Separated confidence, mode, provenance & lossless chunked evidence ledger metadata
+        // Separated confidence, mode, provenance & lossless chunked ledger/narrative metadata
         "refereeConfidence" to review.refereeConfidence.coerceIn(1, 5),
         "extractionConfidence" to review.extractionConfidence.coerceIn(1, 5),
         "reviewMode" to resolvedMode.name,
@@ -502,7 +720,9 @@ class ReviewRepository(private val db: FirebaseFirestore) {
         "schemaVersion" to review.schemaVersion.coerceAtLeast(5),
         "findingsChunkCount" to packagedLedger.chunks.size,
         "findingsChecksum" to packagedLedger.checksumSha256,
-        // Narrative dossier sections
+        "narrativeChunkCount" to packagedNarratives.chunks.size,
+        "narrativeChecksum" to packagedNarratives.checksumSha256,
+        // Narrative dossier sections (full un-truncated copies preserved in narrative_chunks when exceeding inline limits)
         "abstractSummary" to review.abstractSummary.trim().take(5000).ifEmpty { "No abstract summary provided." },
         "researchQuestion" to review.researchQuestion.trim().take(3000).ifEmpty { "Not specified." },
         "keyMethodology" to review.keyMethodology.trim().take(4000).ifEmpty { "Not specified." },

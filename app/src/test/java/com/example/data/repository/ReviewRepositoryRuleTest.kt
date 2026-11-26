@@ -5,6 +5,7 @@ import com.example.data.model.PaperReview
 import com.google.firebase.firestore.FirebaseFirestoreException
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
@@ -95,11 +96,27 @@ class ReviewRepositoryRuleTest : FirestoreEmulatorTestBase() {
 
     signInTestUser(BOB_EMAIL)
     val bobRepo = ReviewRepository(firestore)
-    val result = withTimeout(DEFAULT_TIMEOUT_MS) {
+    // Layer 1 (P1-06 client boundary): ReviewRepository refuses cross-account access before hitting Firestore
+    val repoResult = withTimeout(DEFAULT_TIMEOUT_MS) {
       bobRepo.getReviewById(reviewId, ownerUserId = aliceUid)
     }
-    assertTrue(result.isFailure)
-    val firestoreException = result.exceptionOrNull()?.unwrapFirestoreException()
+    assertTrue(repoResult.isFailure)
+    assertTrue(
+      "Expected SecurityException from repository account guard, got ${repoResult.exceptionOrNull()}",
+      repoResult.exceptionOrNull() is SecurityException
+    )
+
+    // Layer 2 (zero-trust Firestore server rule): Direct Firestore read by Bob must fail with PERMISSION_DENIED
+    val directResult = runCatching {
+      withTimeout(DEFAULT_TIMEOUT_MS) {
+        firestore.collection("users").document(aliceUid)
+          .collection("reviews").document(reviewId)
+          .get()
+          .await()
+      }
+    }
+    assertTrue(directResult.isFailure)
+    val firestoreException = directResult.exceptionOrNull()?.unwrapFirestoreException()
     assertNotNull(firestoreException)
     assertEquals(FirebaseFirestoreException.Code.PERMISSION_DENIED, firestoreException?.code)
   }

@@ -29,12 +29,14 @@ import com.example.data.model.ApiProtocolType
 import com.example.data.model.BenchmarkManuscript
 import com.example.data.model.BenchmarkManuscriptCatalog
 import com.example.data.model.DefaultAiProviderCatalog
+import com.example.data.model.LedgerLoadState
 import com.example.data.model.PaperReview
 import com.example.data.model.PipelineOptions
 import com.example.data.model.ReviewMode
 import com.example.data.repository.LocalReviewRepository
 import com.example.data.repository.ReviewRepository
 import com.example.util.DocumentCoverageReport
+import com.example.util.ExtractedManuscriptFile
 import com.example.util.ManuscriptExtractor
 import com.example.util.ManuscriptInputFormat
 import com.example.util.NetworkHealthChecker
@@ -217,6 +219,20 @@ class PaperCriticViewModel(
     if (uid.isNullOrBlank()) emptyList() else anonymousList
   }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS), emptyList())
 
+  /**
+   * P1-07: Count of legacy/signed-out custom API provider credentials remaining in
+   * [ANONYMOUS_OWNER_SCOPE] so signed-in users can explicitly opt in to recover them.
+   */
+  val anonymousCustomProviderCount: StateFlow<Int> = combine(
+    _authenticatedUserId,
+    localRepository.observeAnonymousCustomProviderCount().catch { emit(0) }
+  ) { uid, count ->
+    if (uid.isNullOrBlank()) 0 else count
+  }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS), 0)
+
+  private val _isRetryingHydration = MutableStateFlow(false)
+  val isRetryingHydration: StateFlow<Boolean> = _isRetryingHydration.asStateFlow()
+
   val offlineCachedIds: StateFlow<Set<String>> = sqlReviewsFlow
     .map { list -> list.map { it.id }.filter { it.isNotBlank() }.toSet() }
     .stateIn(viewModelScope, SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS), emptySet())
@@ -315,11 +331,24 @@ class PaperCriticViewModel(
     )
 
   val archiveState: StateFlow<ArchiveUiState> = combine(
+    _authenticatedUserId,
     cloudReviewsFlow,
     _localReviews,
     sqlReviewsFlow
-  ) { cloudState, localList, sqlList ->
-    val mergedLocalAndSql = (localList + sqlList).distinctBy { it.id.ifBlank { it.title } }
+  ) { activeUid, cloudState, localList, sqlList ->
+    // Presentation-boundary ownership filter: strictly reject any record not belonging to active account
+    fun belongsToActiveAccount(review: PaperReview): Boolean =
+      if (activeUid.isNullOrBlank()) {
+        review.userId.isBlank() || review.userId == ANONYMOUS_OWNER_SCOPE
+      } else {
+        review.userId == activeUid
+      }
+
+    val scopedSqlList = sqlList.filter(::belongsToActiveAccount)
+    val scopedLocalList = localList.filter(::belongsToActiveAccount)
+    val mergedLocalAndSql = (scopedLocalList + scopedSqlList).distinctBy { it.id.ifBlank { it.title } }
+    val sqlById = scopedSqlList.associateBy { it.id }
+
     when (cloudState) {
       is ArchiveUiState.Loading -> {
         if (mergedLocalAndSql.isNotEmpty()) ArchiveUiState.Success(mergedLocalAndSql) else ArchiveUiState.Loading
@@ -328,9 +357,23 @@ class PaperCriticViewModel(
         if (mergedLocalAndSql.isNotEmpty()) ArchiveUiState.Success(mergedLocalAndSql) else cloudState
       }
       is ArchiveUiState.Success -> {
-        val cloudIds = cloudState.reviews.map { it.id }.toSet()
+        val scopedCloud = cloudState.reviews
+          .filter(::belongsToActiveAccount)
+          .map { cloudReview ->
+            // Preserve local merged annotations (dirty offline notes/bookmarks) while surfacing cloud ledger state
+            val localCached = sqlById[cloudReview.id]
+            if (localCached != null) {
+              cloudReview.copy(
+                bookmarked = localCached.bookmarked,
+                personalNotes = localCached.personalNotes
+              )
+            } else {
+              cloudReview
+            }
+          }
+        val cloudIds = scopedCloud.map { it.id }.toSet()
         val unsyncedLocal = mergedLocalAndSql.filter { it.id !in cloudIds }
-        ArchiveUiState.Success((unsyncedLocal + cloudState.reviews).distinctBy { it.id.ifBlank { it.title } })
+        ArchiveUiState.Success((unsyncedLocal + scopedCloud).distinctBy { it.id.ifBlank { it.title } })
       }
     }
   }.stateIn(
@@ -400,6 +443,8 @@ class PaperCriticViewModel(
   private var activeChatJob: Job? = null
   private var activeSearchGroundingJob: Job? = null
   private var activeSyncJob: Job? = null
+  private var activeImportJob: Job? = null
+  private var activeCodeImportJob: Job? = null
 
   private suspend inline fun <T> runSuspendCatching(crossinline block: suspend () -> T): Result<T> =
     try {
@@ -494,9 +539,11 @@ class PaperCriticViewModel(
   }
 
   /**
-   * Enforces strict account/session isolation on every login, logout, or account switch:
-   * - Bumps [sessionGeneration] so any in-flight inference or sync from the previous session is discarded.
-   * - Cancels active pipeline, chat, grounding, and sync jobs.
+   * Enforces strict account/session isolation on every login, logout, or account switch (P0-02):
+   * - Bumps [sessionGeneration] so any in-flight inference, import, or sync from the previous session is discarded.
+   * - Cancels active pipeline, chat, grounding, sync, and document/code import jobs.
+   * - Clears the manuscript workbench form (text, replication code, metadata, rendered PDF bitmaps)
+   *   so confidential unpublished manuscripts NEVER leak across accounts on a shared device.
    * - Clears all account-scoped in-memory reviews, selected dossiers, and provider test banners.
    * - Reloads account-scoped provider/engine preferences so Account B never inherits Account A's config.
    */
@@ -516,6 +563,10 @@ class PaperCriticViewModel(
     activeSearchGroundingJob = null
     activeSyncJob?.cancel()
     activeSyncJob = null
+    activeImportJob?.cancel()
+    activeImportJob = null
+    activeCodeImportJob?.cancel()
+    activeCodeImportJob = null
 
     _localReviews.value = emptyList()
     _selectedDossier.value = null
@@ -523,6 +574,7 @@ class PaperCriticViewModel(
     _followUpState.value = FollowUpQaState.Idle
     _searchGroundingState.value = SearchGroundingUiState.Idle
     _apiTestResultMessage.value = null
+    _isRetryingHydration.value = false
     _chatConfigState.update {
       it.copy(
         isStreaming = false,
@@ -537,6 +589,26 @@ class PaperCriticViewModel(
     val reloadedSettings = loadSettingsFromPrefs(prefs, nextScope)
     _settingsState.value = reloadedSettings
 
+    // P0-02: Wipe workbench manuscript text, replication code, metadata, and PDF page bitmaps
+    _formState.value = WorkbenchFormState(
+      inputModeIndex = _formState.value.inputModeIndex,
+      title = "",
+      authors = "",
+      year = "",
+      venueOrCitation = reloadedSettings.defaultVenue,
+      manuscriptText = "",
+      importedFileName = null,
+      importedFormat = ManuscriptInputFormat.TEXT,
+      importedWordCount = 0,
+      importedPageCount = 0,
+      pdfPageBitmaps = emptyList(),
+      coverageReport = null,
+      importedFileBanner = null,
+      replicationCodeFileName = null,
+      replicationCodeText = "",
+      options = reloadedSettings.defaultOptions
+    )
+
     if (!newUserId.isNullOrBlank() &&
       shouldAllowPortfolioSync(
         confidentialLocalOnly = reloadedSettings.confidentialLocalOnly,
@@ -545,6 +617,32 @@ class PaperCriticViewModel(
       )
     ) {
       syncPortfolioToCloud(isAutomatic = true)
+    }
+  }
+
+  /**
+   * P1-07: Explicit opt-in one-time recovery flow allowing a signed-in user to move legacy
+   * signed-out/anonymous API provider credentials into their authenticated account scope.
+   */
+  fun adoptAnonymousApiProvidersForCurrentUser() {
+    val uid = _authenticatedUserId.value?.takeIf { it.isNotBlank() }
+    if (uid == null) {
+      _statusBanner.value = "Sign in with Google before recovering legacy API provider credentials."
+      return
+    }
+    val sessionAtStart = sessionGeneration.get()
+    viewModelScope.launch {
+      val moved = runSuspendCatching {
+        localRepository.adoptAnonymousApiProvidersToAccount(uid)
+      }.getOrDefault(0)
+      if (!canCommitInferenceResult(uid, sessionAtStart, currentOwnerScope(), sessionGeneration.get())) {
+        return@launch
+      }
+      _statusBanner.value = if (moved > 0) {
+        "Recovered $moved legacy API provider configuration(s) into your account."
+      } else {
+        "No legacy signed-out API provider configurations were found."
+      }
     }
   }
 
@@ -611,6 +709,35 @@ class PaperCriticViewModel(
     activeSyncJob = viewModelScope.launch {
       _isSyncingPortfolio.value = true
       try {
+        // P1-03: Flush dirty offline annotations (bookmarks & personalNotes) BEFORE pulling cloud snapshots
+        val dirtyEntities = runSuspendCatching {
+          localRepository.getDirtyAnnotationReviews(uid)
+        }.getOrDefault(emptyList())
+        var syncedAnnotationsCount = 0
+        for (dirty in dirtyEntities) {
+          if (!canCommitInferenceResult(uid, initiatingSession, currentOwnerScope(), sessionGeneration.get())) {
+            return@launch
+          }
+          val isCloudId = dirty.id.isNotBlank() &&
+            !dirty.id.startsWith("local_") &&
+            !dirty.id.startsWith("sql_")
+          if (!isCloudId) continue
+          if (dirty.bookmarkDirty) {
+            val res = repository.updateBookmark(dirty.id, dirty.bookmarked, expectedUserId = uid)
+            if (res.isSuccess) {
+              runSuspendCatching { localRepository.clearBookmarkDirty(dirty.id, uid) }
+              syncedAnnotationsCount++
+            }
+          }
+          if (dirty.personalNotesDirty) {
+            val res = repository.updatePersonalNotes(dirty.id, dirty.personalNotes, expectedUserId = uid)
+            if (res.isSuccess) {
+              runSuspendCatching { localRepository.clearPersonalNotesDirty(dirty.id, uid) }
+              syncedAnnotationsCount++
+            }
+          }
+        }
+
         // Strictly scope upload candidates to records already owned by [uid] — NEVER auto-upload
         // anonymous drafts or another user's cached records.
         val scopedSqlReviews = localRepository.getCachedReviewsOnce(uid)
@@ -624,7 +751,7 @@ class PaperCriticViewModel(
           if (!canCommitInferenceResult(uid, initiatingSession, currentOwnerScope(), sessionGeneration.get())) {
             return@launch
           }
-          val saveResult = repository.createReview(localItem.copy(userId = uid))
+          val saveResult = repository.createReview(localItem.copy(userId = uid), expectedUserId = uid)
           if (saveResult.isSuccess) {
             val newCloudId = saveResult.getOrThrow()
             uploadedCount++
@@ -649,7 +776,7 @@ class PaperCriticViewModel(
         if (!canCommitInferenceResult(uid, initiatingSession, currentOwnerScope(), sessionGeneration.get())) {
           return@launch
         }
-        val refreshResult = repository.getUserReviews()
+        val refreshResult = repository.getUserReviews(expectedUserId = uid)
         val cloudList = refreshResult.getOrNull().orEmpty()
         if (cloudList.isNotEmpty() &&
           canCommitInferenceResult(uid, initiatingSession, currentOwnerScope(), sessionGeneration.get())
@@ -659,16 +786,21 @@ class PaperCriticViewModel(
           }
         }
         val totalSynced = cloudList.size
-        _statusBanner.value = if (uploadedCount > 0) {
-          "Synced $uploadedCount account review(s) to Google Cloud ($totalSynced total in portfolio)."
-        } else {
-          "Portfolio synced across SQL cache & Google Cloud ($totalSynced dossier(s) up to date)."
+        _statusBanner.value = when {
+          uploadedCount > 0 ->
+            "Synced $uploadedCount account review(s) to Google Cloud ($totalSynced total in portfolio)."
+          syncedAnnotationsCount > 0 ->
+            "Synced $syncedAnnotationsCount offline note/bookmark update(s) to Google Cloud ($totalSynced total)."
+          else ->
+            "Portfolio synced across SQL cache & Google Cloud ($totalSynced dossier(s) up to date)."
         }
       } catch (e: CancellationException) {
         throw e
       } catch (e: Exception) {
         Log.w(TAG, "Portfolio sync encountered an error", e)
-        _statusBanner.value = "Sync error: ${e.localizedMessage ?: "Could not reach Firestore"}"
+        if (canCommitInferenceResult(uid, initiatingSession, currentOwnerScope(), sessionGeneration.get())) {
+          _statusBanner.value = "Sync error: ${e.localizedMessage ?: "Could not reach Firestore"}"
+        }
       } finally {
         _isSyncingPortfolio.value = false
         activeSyncJob = null
@@ -786,37 +918,88 @@ class PaperCriticViewModel(
     _statusBanner.value = "Cleared manuscript input."
   }
 
+  /**
+   * Session-bound commit helper for asynchronous manuscript extraction (P0-02):
+   * refuses to write extracted manuscript text or PDF bitmaps into [_formState] if the active
+   * account or session generation changed while extraction was running.
+   */
+  internal fun applyExtractedManuscriptIfSessionValid(
+    extracted: ExtractedManuscriptFile,
+    initiatingOwnerScope: String,
+    initiatingSessionGen: Long
+  ): Boolean {
+    if (!canCommitInferenceResult(initiatingOwnerScope, initiatingSessionGen, currentOwnerScope(), sessionGeneration.get())) {
+      Log.w(TAG, "Account switched during manuscript extraction; discarding extracted document to prevent cross-account leak.")
+      return false
+    }
+    val sampleAuthorsSet = BenchmarkManuscriptCatalog.samples.map { it.authors }.toSet()
+    val sampleVenuesSet = BenchmarkManuscriptCatalog.samples.map { it.venue }.toSet()
+    _formState.update { current ->
+      val wasBenchmark = current.authors in sampleAuthorsSet ||
+        current.venueOrCitation in sampleVenuesSet ||
+        (current.importedFileBanner?.contains("Benchmark", ignoreCase = true) == true)
+      current.copy(
+        title = extracted.inferredTitle.ifBlank { current.title },
+        authors = if (wasBenchmark) "" else current.authors,
+        year = if (wasBenchmark) "" else current.year,
+        venueOrCitation = if (wasBenchmark) "" else current.venueOrCitation,
+        manuscriptText = extracted.extractedText,
+        importedFileName = extracted.fileName,
+        importedFormat = extracted.format,
+        importedWordCount = extracted.wordCount,
+        importedPageCount = extracted.pageCount,
+        pdfPageBitmaps = extracted.pdfPageBitmaps,
+        coverageReport = extracted.coverageReport,
+        importedFileBanner = extracted.summaryNotice
+      )
+    }
+    _statusBanner.value = extracted.summaryNotice
+    return true
+  }
+
+  /**
+   * Session-bound commit helper for asynchronous replication-code extraction (P0-02).
+   */
+  internal fun applyExtractedCodeIfSessionValid(
+    fileName: String,
+    codeText: String,
+    initiatingOwnerScope: String,
+    initiatingSessionGen: Long
+  ): Boolean {
+    if (!canCommitInferenceResult(initiatingOwnerScope, initiatingSessionGen, currentOwnerScope(), sessionGeneration.get())) {
+      Log.w(TAG, "Account switched during replication-code extraction; discarding code package to prevent cross-account leak.")
+      return false
+    }
+    _formState.update {
+      it.copy(
+        replicationCodeFileName = fileName,
+        replicationCodeText = codeText,
+        options = it.options.copy(enableCodeAudit = true)
+      )
+    }
+    _statusBanner.value = "Attached replication code: $fileName (${codeText.lines().size} lines)"
+    return true
+  }
+
   fun importManuscriptFromUri(context: Context, uri: Uri) {
-    viewModelScope.launch {
-      _statusBanner.value = "Extracting full document text & page coordinates..."
-      val renderVision = _settingsState.value.enablePdfVisionPages
-      val result = ManuscriptExtractor.extractFromUri(context, uri, renderPdfBitmaps = renderVision)
-      result.onSuccess { extracted ->
-        val sampleAuthorsSet = BenchmarkManuscriptCatalog.samples.map { it.authors }.toSet()
-        val sampleVenuesSet = BenchmarkManuscriptCatalog.samples.map { it.venue }.toSet()
-        _formState.update { current ->
-          val wasBenchmark = current.authors in sampleAuthorsSet ||
-            current.venueOrCitation in sampleVenuesSet ||
-            (current.importedFileBanner?.contains("Benchmark", ignoreCase = true) == true)
-          current.copy(
-            title = extracted.inferredTitle.ifBlank { current.title },
-            authors = if (wasBenchmark) "" else current.authors,
-            year = if (wasBenchmark) "" else current.year,
-            venueOrCitation = if (wasBenchmark) "" else current.venueOrCitation,
-            manuscriptText = extracted.extractedText,
-            importedFileName = extracted.fileName,
-            importedFormat = extracted.format,
-            importedWordCount = extracted.wordCount,
-            importedPageCount = extracted.pageCount,
-            pdfPageBitmaps = extracted.pdfPageBitmaps,
-            coverageReport = extracted.coverageReport,
-            importedFileBanner = extracted.summaryNotice
-          )
+    val initiatingOwnerScope = currentOwnerScope()
+    val initiatingSessionGen = sessionGeneration.get()
+    activeImportJob?.cancel()
+    activeImportJob = viewModelScope.launch {
+      try {
+        _statusBanner.value = "Extracting full document text & page coordinates..."
+        val renderVision = _settingsState.value.enablePdfVisionPages
+        val result = ManuscriptExtractor.extractFromUri(context, uri, renderPdfBitmaps = renderVision)
+        result.onSuccess { extracted ->
+          applyExtractedManuscriptIfSessionValid(extracted, initiatingOwnerScope, initiatingSessionGen)
+        }.onFailure { error ->
+          if (canCommitInferenceResult(initiatingOwnerScope, initiatingSessionGen, currentOwnerScope(), sessionGeneration.get())) {
+            Log.e(TAG, "Failed to extract manuscript file", error)
+            _statusBanner.value = "Could not extract file: ${error.localizedMessage ?: "Unknown error"}"
+          }
         }
-        _statusBanner.value = extracted.summaryNotice
-      }.onFailure { error ->
-        Log.e(TAG, "Failed to extract manuscript file", error)
-        _statusBanner.value = "Could not extract file: ${error.localizedMessage ?: "Unknown error"}"
+      } finally {
+        activeImportJob = null
       }
     }
   }
@@ -841,6 +1024,8 @@ class PaperCriticViewModel(
         importedWordCount = words,
         importedPageCount = (words / 350).coerceAtLeast(1),
         pdfPageBitmaps = emptyList(),
+        replicationCodeFileName = null,
+        replicationCodeText = "",
         coverageReport = DocumentCoverageReport.forDirectPastedText(
           text = cleaned,
           engine = "Shared Plain Text"
@@ -853,21 +1038,23 @@ class PaperCriticViewModel(
   }
 
   fun importReplicationCodeFromUri(context: Context, uri: Uri) {
-    viewModelScope.launch {
-      _statusBanner.value = "Extracting replication code package (Stage 00_prep_code)..."
-      val result = ManuscriptExtractor.extractReplicationCodeFromUri(context, uri)
-      result.onSuccess { (fileName, codeText) ->
-        _formState.update {
-          it.copy(
-            replicationCodeFileName = fileName,
-            replicationCodeText = codeText,
-            options = it.options.copy(enableCodeAudit = true)
-          )
+    val initiatingOwnerScope = currentOwnerScope()
+    val initiatingSessionGen = sessionGeneration.get()
+    activeCodeImportJob?.cancel()
+    activeCodeImportJob = viewModelScope.launch {
+      try {
+        _statusBanner.value = "Extracting replication code package (Stage 00_prep_code)..."
+        val result = ManuscriptExtractor.extractReplicationCodeFromUri(context, uri)
+        result.onSuccess { (fileName, codeText) ->
+          applyExtractedCodeIfSessionValid(fileName, codeText, initiatingOwnerScope, initiatingSessionGen)
+        }.onFailure { error ->
+          if (canCommitInferenceResult(initiatingOwnerScope, initiatingSessionGen, currentOwnerScope(), sessionGeneration.get())) {
+            Log.e(TAG, "Failed to extract replication code", error)
+            _statusBanner.value = "Could not load code package: ${error.localizedMessage ?: "Unknown error"}"
+          }
         }
-        _statusBanner.value = "Attached replication code: $fileName (${codeText.lines().size} lines)"
-      }.onFailure { error ->
-        Log.e(TAG, "Failed to extract replication code", error)
-        _statusBanner.value = "Could not load code package: ${error.localizedMessage ?: "Unknown error"}"
+      } finally {
+        activeCodeImportJob = null
       }
     }
   }
@@ -964,7 +1151,7 @@ class PaperCriticViewModel(
         val scopedReview = generatedReview.copy(userId = initiatingUid.orEmpty())
         val shouldSyncCloud = !settings.confidentialLocalOnly && settings.autoSaveToCloud && initiatingUid != null
         val finalReview = if (shouldSyncCloud && initiatingUid != null) {
-          val saveResult = repository.createReview(scopedReview)
+          val saveResult = repository.createReview(scopedReview, expectedUserId = initiatingUid)
           if (!canCommitInferenceResult(initiatingOwnerScope, initiatingSessionGen, currentOwnerScope(), sessionGeneration.get())) {
             return@launch
           }
@@ -985,7 +1172,7 @@ class PaperCriticViewModel(
           val localReview = scopedReview.copy(id = localId)
           _localReviews.update { listOf(localReview) + it }
           _statusBanner.value = if (settings.confidentialLocalOnly) {
-            "Local-only report storage: saved strictly to on-device Room DB (not synced to cloud)."
+            "Local-only report storage: saved strictly on-device (no cloud upload; AI analysis used your selected remote provider)."
           } else {
             "Analysis complete & cached in Room Offline Database!"
           }
@@ -1079,9 +1266,49 @@ class PaperCriticViewModel(
     _activeMainTab.value = 0
   }
 
+  /**
+   * P1-01: On-demand retry hydration when a cloud dossier loaded with degraded/unavailable chunks.
+   */
+  fun retryHydrateSelectedDossier(review: PaperReview) {
+    val activeUid = _authenticatedUserId.value?.takeIf { it.isNotBlank() }
+    if (activeUid == null || review.id.isBlank() || review.id.startsWith("local_") || review.id.startsWith("sql_")) {
+      _statusBanner.value = "Sign in to re-fetch cloud findings chunks for this dossier."
+      return
+    }
+    if (_isRetryingHydration.value) return
+    val initiatingSession = sessionGeneration.get()
+    viewModelScope.launch {
+      _isRetryingHydration.value = true
+      try {
+        val result = repository.retryHydrateReview(review, expectedUserId = activeUid)
+        if (!canCommitInferenceResult(activeUid, initiatingSession, currentOwnerScope(), sessionGeneration.get())) {
+          return@launch
+        }
+        result.onSuccess { hydrated ->
+          runSuspendCatching {
+            localRepository.cacheReviewOffline(hydrated, ownerScope = activeUid)
+          }
+          if (_selectedDossier.value?.id == hydrated.id) {
+            _selectedDossier.value = hydrated
+          }
+          _statusBanner.value = if (hydrated.ledgerLoadState == LedgerLoadState.COMPLETE) {
+            "Verified findings and full narrative sections re-hydrated from cloud."
+          } else {
+            "Re-fetch incomplete (${hydrated.ledgerLoadState.name.replace('_', ' ')}). Check connection and retry."
+          }
+        }.onFailure { err ->
+          _statusBanner.value = "Could not re-fetch cloud findings: ${err.localizedMessage ?: "Network unavailable"}"
+        }
+      } finally {
+        _isRetryingHydration.value = false
+      }
+    }
+  }
+
   fun toggleBookmark(review: PaperReview) {
     val activeUid = _authenticatedUserId.value
     val ownerScope = currentOwnerScope()
+    val initiatingSession = sessionGeneration.get()
     val newBookmarked = !review.bookmarked
     _localReviews.update { list ->
       list.map { if (it.id == review.id) it.copy(bookmarked = newBookmarked) else it }
@@ -1099,9 +1326,13 @@ class PaperCriticViewModel(
       return
     }
     viewModelScope.launch {
-      // Field-level partial update so concurrent note edits never overwrite bookmark state
-      val result = repository.updateBookmark(review.id, newBookmarked)
+      // Field-level partial update with strict account-ownership guard (P1-03 + P1-06)
+      val result = repository.updateBookmark(review.id, newBookmarked, expectedUserId = activeUid)
+      if (!canCommitInferenceResult(ownerScope, initiatingSession, currentOwnerScope(), sessionGeneration.get())) {
+        return@launch
+      }
       result.onSuccess {
+        runSuspendCatching { localRepository.clearBookmarkDirty(review.id, ownerScope) }
         _statusBanner.value = if (newBookmarked) "Added to starred dossiers." else "Removed from starred dossiers."
       }.onFailure {
         _statusBanner.value = if (newBookmarked) {
@@ -1116,6 +1347,7 @@ class PaperCriticViewModel(
   fun savePersonalNotes(review: PaperReview, notes: String) {
     val activeUid = _authenticatedUserId.value
     val ownerScope = currentOwnerScope()
+    val initiatingSession = sessionGeneration.get()
     _localReviews.update { list ->
       list.map { if (it.id == review.id) it.copy(personalNotes = notes) else it }
     }
@@ -1132,9 +1364,13 @@ class PaperCriticViewModel(
       return
     }
     viewModelScope.launch {
-      // Field-level partial update so concurrent bookmark toggles never overwrite notes
-      val result = repository.updatePersonalNotes(review.id, notes)
+      // Field-level partial update with strict account-ownership guard (P1-03 + P1-06)
+      val result = repository.updatePersonalNotes(review.id, notes, expectedUserId = activeUid)
+      if (!canCommitInferenceResult(ownerScope, initiatingSession, currentOwnerScope(), sessionGeneration.get())) {
+        return@launch
+      }
       result.onSuccess {
+        runSuspendCatching { localRepository.clearPersonalNotesDirty(review.id, ownerScope) }
         _statusBanner.value = "Referee notes saved to Room & Cloud Library."
       }.onFailure {
         _statusBanner.value = "Notes saved offline to Room cache (cloud sync pending)."
@@ -1145,30 +1381,50 @@ class PaperCriticViewModel(
   fun deleteReview(reviewId: String) {
     val activeUid = _authenticatedUserId.value
     val ownerScope = currentOwnerScope()
+    val initiatingSession = sessionGeneration.get()
     if (reviewId.isBlank()) return
-    _localReviews.update { list -> list.filterNot { it.id == reviewId } }
-    if (_selectedDossier.value?.id == reviewId) {
-      activeChatJob?.cancel()
-      activeChatJob = null
-      activeSearchGroundingJob?.cancel()
-      activeSearchGroundingJob = null
-      _selectedDossier.value = null
-    }
-    viewModelScope.launch {
-      runSuspendCatching {
-        localRepository.removeCachedReview(reviewId, ownerScope)
+    val isLocalOnly = reviewId.startsWith("local_") || reviewId.startsWith("sql_") || activeUid.isNullOrBlank()
+    if (isLocalOnly) {
+      _localReviews.update { list -> list.filterNot { it.id == reviewId } }
+      if (_selectedDossier.value?.id == reviewId) {
+        activeChatJob?.cancel()
+        activeChatJob = null
+        activeSearchGroundingJob?.cancel()
+        activeSearchGroundingJob = null
+        _selectedDossier.value = null
       }
-    }
-    if (reviewId.startsWith("local_") || reviewId.startsWith("sql_") || activeUid.isNullOrBlank()) {
+      viewModelScope.launch {
+        runSuspendCatching {
+          localRepository.removeCachedReview(reviewId, ownerScope)
+        }
+      }
       _statusBanner.value = "Review dossier deleted from offline Room cache."
       return
     }
+
+    // P1-02 + P1-06: For cloud dossiers, require fail-visible atomic recursive cloud delete
+    // (parent + findings_chunks + narrative_chunks) with expectedUserId verification before
+    // removing the local record so failed deletions remain visible and retryable.
     viewModelScope.launch {
-      val result = repository.deleteReview(reviewId)
+      val result = repository.deleteReview(reviewId, expectedUserId = activeUid)
+      if (!canCommitInferenceResult(ownerScope, initiatingSession, currentOwnerScope(), sessionGeneration.get())) {
+        return@launch
+      }
       result.onSuccess {
-        _statusBanner.value = "Review dossier deleted."
+        _localReviews.update { list -> list.filterNot { it.id == reviewId } }
+        if (_selectedDossier.value?.id == reviewId) {
+          activeChatJob?.cancel()
+          activeChatJob = null
+          activeSearchGroundingJob?.cancel()
+          activeSearchGroundingJob = null
+          _selectedDossier.value = null
+        }
+        runSuspendCatching {
+          localRepository.removeCachedReview(reviewId, ownerScope)
+        }
+        _statusBanner.value = "Review dossier and all cloud chunks deleted."
       }.onFailure { error ->
-        _statusBanner.value = "Removed locally; cloud delete failed: ${error.localizedMessage}"
+        _statusBanner.value = "Cloud delete failed (retained to avoid orphaned cloud chunks): ${error.localizedMessage ?: "Check connection and retry."}"
       }
     }
   }
@@ -1201,11 +1457,12 @@ class PaperCriticViewModel(
           return@launch
         }
         _searchGroundingState.value = SearchGroundingUiState.Success(result)
+        // P1-03: Field-level update so concurrent offline note/bookmark edits are NEVER overwritten
         runSuspendCatching {
-          localRepository.cacheReviewOffline(
+          localRepository.updateSearchGroundingReport(
             review = review,
-            ownerScope = initiatingOwnerScope,
-            searchGroundingReport = result.summaryText
+            report = result.summaryText,
+            ownerScope = initiatingOwnerScope
           )
         }
         _statusBanner.value = "Stage 03b Google Search Grounding complete (${result.sources.size} web source(s))."
@@ -1567,10 +1824,14 @@ class PaperCriticViewModel(
     activeChatJob?.cancel()
     activeSearchGroundingJob?.cancel()
     activeSyncJob?.cancel()
+    activeImportJob?.cancel()
+    activeCodeImportJob?.cancel()
     activePipelineJob = null
     activeChatJob = null
     activeSearchGroundingJob = null
     activeSyncJob = null
+    activeImportJob = null
+    activeCodeImportJob = null
     _formState.update { it.copy(pdfPageBitmaps = emptyList()) }
     super.onCleared()
   }

@@ -301,6 +301,26 @@ data class ScoreCalculationBreakdown(
 }
 
 /**
+ * Finding 5: Two-stage quantitative audit coverage metrics separating Stage-1 discovery caps
+ * (claims, 2x2 tables, meta-analysis effects, structured table rows, sample-flow records)
+ * from Stage-2 numerical reconstruction caps.
+ */
+data class StatisticalCoverageMetrics(
+  val discoveredTotal: Int = 0,
+  val parsedRetained: Int = 0,
+  val discoverySkipped: Int = 0,
+  val reconstructionEligible: Int = 0,
+  val reconstructedCompleted: Int = 0,
+  val reconstructionSkipped: Int = 0,
+  val unsupportedCount: Int = 0,
+  val truncatedPages: List<Int> = emptyList(),
+  val skippedCategories: List<String> = emptyList()
+) {
+  val totalSkippedCoverage: Int get() = discoverySkipped + reconstructionSkipped
+  val hasIncompleteCoverage: Boolean get() = totalSkippedCoverage > 0
+}
+
+/**
  * Complete output of the dedicated Statistical Audit Subsystem (Phases 1–6).
  */
 data class StatisticalAuditReport(
@@ -318,7 +338,17 @@ data class StatisticalAuditReport(
   val semanticValidity: SemanticValidityReport? = null,
   val totalDiscoveredClaims: Int = claims.size,
   val truncatedClaimCount: Int = 0,
-  val truncatedPages: List<Int> = emptyList()
+  val truncatedPages: List<Int> = emptyList(),
+  val coverageMetrics: StatisticalCoverageMetrics = StatisticalCoverageMetrics(
+    discoveredTotal = totalDiscoveredClaims,
+    parsedRetained = claims.size + twoByTwoTables.size + metaStudyEffects.size + sampleFlowRecords.size,
+    discoverySkipped = truncatedClaimCount,
+    reconstructionEligible = reconstructions.size,
+    reconstructedCompleted = reconstructions.size,
+    reconstructionSkipped = 0,
+    unsupportedCount = unsupportedDisclosures.size,
+    truncatedPages = truncatedPages
+  )
 ) {
   val exactClaimCount: Int get() = claims.count { !it.isFromReferenceOrCitation && it.parseStatus == ClaimParseStatus.EXACT }
   val partialClaimCount: Int get() = claims.count { !it.isFromReferenceOrCitation && it.parseStatus == ClaimParseStatus.PARTIAL }
@@ -362,10 +392,28 @@ data class StatisticalAuditReport(
         "($exactClaimCount EXACT, $partialClaimCount PARTIAL, $ambiguousClaimCount AMBIGUOUS, $unsupportedClaimCount UNSUPPORTED; " +
         "$excludedReferenceClaimCount reference/citation claim(s) excluded from testing families)."
     )
-    if (truncatedClaimCount > 0) {
-      val pagesDesc = if (truncatedPages.isNotEmpty()) " on page(s) ${truncatedPages.joinToString(", ")}" else ""
+    appendLine(
+      "Coverage Accounting: Found=${coverageMetrics.discoveredTotal}, " +
+        "Parsed=${coverageMetrics.parsedRetained}, " +
+        "ReconstructionEligible=${coverageMetrics.reconstructionEligible}, " +
+        "Reconstructed=${coverageMetrics.reconstructedCompleted}, " +
+        "Unsupported=${coverageMetrics.unsupportedCount}, " +
+        "Skipped=${coverageMetrics.totalSkippedCoverage} " +
+        "(DiscoverySkipped=${coverageMetrics.discoverySkipped}, ReconstructionSkipped=${coverageMetrics.reconstructionSkipped})."
+    )
+    if (coverageMetrics.hasIncompleteCoverage || truncatedClaimCount > 0) {
+      val pagesDesc = if (coverageMetrics.truncatedPages.isNotEmpty()) {
+        " on page(s) ${coverageMetrics.truncatedPages.joinToString(", ")}"
+      } else {
+        ""
+      }
+      val catDesc = if (coverageMetrics.skippedCategories.isNotEmpty()) {
+        " [categories: ${coverageMetrics.skippedCategories.joinToString(", ")}]"
+      } else {
+        ""
+      }
       appendLine(
-        "QUANTITATIVE COVERAGE PARTIAL (TRUNCATION NOTICE): $truncatedClaimCount additional claim(s)$pagesDesc omitted beyond per-family discovery cap (total discovered: $totalDiscoveredClaims). Do NOT claim complete quantitative coverage."
+        "QUANTITATIVE COVERAGE PARTIAL (TRUNCATION NOTICE): ${coverageMetrics.totalSkippedCoverage} statistical item(s)$pagesDesc were skipped by discovery/reconstruction caps$catDesc (total discovered: ${coverageMetrics.discoveredTotal}). Do NOT claim complete quantitative coverage."
       )
     }
     appendLine(

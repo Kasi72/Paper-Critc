@@ -1044,7 +1044,8 @@ object StatisticalAuditOrchestrator {
 
     val subDesign = DomainStatisticalAuditModules.classifySubDesign(cleanText, parentArchetype)
     val designClassification = SemanticValidityEngine.classifyDesignWithConfidence(cleanText, parentArchetype)
-    val reconstructions = NumericalReconstructionEngine.runAllReconstructions(ledger, cleanText)
+    val reconstructionRun = NumericalReconstructionEngine.runAllReconstructionsWithCoverage(ledger, cleanText)
+    val reconstructions = reconstructionRun.results
     val rawDomainFindings = DomainStatisticalAuditModules.runDomainAudit(cleanText, subDesign, ledger, reconstructions)
 
     // Phase 8 #2 Classifier-Confidence Gate: when design classification abstains due to low confidence
@@ -1075,6 +1076,27 @@ object StatisticalAuditOrchestrator {
       extractionConfidence = extractionConfidence
     )
 
+    val allDisclosures = buildList {
+      addAll(ledger.unsupportedDisclosures)
+      if (reconstructionRun.skippedCount > 0) {
+        add(
+          "Stage-2 numerical reconstruction cap reached: ${reconstructionRun.skippedCount} eligible claim(s)/table(s) were skipped [${reconstructionRun.skippedCategories.joinToString(", ")}]; quantitative verification is incomplete."
+        )
+      }
+    }.distinct()
+
+    val coverageMetrics = StatisticalCoverageMetrics(
+      discoveredTotal = ledger.totalDiscoveredClaims,
+      parsedRetained = ledger.claims.size + ledger.twoByTwoTables.size + ledger.metaStudyEffects.size + ledger.sampleFlowRecords.size,
+      discoverySkipped = ledger.truncatedClaimCount,
+      reconstructionEligible = reconstructionRun.eligibleCount,
+      reconstructedCompleted = reconstructionRun.completedCount,
+      reconstructionSkipped = reconstructionRun.skippedCount,
+      unsupportedCount = allDisclosures.size,
+      truncatedPages = ledger.truncatedPages,
+      skippedCategories = (ledger.skippedDiscoveryCategories + reconstructionRun.skippedCategories).distinct()
+    )
+
     return StatisticalAuditReport(
       subDesign = subDesign,
       claims = ledger.claims,
@@ -1084,12 +1106,13 @@ object StatisticalAuditOrchestrator {
       crossLinks = ledger.crossLinks,
       reconstructions = reconstructions,
       domainFindings = gatedDomainFindings,
-      unsupportedDisclosures = ledger.unsupportedDisclosures,
+      unsupportedDisclosures = allDisclosures,
       designClassification = designClassification,
       semanticValidity = semanticValidity,
       totalDiscoveredClaims = ledger.totalDiscoveredClaims,
-      truncatedClaimCount = ledger.truncatedClaimCount,
-      truncatedPages = ledger.truncatedPages
+      truncatedClaimCount = coverageMetrics.totalSkippedCoverage,
+      truncatedPages = ledger.truncatedPages,
+      coverageMetrics = coverageMetrics
     )
   }
 }

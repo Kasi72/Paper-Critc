@@ -85,8 +85,11 @@ class LocalReviewRepository(private val sqlDao: PaperCriticSqlDao) {
   }
 
   /**
-   * Field-level Room update for [bookmarked] with durable dirty-flag tracking so concurrent
-   * personalNotes edits or subsequent stale cloud snapshots NEVER clobber newer local bookmarks.
+   * Field-level Room update for [bookmarked] with monotonic revision tracking so concurrent
+   * personalNotes edits, stale cloud snapshots, or older in-flight cloud acknowledgments NEVER
+   * erase a newer local bookmark edit.
+   *
+   * @return the new monotonic [SqlReviewCacheEntity.bookmarkRevision] persisted in Room.
    */
   suspend fun updateBookmark(
     review: PaperReview,
@@ -94,7 +97,7 @@ class LocalReviewRepository(private val sqlDao: PaperCriticSqlDao) {
     ownerScope: String = normalizeOwnerScope(review.userId),
     markDirty: Boolean = true,
     updatedAtEpochMs: Long = System.currentTimeMillis()
-  ) {
+  ): Long {
     val scope = normalizeOwnerScope(ownerScope)
     val updatedRows = sqlDao.updateBookmarkForOwner(
       reviewId = review.id,
@@ -105,6 +108,7 @@ class LocalReviewRepository(private val sqlDao: PaperCriticSqlDao) {
     )
     if (updatedRows == 0) {
       val existing = sqlDao.getReviewByIdForOwner(review.id, scope)
+      val nextRevision = (existing?.bookmarkRevision ?: 0L) + 1L
       sqlDao.upsertReview(
         SqlReviewCacheEntity.fromPaperReview(
           review = review.copy(bookmarked = bookmarked),
@@ -112,15 +116,22 @@ class LocalReviewRepository(private val sqlDao: PaperCriticSqlDao) {
           searchGroundingReport = existing?.searchGroundingReport.orEmpty(),
           bookmarkDirty = markDirty,
           personalNotesDirty = existing?.personalNotesDirty ?: false,
+          bookmarkRevision = nextRevision,
+          personalNotesRevision = existing?.personalNotesRevision ?: 0L,
           localAnnotationUpdatedAtMs = updatedAtEpochMs
         )
       )
+      return nextRevision
     }
+    return sqlDao.getReviewByIdForOwner(review.id, scope)?.bookmarkRevision ?: 1L
   }
 
   /**
-   * Field-level Room update for [personalNotes] with durable dirty-flag tracking so concurrent
-   * bookmark toggles or subsequent stale cloud snapshots NEVER clobber newer local notes.
+   * Field-level Room update for [personalNotes] with monotonic revision tracking so concurrent
+   * bookmark toggles, stale cloud snapshots, or older in-flight cloud acknowledgments NEVER
+   * erase a newer local note edit.
+   *
+   * @return the new monotonic [SqlReviewCacheEntity.personalNotesRevision] persisted in Room.
    */
   suspend fun updatePersonalNotes(
     review: PaperReview,
@@ -128,7 +139,7 @@ class LocalReviewRepository(private val sqlDao: PaperCriticSqlDao) {
     ownerScope: String = normalizeOwnerScope(review.userId),
     markDirty: Boolean = true,
     updatedAtEpochMs: Long = System.currentTimeMillis()
-  ) {
+  ): Long {
     val scope = normalizeOwnerScope(ownerScope)
     val updatedRows = sqlDao.updatePersonalNotesForOwner(
       reviewId = review.id,
@@ -139,6 +150,7 @@ class LocalReviewRepository(private val sqlDao: PaperCriticSqlDao) {
     )
     if (updatedRows == 0) {
       val existing = sqlDao.getReviewByIdForOwner(review.id, scope)
+      val nextRevision = (existing?.personalNotesRevision ?: 0L) + 1L
       sqlDao.upsertReview(
         SqlReviewCacheEntity.fromPaperReview(
           review = review.copy(personalNotes = personalNotes),
@@ -146,19 +158,44 @@ class LocalReviewRepository(private val sqlDao: PaperCriticSqlDao) {
           searchGroundingReport = existing?.searchGroundingReport.orEmpty(),
           bookmarkDirty = existing?.bookmarkDirty ?: false,
           personalNotesDirty = markDirty,
+          bookmarkRevision = existing?.bookmarkRevision ?: 0L,
+          personalNotesRevision = nextRevision,
           localAnnotationUpdatedAtMs = updatedAtEpochMs
         )
       )
+      return nextRevision
     }
+    return sqlDao.getReviewByIdForOwner(review.id, scope)?.personalNotesRevision ?: 1L
   }
 
-  suspend fun clearBookmarkDirty(reviewId: String, ownerScope: String) {
-    sqlDao.clearBookmarkDirtyForOwner(reviewId, normalizeOwnerScope(ownerScope))
-  }
+  /**
+   * Clears [SqlReviewCacheEntity.bookmarkDirty] ONLY if the current local `bookmarkRevision`
+   * still equals [acknowledgedRevision]. If the user edited the bookmark again while the cloud
+   * write was in flight, the dirty flag remains `true` so the newer edit is still synchronized.
+   */
+  suspend fun clearBookmarkDirtyIfRevisionMatches(
+    reviewId: String,
+    ownerScope: String,
+    acknowledgedRevision: Long
+  ): Boolean = sqlDao.clearBookmarkDirtyIfRevisionMatches(
+    reviewId = reviewId,
+    ownerScope = normalizeOwnerScope(ownerScope),
+    acknowledgedRevision = acknowledgedRevision
+  ) > 0
 
-  suspend fun clearPersonalNotesDirty(reviewId: String, ownerScope: String) {
-    sqlDao.clearPersonalNotesDirtyForOwner(reviewId, normalizeOwnerScope(ownerScope))
-  }
+  /**
+   * Clears [SqlReviewCacheEntity.personalNotesDirty] ONLY if the current local
+   * `personalNotesRevision` still equals [acknowledgedRevision].
+   */
+  suspend fun clearPersonalNotesDirtyIfRevisionMatches(
+    reviewId: String,
+    ownerScope: String,
+    acknowledgedRevision: Long
+  ): Boolean = sqlDao.clearPersonalNotesDirtyIfRevisionMatches(
+    reviewId = reviewId,
+    ownerScope = normalizeOwnerScope(ownerScope),
+    acknowledgedRevision = acknowledgedRevision
+  ) > 0
 
   suspend fun getDirtyAnnotationReviews(ownerScope: String): List<SqlReviewCacheEntity> =
     sqlDao.getDirtyAnnotationReviewsForOwner(normalizeOwnerScope(ownerScope))
@@ -188,40 +225,66 @@ class LocalReviewRepository(private val sqlDao: PaperCriticSqlDao) {
     val preservedGrounding = searchGroundingReport.ifBlank { existing?.searchGroundingReport.orEmpty() }
     val incomingUpdatedMs = incoming.updatedAt?.toDate()?.time ?: 0L
 
-    // 1. Protect intact local structured findings if incoming cloud snapshot failed transient chunk hydration
-    //    (NEVER paper over a cloud-verified CORRUPT checksum failure — keep CORRUPT visible!)
-    var safeReview = if (
-      existing != null &&
+    var safeReview = incoming
+    val existingIsComplete = existing != null && existing.ledgerLoadState == LedgerLoadState.COMPLETE.name
+    val isTransientDegraded = incoming.ledgerLoadState == LedgerLoadState.TEMPORARILY_UNAVAILABLE ||
+      (incoming.findingsChunkCount > 0 && incoming.structuredFindingsJson.isBlank() && incoming.ledgerLoadState != LedgerLoadState.CORRUPT)
+
+    // 1. Checksum-verified lossless recovery of structured findings when cloud chunk hydration failed transiently
+    //    (NEVER mask a cloud-verified CORRUPT checksum failure — keep CORRUPT visible!)
+    val findingsNeedRestore = incoming.findingsChunkCount > 0 &&
+      (incoming.structuredFindingsJson.isBlank() || incoming.ledgerLoadState == LedgerLoadState.TEMPORARILY_UNAVAILABLE)
+    val findingsChecksumCompatible = existing != null &&
       existing.structuredFindingsJson.isNotBlank() &&
-      existing.ledgerLoadState == LedgerLoadState.COMPLETE.name &&
-      incoming.ledgerLoadState != LedgerLoadState.CORRUPT &&
-      ((incoming.findingsChunkCount > 0 && incoming.structuredFindingsJson.isBlank()) ||
-        incoming.ledgerLoadState == LedgerLoadState.TEMPORARILY_UNAVAILABLE) &&
       (incoming.findingsChecksum.isBlank() ||
         existing.findingsChecksum.isBlank() ||
         incoming.findingsChecksum == existing.findingsChecksum)
-    ) {
-      incoming.copy(
-        structuredFindingsJson = existing.structuredFindingsJson,
-        validationStatus = existing.validationStatus,
-        ledgerLoadState = LedgerLoadState.COMPLETE
+    val findingsRestored = existingIsComplete && isTransientDegraded && findingsNeedRestore && findingsChecksumCompatible
+    if (findingsRestored && existing != null) {
+      safeReview = safeReview.copy(
+        structuredFindingsJson = existing.structuredFindingsJson
       )
-    } else {
-      incoming
     }
 
-    // 2. Protect intact local narrative sections if incoming cloud snapshot has shorter truncated fields
-    if (existing != null &&
-      incoming.narrativeChunkCount > 0 &&
+    // 2. Checksum-verified lossless recovery of ALL 12 narrative fields (never length heuristics!)
+    //    when narrative chunk hydration failed transiently for the same narrative checksum/version.
+    val narrativeNeedsRestore = incoming.narrativeChunkCount > 0 &&
       incoming.ledgerLoadState == LedgerLoadState.TEMPORARILY_UNAVAILABLE
+    val narrativeChecksumCompatible = existing != null &&
+      (incoming.narrativeChecksum.isBlank() ||
+        existing.narrativeChecksum.isBlank() ||
+        incoming.narrativeChecksum == existing.narrativeChecksum)
+    val narrativesRestored = existingIsComplete && narrativeNeedsRestore && narrativeChecksumCompatible
+    if (narrativesRestored && existing != null) {
+      safeReview = safeReview.copy(
+        abstractSummary = existing.abstractSummary,
+        researchQuestion = existing.researchQuestion,
+        keyMethodology = existing.keyMethodology,
+        coreContributions = existing.coreContributions,
+        redTeamCritique = existing.redTeamCritique,
+        blueTeamVerification = existing.blueTeamVerification,
+        mathAuditReport = existing.mathAuditReport,
+        codeAuditReport = existing.codeAuditReport,
+        editorNote = existing.editorNote,
+        copyeditSuggestions = existing.copyeditSuggestions,
+        reviewerQuestions = existing.reviewerQuestions,
+        formattedDossier = existing.formattedDossier
+      )
+    }
+
+    // Restore COMPLETE load state & verified validationStatus ONLY if every degraded component was losslessly recovered
+    val findingsSatisfied = !findingsNeedRestore || findingsRestored
+    val narrativesSatisfied = !narrativeNeedsRestore || narrativesRestored
+    if (existing != null &&
+      existingIsComplete &&
+      isTransientDegraded &&
+      (findingsRestored || narrativesRestored) &&
+      findingsSatisfied &&
+      narrativesSatisfied
     ) {
       safeReview = safeReview.copy(
-        redTeamCritique = if (existing.redTeamCritique.length > safeReview.redTeamCritique.length) existing.redTeamCritique else safeReview.redTeamCritique,
-        blueTeamVerification = if (existing.blueTeamVerification.length > safeReview.blueTeamVerification.length) existing.blueTeamVerification else safeReview.blueTeamVerification,
-        mathAuditReport = if (existing.mathAuditReport.length > safeReview.mathAuditReport.length) existing.mathAuditReport else safeReview.mathAuditReport,
-        codeAuditReport = if (existing.codeAuditReport.length > safeReview.codeAuditReport.length) existing.codeAuditReport else safeReview.codeAuditReport,
-        editorNote = if (existing.editorNote.length > safeReview.editorNote.length) existing.editorNote else safeReview.editorNote,
-        formattedDossier = if (existing.formattedDossier.length > safeReview.formattedDossier.length) existing.formattedDossier else safeReview.formattedDossier
+        validationStatus = existing.validationStatus,
+        ledgerLoadState = LedgerLoadState.COMPLETE
       )
     }
 
@@ -248,6 +311,8 @@ class LocalReviewRepository(private val sqlDao: PaperCriticSqlDao) {
       searchGroundingReport = preservedGrounding,
       bookmarkDirty = if (keepLocalBookmark) existing?.bookmarkDirty ?: false else false,
       personalNotesDirty = if (keepLocalNotes) existing?.personalNotesDirty ?: false else false,
+      bookmarkRevision = existing?.bookmarkRevision ?: 0L,
+      personalNotesRevision = existing?.personalNotesRevision ?: 0L,
       localAnnotationUpdatedAtMs = if (keepLocalBookmark || keepLocalNotes) {
         existing?.localAnnotationUpdatedAtMs ?: 0L
       } else {

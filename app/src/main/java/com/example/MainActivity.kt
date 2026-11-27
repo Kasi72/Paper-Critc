@@ -415,6 +415,7 @@ fun PaperCriticAuthenticatedShell(
               } else {
                 "Firebase Gemini (Built-in Cloud AI)"
               }
+              val hasValidRemoteConsent by viewModel.hasValidRemoteInferenceConsent.collectAsStateWithLifecycle()
               WorkbenchScreen(
                 formState = formState,
                 preFlight = preFlightReport,
@@ -435,7 +436,9 @@ fun PaperCriticAuthenticatedShell(
                 onCancelPipeline = viewModel::cancelRunningPipeline,
                 onOpenCompletedDossier = viewModel::openDossier,
                 confidentialLocalOnly = settingsState.confidentialLocalOnly,
-                activeAiProviderSummary = activeProviderSummary
+                activeAiProviderSummary = activeProviderSummary,
+                hasValidRemoteConsent = hasValidRemoteConsent,
+                onConfirmRemoteInferenceConsent = viewModel::confirmRemoteInferenceForCurrentDraft
               )
             }
 

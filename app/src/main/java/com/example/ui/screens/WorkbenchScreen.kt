@@ -122,17 +122,13 @@ fun WorkbenchScreen(
   onCancelPipeline: () -> Unit = {},
   onOpenCompletedDossier: (PaperReview) -> Unit,
   confidentialLocalOnly: Boolean = false,
-  activeAiProviderSummary: String = "Firebase Gemini (Cloud AI)"
+  activeAiProviderSummary: String = "Firebase Gemini (Cloud AI)",
+  hasValidRemoteConsent: Boolean = !confidentialLocalOnly,
+  onConfirmRemoteInferenceConsent: () -> Unit = {}
 ) {
-  var remoteInferenceConfirmed by remember(
-    confidentialLocalOnly,
-    activeAiProviderSummary,
-    formState.importedFileName,
-    formState.title
-  ) { mutableStateOf(false) }
   var showConfidentialProviderDialog by remember { mutableStateOf(false) }
   val triggerRunPipeline: () -> Unit = {
-    if (confidentialLocalOnly && !remoteInferenceConfirmed) {
+    if (confidentialLocalOnly && !hasValidRemoteConsent) {
       showConfidentialProviderDialog = true
     } else {
       onRunPipeline()
@@ -146,15 +142,15 @@ fun WorkbenchScreen(
       text = {
         Text(
           "Local-Only Report Storage keeps your generated review dossier strictly on-device in Room SQLite (no Firestore upload), " +
-            "but AI appraisal still sends manuscript text to your selected remote AI provider:\n\n" +
+            "but AI appraisal still sends manuscript text and any attached replication code to your selected remote AI provider:\n\n" +
             "Active Provider: $activeAiProviderSummary\n\n" +
-            "Confirm that you are authorized to transmit this manuscript to $activeAiProviderSummary, or change your provider in Settings → AI Engine."
+            "This consent is cryptographically bound to the current manuscript content, code package, provider, and account session. Any edit will require fresh confirmation."
         )
       },
       confirmButton = {
         Button(
           onClick = {
-            remoteInferenceConfirmed = true
+            onConfirmRemoteInferenceConsent()
             showConfidentialProviderDialog = false
             onRunPipeline()
           },

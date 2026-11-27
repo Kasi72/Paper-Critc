@@ -83,6 +83,15 @@ sealed interface AiProviderRoute {
   data class UnavailableCustomProvider(val providerId: String, val reason: String) : AiProviderRoute
 }
 
+data class RemoteInferenceConsentRecord(
+  val manuscriptContentSha256: String,
+  val replicationCodeSha256: String,
+  val pdfBitmapCount: Int,
+  val providerFingerprint: String,
+  val ownerScope: String,
+  val sessionGeneration: Long
+)
+
 data class AppSettingsState(
   val themeMode: ThemeModePreference = ThemeModePreference.IOS_LIGHT,
   val compactDossierMode: Boolean = false,
@@ -156,6 +165,7 @@ data class RefereeChatUiState(
 )
 
 data class WorkbenchFormState(
+  val draftId: String = UUID.randomUUID().toString(),
   val inputModeIndex: Int = 0, // 0 = PDF/Word/Text File, 1 = Paste/Edit Text, 2 = Sample Papers
   val title: String = BenchmarkManuscriptCatalog.samples.first().title,
   val authors: String = BenchmarkManuscriptCatalog.samples.first().authors,
@@ -174,6 +184,9 @@ data class WorkbenchFormState(
   val importedFileBanner: String? = "Ready: Benchmark #1 — Yell at It (reviewer2)",
   val replicationCodeFileName: String? = null,
   val replicationCodeText: String = "",
+  val replicationCodeBoundDraftId: String? = null,
+  val userEditedMetadataFields: Set<String> = emptySet(),
+  val metadataNeedsReconfirmation: Boolean = false,
   val options: PipelineOptions = PipelineOptions()
 )
 
@@ -322,13 +335,15 @@ class PaperCriticViewModel(
                       !dirty.id.startsWith("sql_")
                     if (!isCloudDoc) continue
                     if (dirty.bookmarkDirty) {
+                      val ackRev = dirty.bookmarkRevision
                       if (repository.updateBookmark(dirty.id, dirty.bookmarked, expectedUserId = uid).isSuccess) {
-                        localRepository.clearBookmarkDirty(dirty.id, uid)
+                        localRepository.clearBookmarkDirtyIfRevisionMatches(dirty.id, uid, ackRev)
                       }
                     }
                     if (dirty.personalNotesDirty) {
+                      val ackRev = dirty.personalNotesRevision
                       if (repository.updatePersonalNotes(dirty.id, dirty.personalNotes, expectedUserId = uid).isSuccess) {
-                        localRepository.clearPersonalNotesDirty(dirty.id, uid)
+                        localRepository.clearPersonalNotesDirtyIfRevisionMatches(dirty.id, uid, ackRev)
                       }
                     }
                   }
@@ -390,19 +405,44 @@ class PaperCriticViewModel(
             // when a transient hydration failure occurs (NEVER mask CORRUPT cloud ledgers).
             val localCached = sqlById[cloudReview.id]
             if (localCached != null) {
-              val restoreIntactLocalLedger =
-                cloudReview.ledgerLoadState == LedgerLoadState.TEMPORARILY_UNAVAILABLE &&
-                  localCached.ledgerLoadState == LedgerLoadState.COMPLETE &&
-                  localCached.structuredFindingsJson.isNotBlank() &&
-                  (cloudReview.findingsChecksum.isBlank() ||
-                    localCached.findingsChecksum.isBlank() ||
-                    cloudReview.findingsChecksum == localCached.findingsChecksum)
+              val isTransientDegraded = cloudReview.ledgerLoadState == LedgerLoadState.TEMPORARILY_UNAVAILABLE
+              val localComplete = localCached.ledgerLoadState == LedgerLoadState.COMPLETE
+              val findingsNeedRestore = isTransientDegraded && cloudReview.findingsChunkCount > 0
+              val findingsChecksumOk = localCached.structuredFindingsJson.isNotBlank() &&
+                (cloudReview.findingsChecksum.isBlank() ||
+                  localCached.findingsChecksum.isBlank() ||
+                  cloudReview.findingsChecksum == localCached.findingsChecksum)
+              val restoreIntactLocalFindings = localComplete && findingsNeedRestore && findingsChecksumOk
+
+              val narrativesNeedRestore = isTransientDegraded && cloudReview.narrativeChunkCount > 0
+              val narrativeChecksumOk = cloudReview.narrativeChecksum.isBlank() ||
+                localCached.narrativeChecksum.isBlank() ||
+                cloudReview.narrativeChecksum == localCached.narrativeChecksum
+              val restoreIntactLocalNarratives = localComplete && narrativesNeedRestore && narrativeChecksumOk
+
+              val allDegradedRestored = isTransientDegraded &&
+                (restoreIntactLocalFindings || restoreIntactLocalNarratives) &&
+                (!findingsNeedRestore || restoreIntactLocalFindings) &&
+                (!narrativesNeedRestore || restoreIntactLocalNarratives)
+
               cloudReview.copy(
                 bookmarked = localCached.bookmarked,
                 personalNotes = localCached.personalNotes,
-                structuredFindingsJson = if (restoreIntactLocalLedger) localCached.structuredFindingsJson else cloudReview.structuredFindingsJson,
-                validationStatus = if (restoreIntactLocalLedger) localCached.validationStatus else cloudReview.validationStatus,
-                ledgerLoadState = if (restoreIntactLocalLedger) LedgerLoadState.COMPLETE else cloudReview.ledgerLoadState
+                structuredFindingsJson = if (restoreIntactLocalFindings) localCached.structuredFindingsJson else cloudReview.structuredFindingsJson,
+                abstractSummary = if (restoreIntactLocalNarratives) localCached.abstractSummary else cloudReview.abstractSummary,
+                researchQuestion = if (restoreIntactLocalNarratives) localCached.researchQuestion else cloudReview.researchQuestion,
+                keyMethodology = if (restoreIntactLocalNarratives) localCached.keyMethodology else cloudReview.keyMethodology,
+                coreContributions = if (restoreIntactLocalNarratives) localCached.coreContributions else cloudReview.coreContributions,
+                redTeamCritique = if (restoreIntactLocalNarratives) localCached.redTeamCritique else cloudReview.redTeamCritique,
+                blueTeamVerification = if (restoreIntactLocalNarratives) localCached.blueTeamVerification else cloudReview.blueTeamVerification,
+                mathAuditReport = if (restoreIntactLocalNarratives) localCached.mathAuditReport else cloudReview.mathAuditReport,
+                codeAuditReport = if (restoreIntactLocalNarratives) localCached.codeAuditReport else cloudReview.codeAuditReport,
+                editorNote = if (restoreIntactLocalNarratives) localCached.editorNote else cloudReview.editorNote,
+                copyeditSuggestions = if (restoreIntactLocalNarratives) localCached.copyeditSuggestions else cloudReview.copyeditSuggestions,
+                reviewerQuestions = if (restoreIntactLocalNarratives) localCached.reviewerQuestions else cloudReview.reviewerQuestions,
+                formattedDossier = if (restoreIntactLocalNarratives) localCached.formattedDossier else cloudReview.formattedDossier,
+                validationStatus = if (allDegradedRestored) localCached.validationStatus else cloudReview.validationStatus,
+                ledgerLoadState = if (allDegradedRestored) LedgerLoadState.COMPLETE else cloudReview.ledgerLoadState
               )
             } else {
               cloudReview
@@ -435,11 +475,57 @@ class PaperCriticViewModel(
   )
   val formState: StateFlow<WorkbenchFormState> = _formState.asStateFlow()
 
+  private val _remoteInferenceConsent = MutableStateFlow<RemoteInferenceConsentRecord?>(null)
+
+  val hasValidRemoteInferenceConsent: StateFlow<Boolean> = combine(
+    _remoteInferenceConsent,
+    _formState,
+    _settingsState,
+    apiProviders,
+    activeOwnerScope
+  ) { consent, form, settings, providers, scope ->
+    if (!settings.confidentialLocalOnly) {
+      true
+    } else {
+      val route = resolveAiProviderRoute(settings, providers)
+      val expected = computeRemoteConsentKey(
+        form = form,
+        providerRoute = route,
+        ownerScope = scope,
+        sessionGen = sessionGeneration.get()
+      )
+      consent != null && consent == expected
+    }
+  }.stateIn(viewModelScope, SharingStarted.Eagerly, false)
+
+  fun isRemoteInferenceConsentValidNow(): Boolean {
+    val settings = _settingsState.value
+    if (!settings.confidentialLocalOnly) return true
+    val route = resolveAiProviderRoute(settings, apiProviders.value)
+    val expected = computeRemoteConsentKey(
+      form = _formState.value,
+      providerRoute = route,
+      ownerScope = currentOwnerScope(),
+      sessionGen = sessionGeneration.get()
+    )
+    return _remoteInferenceConsent.value != null && _remoteInferenceConsent.value == expected
+  }
+
+  fun confirmRemoteInferenceForCurrentDraft() {
+    val route = resolveAiProviderRoute(_settingsState.value, apiProviders.value)
+    _remoteInferenceConsent.value = computeRemoteConsentKey(
+      form = _formState.value,
+      providerRoute = route,
+      ownerScope = currentOwnerScope(),
+      sessionGen = sessionGeneration.get()
+    )
+  }
+
   // Off-main-thread debounced deterministic pre-flight forensic & quantitative audit
   @OptIn(FlowPreview::class, ExperimentalCoroutinesApi::class)
   val preFlightReport: StateFlow<ForensicPreFlightReport> = _formState
     .map {
-      listOf(it.manuscriptText, it.options.isEmpirical, it.replicationCodeText, it.coverageReport)
+      listOf(it.manuscriptText, it.options.isEmpirical, resolveBoundReplicationCode(it), it.coverageReport)
     }
     .distinctUntilChanged()
     .debounce(260L)
@@ -607,6 +693,7 @@ class PaperCriticViewModel(
 
     _localReviews.value = emptyList()
     _selectedDossier.value = null
+    _remoteInferenceConsent.value = null
     _pipelineState.value = PipelineExecutionState.Idle
     _followUpState.value = FollowUpQaState.Idle
     _searchGroundingState.value = SearchGroundingUiState.Idle
@@ -760,16 +847,18 @@ class PaperCriticViewModel(
             !dirty.id.startsWith("sql_")
           if (!isCloudId) continue
           if (dirty.bookmarkDirty) {
+            val ackRev = dirty.bookmarkRevision
             val res = repository.updateBookmark(dirty.id, dirty.bookmarked, expectedUserId = uid)
             if (res.isSuccess) {
-              runSuspendCatching { localRepository.clearBookmarkDirty(dirty.id, uid) }
+              runSuspendCatching { localRepository.clearBookmarkDirtyIfRevisionMatches(dirty.id, uid, ackRev) }
               syncedAnnotationsCount++
             }
           }
           if (dirty.personalNotesDirty) {
+            val ackRev = dirty.personalNotesRevision
             val res = repository.updatePersonalNotes(dirty.id, dirty.personalNotes, expectedUserId = uid)
             if (res.isSuccess) {
-              runSuspendCatching { localRepository.clearPersonalNotesDirty(dirty.id, uid) }
+              runSuspendCatching { localRepository.clearPersonalNotesDirtyIfRevisionMatches(dirty.id, uid, ackRev) }
               syncedAnnotationsCount++
             }
           }
@@ -839,8 +928,10 @@ class PaperCriticViewModel(
           _statusBanner.value = "Sync error: ${e.localizedMessage ?: "Could not reach Firestore"}"
         }
       } finally {
-        _isSyncingPortfolio.value = false
-        activeSyncJob = null
+        if (activeSyncJob === coroutineContext[Job]) {
+          _isSyncingPortfolio.value = false
+          activeSyncJob = null
+        }
       }
     }
   }
@@ -854,43 +945,128 @@ class PaperCriticViewModel(
   }
 
   fun updateTitle(value: String) {
-    _formState.update { it.copy(title = value) }
+    _formState.update {
+      it.copy(
+        title = value,
+        userEditedMetadataFields = it.userEditedMetadataFields + "title",
+        metadataNeedsReconfirmation = false
+      )
+    }
   }
 
   fun updateAuthors(value: String) {
-    _formState.update { it.copy(authors = value) }
+    _formState.update {
+      it.copy(
+        authors = value,
+        userEditedMetadataFields = it.userEditedMetadataFields + "authors",
+        metadataNeedsReconfirmation = false
+      )
+    }
   }
 
   fun updateYear(value: String) {
-    _formState.update { it.copy(year = value) }
+    _formState.update {
+      it.copy(
+        year = value,
+        userEditedMetadataFields = it.userEditedMetadataFields + "year",
+        metadataNeedsReconfirmation = false
+      )
+    }
   }
 
   fun updateVenue(value: String) {
-    _formState.update { it.copy(venueOrCitation = value) }
+    _formState.update {
+      it.copy(
+        venueOrCitation = value,
+        userEditedMetadataFields = it.userEditedMetadataFields + "venue",
+        metadataNeedsReconfirmation = false
+      )
+    }
+  }
+
+  fun confirmRetainedMetadata() {
+    _formState.update { it.copy(metadataNeedsReconfirmation = false) }
   }
 
   fun updateManuscriptText(value: String) {
     val words = if (value.isBlank()) 0 else value.trim().split(Regex("""\s+""")).size
     _formState.update { current ->
       if (value == current.manuscriptText) return@update current
+      val prevLen = current.manuscriptText.length
+      val deltaLen = kotlin.math.abs(value.length - prevLen)
+      val contentDisjointReplacement = prevLen >= 60 && value.length >= 60 &&
+        computeWordOverlapRatio(current.manuscriptText, value) < 0.35
+      val isSubstantiveDocumentReplacement = current.importedFileName != null ||
+        value.isBlank() ||
+        (prevLen >= 80 && deltaLen > (prevLen * 0.40).toInt()) ||
+        contentDisjointReplacement
       val updatedCoverage = if (value.isBlank()) {
         DocumentCoverageReport.unknown("Manuscript editor is empty.")
       } else {
         DocumentCoverageReport.forDirectPastedText(value, engine = "Direct Text Editor")
       }
-      current.copy(
-        manuscriptText = value,
-        importedFormat = ManuscriptInputFormat.TEXT,
-        importedWordCount = words,
-        importedPageCount = (words / 350).coerceAtLeast(1),
-        pdfPageBitmaps = emptyList(),
-        coverageReport = updatedCoverage
-      )
+      if (isSubstantiveDocumentReplacement) {
+        val keepTitle = "title" in current.userEditedMetadataFields && value.isNotBlank()
+        val keepAuthors = "authors" in current.userEditedMetadataFields && value.isNotBlank()
+        val keepYear = "year" in current.userEditedMetadataFields && value.isNotBlank()
+        val keepVenue = "venue" in current.userEditedMetadataFields && value.isNotBlank()
+        val retainedAnyUserMetadata = keepTitle || keepAuthors || keepYear || keepVenue
+        current.copy(
+          draftId = UUID.randomUUID().toString(),
+          title = if (keepTitle) current.title else "",
+          authors = if (keepAuthors) current.authors else "",
+          year = if (keepYear) current.year else "",
+          venueOrCitation = if (keepVenue) current.venueOrCitation else "",
+          manuscriptText = value,
+          importedFileName = null,
+          importedFileBanner = null,
+          importedFormat = ManuscriptInputFormat.TEXT,
+          importedWordCount = words,
+          importedPageCount = (words / 350).coerceAtLeast(1),
+          pdfPageBitmaps = emptyList(),
+          replicationCodeFileName = null,
+          replicationCodeText = "",
+          replicationCodeBoundDraftId = null,
+          metadataNeedsReconfirmation = retainedAnyUserMetadata,
+          coverageReport = updatedCoverage
+        )
+      } else {
+        current.copy(
+          manuscriptText = value,
+          importedFormat = ManuscriptInputFormat.TEXT,
+          importedWordCount = words,
+          importedPageCount = (words / 350).coerceAtLeast(1),
+          pdfPageBitmaps = emptyList(),
+          coverageReport = updatedCoverage
+        )
+      }
     }
   }
 
+  private fun computeWordOverlapRatio(previousText: String, nextText: String): Double {
+    val wordRegex = Regex("""[a-z0-9]{3,}""")
+    val prevTokens = wordRegex.findAll(previousText.take(4000).lowercase(java.util.Locale.US))
+      .map { it.value }
+      .take(250)
+      .toSet()
+    val nextTokens = wordRegex.findAll(nextText.take(4000).lowercase(java.util.Locale.US))
+      .map { it.value }
+      .take(250)
+      .toSet()
+    if (prevTokens.size < 8 || nextTokens.size < 8) return 1.0
+    val intersection = prevTokens.count { it in nextTokens }
+    val union = prevTokens.size + nextTokens.size - intersection
+    return if (union <= 0) 1.0 else intersection.toDouble() / union.toDouble()
+  }
+
   fun updateReplicationCodeText(value: String) {
-    _formState.update { it.copy(replicationCodeText = value) }
+    _formState.update { current ->
+      current.copy(
+        replicationCodeText = value,
+        replicationCodeBoundDraftId = if (value.isBlank()) null else current.draftId,
+        replicationCodeFileName = if (value.isBlank()) null else current.replicationCodeFileName
+      )
+    }
   }
 
   fun updatePipelineOptions(transform: (PipelineOptions) -> PipelineOptions) {
@@ -911,8 +1087,10 @@ class PaperCriticViewModel(
 
   fun loadBenchmarkManuscript(sample: BenchmarkManuscript) {
     val words = sample.manuscriptText.trim().split(Regex("""\s+""")).size
+    _remoteInferenceConsent.value = null
     _formState.update {
       it.copy(
+        draftId = UUID.randomUUID().toString(),
         title = sample.title,
         authors = sample.authors,
         year = sample.year,
@@ -923,6 +1101,11 @@ class PaperCriticViewModel(
         importedWordCount = words,
         importedPageCount = 1,
         pdfPageBitmaps = emptyList(),
+        replicationCodeFileName = null,
+        replicationCodeText = "",
+        replicationCodeBoundDraftId = null,
+        userEditedMetadataFields = emptySet(),
+        metadataNeedsReconfirmation = false,
         coverageReport = DocumentCoverageReport.forCompleteText(
           text = sample.manuscriptText,
           engine = "Benchmark Sample Text"
@@ -935,8 +1118,10 @@ class PaperCriticViewModel(
   }
 
   fun clearManuscriptForm() {
+    _remoteInferenceConsent.value = null
     _formState.update {
       WorkbenchFormState(
+        draftId = UUID.randomUUID().toString(),
         inputModeIndex = it.inputModeIndex,
         title = "",
         authors = "",
@@ -949,6 +1134,11 @@ class PaperCriticViewModel(
         pdfPageBitmaps = emptyList(),
         coverageReport = null,
         importedFileBanner = null,
+        replicationCodeFileName = null,
+        replicationCodeText = "",
+        replicationCodeBoundDraftId = null,
+        userEditedMetadataFields = emptySet(),
+        metadataNeedsReconfirmation = false,
         options = _settingsState.value.defaultOptions
       )
     }
@@ -956,9 +1146,11 @@ class PaperCriticViewModel(
   }
 
   /**
-   * Session-bound commit helper for asynchronous manuscript extraction (P0-02):
-   * refuses to write extracted manuscript text or PDF bitmaps into [_formState] if the active
-   * account or session generation changed while extraction was running.
+   * Session-bound commit helper for asynchronous manuscript extraction:
+   * - Refuses to write if the active account or session generation changed mid-extraction.
+   * - Assigns a fresh [WorkbenchFormState.draftId] and ALWAYS clears any previously attached
+   *   replication code + prior manuscript's source-derived metadata so Paper B can NEVER inherit
+   *   Paper A's code or bibliographic identity.
    */
   internal fun applyExtractedManuscriptIfSessionValid(
     extracted: ExtractedManuscriptFile,
@@ -969,48 +1161,65 @@ class PaperCriticViewModel(
       Log.w(TAG, "Account switched during manuscript extraction; discarding extracted document to prevent cross-account leak.")
       return false
     }
-    val sampleAuthorsSet = BenchmarkManuscriptCatalog.samples.map { it.authors }.toSet()
-    val sampleVenuesSet = BenchmarkManuscriptCatalog.samples.map { it.venue }.toSet()
+    _remoteInferenceConsent.value = null
+    val hadAttachedCode = _formState.value.replicationCodeText.isNotBlank() ||
+      _formState.value.replicationCodeFileName != null
     _formState.update { current ->
-      val wasBenchmark = current.authors in sampleAuthorsSet ||
-        current.venueOrCitation in sampleVenuesSet ||
-        (current.importedFileBanner?.contains("Benchmark", ignoreCase = true) == true)
       current.copy(
-        title = extracted.inferredTitle.ifBlank { current.title },
-        authors = if (wasBenchmark) "" else current.authors,
-        year = if (wasBenchmark) "" else current.year,
-        venueOrCitation = if (wasBenchmark) "" else current.venueOrCitation,
+        draftId = UUID.randomUUID().toString(),
+        title = extracted.inferredTitle,
+        authors = "",
+        year = "",
+        venueOrCitation = "",
         manuscriptText = extracted.extractedText,
         importedFileName = extracted.fileName,
         importedFormat = extracted.format,
         importedWordCount = extracted.wordCount,
         importedPageCount = extracted.pageCount,
         pdfPageBitmaps = extracted.pdfPageBitmaps,
+        replicationCodeFileName = null,
+        replicationCodeText = "",
+        replicationCodeBoundDraftId = null,
+        userEditedMetadataFields = emptySet(),
+        metadataNeedsReconfirmation = false,
         coverageReport = extracted.coverageReport,
         importedFileBanner = extracted.summaryNotice
       )
     }
-    _statusBanner.value = extracted.summaryNotice
+    _statusBanner.value = if (hadAttachedCode) {
+      "${extracted.summaryNotice} Previous replication code attachment was cleared for the new manuscript."
+    } else {
+      extracted.summaryNotice
+    }
     return true
   }
 
   /**
-   * Session-bound commit helper for asynchronous replication-code extraction (P0-02).
+   * Session-bound commit helper for asynchronous replication-code extraction.
+   * Binds the attached code package explicitly to the current [WorkbenchFormState.draftId].
    */
   internal fun applyExtractedCodeIfSessionValid(
     fileName: String,
     codeText: String,
     initiatingOwnerScope: String,
-    initiatingSessionGen: Long
+    initiatingSessionGen: Long,
+    expectedDraftId: String? = null
   ): Boolean {
     if (!canCommitInferenceResult(initiatingOwnerScope, initiatingSessionGen, currentOwnerScope(), sessionGeneration.get())) {
       Log.w(TAG, "Account switched during replication-code extraction; discarding code package to prevent cross-account leak.")
       return false
     }
+    val currentDraftId = _formState.value.draftId
+    if (!expectedDraftId.isNullOrBlank() && expectedDraftId != currentDraftId) {
+      Log.w(TAG, "Manuscript changed during replication-code extraction; discarding code package to prevent cross-manuscript contamination.")
+      return false
+    }
+    _remoteInferenceConsent.value = null
     _formState.update {
       it.copy(
         replicationCodeFileName = fileName,
         replicationCodeText = codeText,
+        replicationCodeBoundDraftId = it.draftId,
         options = it.options.copy(enableCodeAudit = true)
       )
     }
@@ -1023,6 +1232,7 @@ class PaperCriticViewModel(
     val initiatingSessionGen = sessionGeneration.get()
     activeImportJob?.cancel()
     activeImportJob = viewModelScope.launch {
+      val currentJob = coroutineContext[Job]
       try {
         _statusBanner.value = "Extracting full document text & page coordinates..."
         val renderVision = _settingsState.value.enablePdfVisionPages
@@ -1036,7 +1246,9 @@ class PaperCriticViewModel(
           }
         }
       } finally {
-        activeImportJob = null
+        if (activeImportJob === currentJob) {
+          activeImportJob = null
+        }
       }
     }
   }
@@ -1048,8 +1260,10 @@ class PaperCriticViewModel(
     val inferredTitle = subject?.trim()?.takeIf { it.length in 4..180 }
       ?: cleaned.lineSequence().firstOrNull { it.trim().length in 10..160 }?.trim()
       ?: "Shared Academic Manuscript"
+    _remoteInferenceConsent.value = null
     _formState.update { current ->
       current.copy(
+        draftId = UUID.randomUUID().toString(),
         inputModeIndex = 1,
         title = inferredTitle,
         authors = "",
@@ -1063,6 +1277,9 @@ class PaperCriticViewModel(
         pdfPageBitmaps = emptyList(),
         replicationCodeFileName = null,
         replicationCodeText = "",
+        replicationCodeBoundDraftId = null,
+        userEditedMetadataFields = emptySet(),
+        metadataNeedsReconfirmation = false,
         coverageReport = DocumentCoverageReport.forDirectPastedText(
           text = cleaned,
           engine = "Shared Plain Text"
@@ -1077,13 +1294,15 @@ class PaperCriticViewModel(
   fun importReplicationCodeFromUri(context: Context, uri: Uri) {
     val initiatingOwnerScope = currentOwnerScope()
     val initiatingSessionGen = sessionGeneration.get()
+    val initiatingDraftId = _formState.value.draftId
     activeCodeImportJob?.cancel()
     activeCodeImportJob = viewModelScope.launch {
+      val currentJob = coroutineContext[Job]
       try {
         _statusBanner.value = "Extracting replication code package (Stage 00_prep_code)..."
         val result = ManuscriptExtractor.extractReplicationCodeFromUri(context, uri)
         result.onSuccess { (fileName, codeText) ->
-          applyExtractedCodeIfSessionValid(fileName, codeText, initiatingOwnerScope, initiatingSessionGen)
+          applyExtractedCodeIfSessionValid(fileName, codeText, initiatingOwnerScope, initiatingSessionGen, initiatingDraftId)
         }.onFailure { error ->
           if (canCommitInferenceResult(initiatingOwnerScope, initiatingSessionGen, currentOwnerScope(), sessionGeneration.get())) {
             Log.e(TAG, "Failed to extract replication code", error)
@@ -1091,7 +1310,9 @@ class PaperCriticViewModel(
           }
         }
       } finally {
-        activeCodeImportJob = null
+        if (activeCodeImportJob === currentJob) {
+          activeCodeImportJob = null
+        }
       }
     }
   }
@@ -1139,7 +1360,27 @@ class PaperCriticViewModel(
     val initiatingOwnerScope = normalizeOwnerScope(initiatingUid)
     val initiatingSessionGen = sessionGeneration.get()
 
+    // Finding 8: Enforce content-bound remote inference consent AT THE ANALYSIS BOUNDARY
+    if (settings.confidentialLocalOnly) {
+      val requiredConsent = computeRemoteConsentKey(
+        form = form,
+        providerRoute = providerRoute,
+        ownerScope = initiatingOwnerScope,
+        sessionGen = initiatingSessionGen
+      )
+      if (_remoteInferenceConsent.value != requiredConsent) {
+        val msg = "Remote AI inference consent is required for this exact manuscript content, code attachment, and provider under Local-Only Report Storage."
+        _pipelineState.value = PipelineExecutionState.Error(msg)
+        _statusBanner.value = msg
+        return
+      }
+    }
+
+    // Finding 6: Strictly enforce draft-bound replication code at the analysis boundary
+    val boundReplicationCode = resolveBoundReplicationCode(form)
+
     activePipelineJob = viewModelScope.launch {
+      val currentJob = coroutineContext[Job]
       _pipelineState.value = PipelineExecutionState.Running(
         stageCode = "00a",
         stageLabel = "Initializing Reviewer2 + PhD-Skills Pipeline...",
@@ -1154,7 +1395,7 @@ class PaperCriticViewModel(
           year = form.year,
           venueOrCitation = form.venueOrCitation.ifBlank { settings.defaultVenue },
           manuscriptText = form.manuscriptText,
-          replicationCodeText = form.replicationCodeText,
+          replicationCodeText = boundReplicationCode,
           pdfPageBitmaps = if (settings.enablePdfVisionPages) form.pdfPageBitmaps else emptyList(),
           coverageReport = form.coverageReport ?: if (form.manuscriptText.isNotBlank()) {
             DocumentCoverageReport.forDirectPastedText(
@@ -1244,7 +1485,9 @@ class PaperCriticViewModel(
           )
         }
       } finally {
-        activePipelineJob = null
+        if (activePipelineJob === currentJob) {
+          activePipelineJob = null
+        }
       }
     }
   }
@@ -1353,23 +1596,32 @@ class PaperCriticViewModel(
     _selectedDossier.update { current ->
       if (current?.id == review.id) current.copy(bookmarked = newBookmarked) else current
     }
+    val isLocalOnly = activeUid.isNullOrBlank() ||
+      review.id.startsWith("local_") ||
+      review.id.startsWith("sql_") ||
+      review.createdAt == null
     viewModelScope.launch {
-      runSuspendCatching {
+      // Persist locally FIRST and capture the exact monotonic bookmarkRevision before cloud upload
+      val persistedRevision = runSuspendCatching {
         localRepository.updateBookmark(review, bookmarked = newBookmarked, ownerScope = ownerScope)
+      }.getOrElse { return@launch }
+
+      if (isLocalOnly) {
+        if (canCommitInferenceResult(ownerScope, initiatingSession, currentOwnerScope(), sessionGeneration.get())) {
+          _statusBanner.value = if (newBookmarked) "Starred in offline Room cache." else "Removed star from offline Room cache."
+        }
+        return@launch
       }
-    }
-    if (activeUid.isNullOrBlank() || review.id.startsWith("local_") || review.id.startsWith("sql_") || review.createdAt == null) {
-      _statusBanner.value = if (newBookmarked) "Starred in offline Room cache." else "Removed star from offline Room cache."
-      return
-    }
-    viewModelScope.launch {
-      // Field-level partial update with strict account-ownership guard (P1-03 + P1-06)
+
+      // Field-level partial update with strict account-ownership guard & revision-checked ack
       val result = repository.updateBookmark(review.id, newBookmarked, expectedUserId = activeUid)
       if (!canCommitInferenceResult(ownerScope, initiatingSession, currentOwnerScope(), sessionGeneration.get())) {
         return@launch
       }
       result.onSuccess {
-        runSuspendCatching { localRepository.clearBookmarkDirty(review.id, ownerScope) }
+        runSuspendCatching {
+          localRepository.clearBookmarkDirtyIfRevisionMatches(review.id, ownerScope, persistedRevision)
+        }
         _statusBanner.value = if (newBookmarked) "Added to starred dossiers." else "Removed from starred dossiers."
       }.onFailure {
         _statusBanner.value = if (newBookmarked) {
@@ -1391,23 +1643,32 @@ class PaperCriticViewModel(
     _selectedDossier.update { current ->
       if (current?.id == review.id) current.copy(personalNotes = notes) else current
     }
+    val isLocalOnly = activeUid.isNullOrBlank() ||
+      review.id.startsWith("local_") ||
+      review.id.startsWith("sql_") ||
+      review.createdAt == null
     viewModelScope.launch {
-      runSuspendCatching {
+      // Persist locally FIRST and capture the exact monotonic personalNotesRevision before cloud upload
+      val persistedRevision = runSuspendCatching {
         localRepository.updatePersonalNotes(review, personalNotes = notes, ownerScope = ownerScope)
+      }.getOrElse { return@launch }
+
+      if (isLocalOnly) {
+        if (canCommitInferenceResult(ownerScope, initiatingSession, currentOwnerScope(), sessionGeneration.get())) {
+          _statusBanner.value = "Notes saved to Room offline dossier."
+        }
+        return@launch
       }
-    }
-    if (activeUid.isNullOrBlank() || review.id.startsWith("local_") || review.id.startsWith("sql_") || review.createdAt == null) {
-      _statusBanner.value = "Notes saved to Room offline dossier."
-      return
-    }
-    viewModelScope.launch {
-      // Field-level partial update with strict account-ownership guard (P1-03 + P1-06)
+
+      // Field-level partial update with strict account-ownership guard & revision-checked ack
       val result = repository.updatePersonalNotes(review.id, notes, expectedUserId = activeUid)
       if (!canCommitInferenceResult(ownerScope, initiatingSession, currentOwnerScope(), sessionGeneration.get())) {
         return@launch
       }
       result.onSuccess {
-        runSuspendCatching { localRepository.clearPersonalNotesDirty(review.id, ownerScope) }
+        runSuspendCatching {
+          localRepository.clearPersonalNotesDirtyIfRevisionMatches(review.id, ownerScope, persistedRevision)
+        }
         _statusBanner.value = "Referee notes saved to Room & Cloud Library."
       }.onFailure {
         _statusBanner.value = "Notes saved offline to Room cache (cloud sync pending)."
@@ -1474,6 +1735,7 @@ class PaperCriticViewModel(
     val initiatingOwnerScope = currentOwnerScope()
     val initiatingSessionGen = sessionGeneration.get()
     activeSearchGroundingJob = viewModelScope.launch {
+      val currentJob = coroutineContext[Job]
       _searchGroundingState.value = SearchGroundingUiState.Loading
       try {
         val claimsBlock = buildString {
@@ -1494,7 +1756,7 @@ class PaperCriticViewModel(
           return@launch
         }
         _searchGroundingState.value = SearchGroundingUiState.Success(result)
-        // P1-03: Field-level update so concurrent offline note/bookmark edits are NEVER overwritten
+        // Field-level update so concurrent offline note/bookmark edits are NEVER overwritten
         runSuspendCatching {
           localRepository.updateSearchGroundingReport(
             review = review,
@@ -1525,7 +1787,9 @@ class PaperCriticViewModel(
           )
         }
       } finally {
-        activeSearchGroundingJob = null
+        if (activeSearchGroundingJob === currentJob) {
+          activeSearchGroundingJob = null
+        }
       }
     }
   }
@@ -1575,6 +1839,7 @@ class PaperCriticViewModel(
     val initiatingSessionGen = sessionGeneration.get()
 
     activeChatJob = viewModelScope.launch {
+      val currentJob = coroutineContext[Job]
       // 1. Persist user message to SQLite under initiatingOwnerScope
       runSuspendCatching {
         localRepository.insertChatMessage(
@@ -1678,7 +1943,9 @@ class PaperCriticViewModel(
           }
         }
       } catch (e: CancellationException) {
-        if (canCommitInferenceResult(initiatingOwnerScope, initiatingSessionGen, currentOwnerScope(), sessionGeneration.get())) {
+        if (canCommitInferenceResult(initiatingOwnerScope, initiatingSessionGen, currentOwnerScope(), sessionGeneration.get()) &&
+          activeChatJob === currentJob
+        ) {
           _chatConfigState.update {
             it.copy(
               isStreaming = false,
@@ -1700,7 +1967,9 @@ class PaperCriticViewModel(
           }
         }
       } finally {
-        activeChatJob = null
+        if (activeChatJob === currentJob) {
+          activeChatJob = null
+        }
       }
     }
   }
@@ -1926,6 +2195,40 @@ class PaperCriticViewModel(
       if (confidentialLocalOnly) return false
       if (isAutomatic && !autoSaveToCloud) return false
       return true
+    }
+
+    internal fun resolveBoundReplicationCode(form: WorkbenchFormState): String =
+      if (form.replicationCodeText.isNotBlank() && form.replicationCodeBoundDraftId == form.draftId) {
+        form.replicationCodeText
+      } else {
+        ""
+      }
+
+    private fun sha256Hex(text: String): String {
+      val digest = java.security.MessageDigest.getInstance("SHA-256")
+      return digest.digest(text.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
+    }
+
+    internal fun computeRemoteConsentKey(
+      form: WorkbenchFormState,
+      providerRoute: AiProviderRoute,
+      ownerScope: String,
+      sessionGen: Long
+    ): RemoteInferenceConsentRecord {
+      val providerFingerprint = when (providerRoute) {
+        is AiProviderRoute.BuiltInKeyless -> "firebase_ai_logic_keyless"
+        is AiProviderRoute.CustomProvider ->
+          "custom:${providerRoute.provider.id}:${providerRoute.provider.baseUrl.trim()}:${providerRoute.provider.modelId.trim()}"
+        is AiProviderRoute.UnavailableCustomProvider -> "unavailable:${providerRoute.providerId}"
+      }
+      return RemoteInferenceConsentRecord(
+        manuscriptContentSha256 = sha256Hex(form.manuscriptText),
+        replicationCodeSha256 = sha256Hex(resolveBoundReplicationCode(form)),
+        pdfBitmapCount = form.pdfPageBitmaps.size,
+        providerFingerprint = providerFingerprint,
+        ownerScope = normalizeOwnerScope(ownerScope),
+        sessionGeneration = sessionGen
+      )
     }
 
     private fun scopedPrefKey(ownerScope: String, baseKey: String): String =

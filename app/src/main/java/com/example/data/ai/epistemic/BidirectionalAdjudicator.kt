@@ -96,12 +96,28 @@ object BidirectionalAdjudicator {
       overturnHint = "Validation cohort table, calibration curve, or grouped CV pipeline specification."
     ),
     DefenseRule(
-      allegationMatcher = Regex("""(no|omitted|lacked|missing|without).{0,60}(competing\s+risk|fine[- ]gray|schoenfeld|proportional\s+hazards)""", RegexOption.IGNORE_CASE),
+      allegationMatcher = Regex("""(no|omitted|lacked|missing|without|did\s+not\s+(?:test|check|evaluate|assess|perform|conduct|report)).{0,60}(competing\s+risk|fine[- ]gray|schoenfeld|proportional\s+hazards)""", RegexOption.IGNORE_CASE),
       defenseEvidenceMatcher = Regex("""(fine[- ]gray|aalen[- ]johansen|subdistribution\s+hazard|schoenfeld\s+residual|proportional\s+hazards\s+assumption\s+(?:was\s+)?(?:tested|verified|met))""", RegexOption.IGNORE_CASE),
       defenseLabel = "Manuscript explicitly evaluates proportional hazards or competing risks.",
       dismissesCompletely = true,
       isStudyWideProperty = false,
       overturnHint = "Schoenfeld residual p-values or Fine-Gray / Aalen-Johansen cumulative incidence results."
+    ),
+    DefenseRule(
+      allegationMatcher = Regex("""(unadjusted\s+(?:observational\s+)?analysis|(?:failed\s+to|did\s+not)\s+adjust\s+for\s+confound|(?:no|omitted|lacked|missing|without).{0,50}(?:confound(?:er|ing)?\s+adjustment|multivariable\s+adjustment|covariate\s+adjustment|propensity\s+score))""", RegexOption.IGNORE_CASE),
+      defenseEvidenceMatcher = Regex("""(multivariable\s+(?:cox|logistic|linear|poisson|mixed)?\s*regression\s+adjusted|adjusted\s+for\s+(?:age|sex|baseline|confound)|propensity\s+score\s+(?:matching|weighting|stratification)|inverse\s+probability\s+(?:of\s+treatment\s+)?weighting)""", RegexOption.IGNORE_CASE),
+      defenseLabel = "Manuscript documents multivariable confounding adjustment or propensity weighting.",
+      dismissesCompletely = true,
+      isStudyWideProperty = false,
+      overturnHint = "Methods section detailing multivariable covariate adjustment or propensity score weighting."
+    ),
+    DefenseRule(
+      allegationMatcher = Regex("""(unblinded\s+(?:reference\s+standard|outcome\s+adjudication|assessor)|(?:no|omitted|lacked|missing|without|did\s+not\s+use).{0,40}(?:blind(?:ed|ing)?|mask(?:ed|ing)?)\s+(?:reference\s+standard|outcome\s+adjudication|assessor))""", RegexOption.IGNORE_CASE),
+      defenseEvidenceMatcher = Regex("""(blinded\s+(?:reference\s+standard|outcome\s+adjudication|assessor)|masked\s+(?:reference\s+standard|outcome\s+adjudication|assessor)|double[- ]blind(?:ed)?\s+outcome\s+adjudication)""", RegexOption.IGNORE_CASE),
+      defenseLabel = "Manuscript documents blinded reference standard or masked outcome adjudication.",
+      dismissesCompletely = true,
+      isStudyWideProperty = false,
+      overturnHint = "Methods description confirming blinded reference standard or masked adjudication."
     ),
     // Soft rescue: alleged missing justification/method when manuscript defers to Supplementary Appendix -> DOWNGRADE to NOT_ASSESSABLE rather than FATAL
     DefenseRule(
@@ -299,7 +315,8 @@ object BidirectionalAdjudicator {
     ) {
       return DefenseScopeAlignment.CONFLICTING_SCOPE
     }
-    if (findingKey.adjustmentStatus != AdjustmentStatus.UNSPECIFIED &&
+    if (!rule.defenseLabel.contains("confounding", ignoreCase = true) &&
+      findingKey.adjustmentStatus != AdjustmentStatus.UNSPECIFIED &&
       defenseKey.adjustmentStatus != AdjustmentStatus.UNSPECIFIED &&
       findingKey.adjustmentStatus != defenseKey.adjustmentStatus
     ) {

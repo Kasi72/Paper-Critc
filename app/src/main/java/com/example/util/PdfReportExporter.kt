@@ -62,8 +62,166 @@ enum class PdfExportScope(
 }
 
 /**
- * P0.3 Raw-Markup PDF Gate diagnostics returned by [PdfReportExporter.inspectRenderedText]
- * and [PdfReportExporter.renderAndInspectPdf].
+ * Finding 14 (P2): Recorded bounding box for a rendered PDF layout block.
+ */
+data class PdfLayoutBlockBounds(
+  val pageNumber: Int,
+  val kind: String,
+  val left: Float,
+  val top: Float,
+  val right: Float,
+  val bottom: Float
+)
+
+/**
+ * Finding 14 (P2): Geometry-aware PDF layout verification summary checking margin containment,
+ * header/footer safe-zone collisions, sequential vertical block overlaps, and table cell overflow.
+ */
+data class PdfGeometryVerificationReport(
+  val totalBlocksChecked: Int = 0,
+  val overlapDetected: Boolean = false,
+  val outOfBoundsDetected: Boolean = false,
+  val headerFooterCollisionDetected: Boolean = false,
+  val tableCellOverflowDetected: Boolean = false,
+  val issues: List<String> = emptyList()
+) {
+  val isGeometryClean: Boolean
+    get() = !overlapDetected &&
+      !outOfBoundsDetected &&
+      !headerFooterCollisionDetected &&
+      !tableCellOverflowDetected &&
+      issues.isEmpty()
+}
+
+/**
+ * Finding 14 (P2): Records rendered PDF geometry during canvas layout and runs deterministic
+ * bounding-box verification across all pages.
+ */
+class PdfLayoutGeometryRecorder {
+  private val bodyBlocks = mutableListOf<PdfLayoutBlockBounds>()
+  private val headerBottomByPage = mutableMapOf<Int, Float>()
+  private val footerTopByPage = mutableMapOf<Int, Float>()
+  private var cellOverflowCount = 0
+  private val recordedCellIssues = mutableListOf<String>()
+
+  fun recordHeaderBand(pageNumber: Int, bottomY: Float) {
+    val prev = headerBottomByPage[pageNumber]
+    headerBottomByPage[pageNumber] = if (prev == null) bottomY else maxOf(prev, bottomY)
+  }
+
+  fun recordFooterBand(pageNumber: Int, topY: Float) {
+    val prev = footerTopByPage[pageNumber]
+    footerTopByPage[pageNumber] = if (prev == null) topY else minOf(prev, topY)
+  }
+
+  fun recordBodyBlock(
+    pageNumber: Int,
+    kind: String,
+    left: Float,
+    top: Float,
+    right: Float,
+    bottom: Float
+  ) {
+    if (bottom <= top || right <= left) return
+    bodyBlocks.add(PdfLayoutBlockBounds(pageNumber, kind, left, top, right, bottom))
+  }
+
+  fun recordTableCell(
+    pageNumber: Int,
+    rowTop: Float,
+    rowBottom: Float,
+    cellLeft: Float,
+    cellRight: Float,
+    measuredTextHeight: Float,
+    padV: Float,
+    maxPageRight: Float
+  ) {
+    val rowHeight = rowBottom - rowTop
+    if (measuredTextHeight + padV * 2f > rowHeight + 2.0f) {
+      cellOverflowCount++
+      if (recordedCellIssues.size < 8) {
+        recordedCellIssues.add(
+          "Page $pageNumber table cell vertical overflow (needed=${"%.1f".format(Locale.US, measuredTextHeight + padV * 2f)}pt > row=${"%.1f".format(Locale.US, rowHeight)}pt)"
+        )
+      }
+    }
+    if (cellRight > maxPageRight + 1.5f) {
+      cellOverflowCount++
+      if (recordedCellIssues.size < 8) {
+        recordedCellIssues.add(
+          "Page $pageNumber table cell horizontal overflow (right=${"%.1f".format(Locale.US, cellRight)}pt > limit=${"%.1f".format(Locale.US, maxPageRight)}pt)"
+        )
+      }
+    }
+  }
+
+  fun verify(
+    pageWidth: Float = 595f,
+    pageHeight: Float = 842f,
+    marginH: Float = 40f,
+    marginBottom: Float = 46f
+  ): PdfGeometryVerificationReport {
+    val issues = mutableListOf<String>()
+    issues.addAll(recordedCellIssues)
+    var overlap = false
+    var outOfBounds = false
+    var headerFooterCollision = false
+
+    val minLeft = marginH - 1.5f
+    val maxRight = pageWidth - marginH + 1.5f
+    val maxBodyBottom = pageHeight - marginBottom + 2.0f
+
+    bodyBlocks.groupBy { it.pageNumber }.forEach { (pg, blocks) ->
+      val headerBottom = headerBottomByPage[pg] ?: if (pg >= 2) 33f else 0f
+      val footerTop = footerTopByPage[pg] ?: (pageHeight - 34f)
+
+      blocks.forEachIndexed { idx, b ->
+        if (b.left < minLeft || b.right > maxRight || b.top < 0f || b.bottom > maxBodyBottom) {
+          outOfBounds = true
+          if (issues.size < 12) {
+            issues.add(
+              "Page $pg out-of-bounds ${b.kind} [${"%.1f".format(Locale.US, b.left)}, ${"%.1f".format(Locale.US, b.top)}, ${"%.1f".format(Locale.US, b.right)}, ${"%.1f".format(Locale.US, b.bottom)}]"
+            )
+          }
+        }
+        if ((headerBottom > 0f && b.top < headerBottom - 0.5f) || b.bottom > footerTop + 0.5f) {
+          headerFooterCollision = true
+          if (issues.size < 12) {
+            issues.add(
+              "Page $pg header/footer collision on ${b.kind} (top=${"%.1f".format(Locale.US, b.top)}, bottom=${"%.1f".format(Locale.US, b.bottom)})"
+            )
+          }
+        }
+        if (idx > 0) {
+          val prev = blocks[idx - 1]
+          val horizontalOverlap = minOf(prev.right, b.right) - maxOf(prev.left, b.left) > 1.0f
+          val verticalOverlap = prev.bottom - b.top > 1.5f
+          if (horizontalOverlap && verticalOverlap) {
+            overlap = true
+            if (issues.size < 12) {
+              issues.add(
+                "Page $pg vertical overlap between ${prev.kind} (bottom=${"%.1f".format(Locale.US, prev.bottom)}) and ${b.kind} (top=${"%.1f".format(Locale.US, b.top)})"
+              )
+            }
+          }
+        }
+      }
+    }
+
+    return PdfGeometryVerificationReport(
+      totalBlocksChecked = bodyBlocks.size,
+      overlapDetected = overlap,
+      outOfBoundsDetected = outOfBounds,
+      headerFooterCollisionDetected = headerFooterCollision,
+      tableCellOverflowDetected = cellOverflowCount > 0,
+      issues = issues
+    )
+  }
+}
+
+/**
+ * P0.3 Raw-Markup & Finding 14 Geometry-Aware PDF Gate diagnostics returned by
+ * [PdfReportExporter.inspectRenderedText] and [PdfReportExporter.renderAndInspectPdf].
  */
 data class PdfRenderDiagnostics(
   val rawHeaderCount: Int,
@@ -73,14 +231,28 @@ data class PdfRenderDiagnostics(
   val extractedFromPdfBytes: Boolean = false,
   val pageCount: Int = 1,
   val pdfByteIntegrityFailed: Boolean = false,
-  val verificationFailureReason: String? = null
+  val verificationFailureReason: String? = null,
+  val overlapDetected: Boolean = false,
+  val outOfBoundsDetected: Boolean = false,
+  val headerFooterCollisionDetected: Boolean = false,
+  val tableCellOverflowDetected: Boolean = false,
+  val geometryIssues: List<String> = emptyList(),
+  val geometryBlocksChecked: Int = 0
 ) {
+  val geometryClean: Boolean
+    get() = !overlapDetected &&
+      !outOfBoundsDetected &&
+      !headerFooterCollisionDetected &&
+      !tableCellOverflowDetected &&
+      geometryIssues.isEmpty()
+
   val isClean: Boolean
     get() = rawHeaderCount == 0 &&
       rawMarkdownRowCount == 0 &&
       internalEnumCount == 0 &&
       !clippedContentDetected &&
-      !pdfByteIntegrityFailed
+      !pdfByteIntegrityFailed &&
+      geometryClean
 }
 
 /**
@@ -137,15 +309,22 @@ object PdfReportExporter {
     return runCatching {
       PDDocument.load(ByteArrayInputStream(pdfBytes)).use { doc ->
         val pages = doc.numberOfPages
+        if (pages <= 0) return@use null
+        // Finding 14: verify every page has valid non-zero A4/mediaBox dimensions
+        val validBoxes = (0 until pages).all { idx ->
+          val box = doc.getPage(idx)?.mediaBox
+          box != null && box.width > 100f && box.height > 100f
+        }
+        if (!validBoxes) return@use null
         val text = PDFTextStripper().getText(doc).orEmpty()
-        if (pages > 0 && text.isNotBlank()) text to pages else null
+        if (text.isNotBlank()) text to pages else null
       }
     }.getOrNull()
   }
 
   /**
    * Renders [review] to PDF bytes and returns both the rendered PDF payload, the captured/extracted
-   * rendered text stream, and the P0.3 [PdfRenderDiagnostics] verification result.
+   * rendered text stream, and the P0.3 + Finding 14 [PdfRenderDiagnostics] verification result.
    */
   data class RenderedPdfResult(
     val pdfBytes: ByteArray,
@@ -153,8 +332,24 @@ object PdfReportExporter {
     val diagnostics: PdfRenderDiagnostics
   )
 
+  private fun PdfRenderDiagnostics.withGeometry(geometry: PdfGeometryVerificationReport?): PdfRenderDiagnostics {
+    if (geometry == null) return this
+    val geomFailure = if (!geometry.isGeometryClean) {
+      "PDF layout geometry violation: ${geometry.issues.firstOrNull() ?: "overlap or out-of-bounds content"}"
+    } else null
+    return copy(
+      overlapDetected = geometry.overlapDetected,
+      outOfBoundsDetected = geometry.outOfBoundsDetected,
+      headerFooterCollisionDetected = geometry.headerFooterCollisionDetected,
+      tableCellOverflowDetected = geometry.tableCellOverflowDetected,
+      geometryIssues = geometry.issues,
+      geometryBlocksChecked = geometry.totalBlocksChecked,
+      verificationFailureReason = verificationFailureReason ?: geomFailure
+    )
+  }
+
   /**
-   * Validates actual exported PDF bytes via PDFBox.
+   * Validates actual exported PDF bytes via PDFBox and attaches optional geometry diagnostics.
    * - If [pdfBytes] are corrupted / unreadable / non-PDF when [requireByteExtraction] is true
    *   (or whenever non-empty bytes fail PDFBox parsing), sets [PdfRenderDiagnostics.pdfByteIntegrityFailed] = true
    *   so [PdfRenderDiagnostics.isClean] is GUARANTEED to be false and sharing/saving is blocked!
@@ -164,7 +359,8 @@ object PdfReportExporter {
     fallbackText: String = "",
     clippedContentDetected: Boolean = false,
     fallbackPageCount: Int = 1,
-    requireByteExtraction: Boolean = true
+    requireByteExtraction: Boolean = true,
+    geometryReport: PdfGeometryVerificationReport? = null
   ): PdfRenderDiagnostics {
     val pdfBoxExtracted = extractTextFromPdfBytes(pdfBytes)
     if (pdfBoxExtracted != null) {
@@ -174,10 +370,11 @@ object PdfReportExporter {
         clippedContentDetected = clippedContentDetected,
         extractedFromPdfBytes = true,
         pageCount = pages
-      )
+      ).withGeometry(geometryReport)
       return base.copy(
         pdfByteIntegrityFailed = false,
-        verificationFailureReason = if (base.isClean) null else "Exported PDF contains raw markup or clipped layout."
+        verificationFailureReason = base.verificationFailureReason
+          ?: if (base.isClean) null else "Exported PDF contains raw markup, clipped content, or layout geometry issues."
       )
     }
     // Whenever byte extraction is required (all production exports & integrity checks),
@@ -193,7 +390,7 @@ object PdfReportExporter {
         clippedContentDetected = clippedContentDetected,
         extractedFromPdfBytes = false,
         pageCount = fallbackPageCount.coerceAtLeast(1)
-      )
+      ).withGeometry(geometryReport)
       return base.copy(
         pdfByteIntegrityFailed = true,
         verificationFailureReason = reason
@@ -205,7 +402,7 @@ object PdfReportExporter {
       clippedContentDetected = clippedContentDetected,
       extractedFromPdfBytes = false,
       pageCount = fallbackPageCount.coerceAtLeast(1)
-    )
+    ).withGeometry(geometryReport)
   }
 
   fun renderAndInspectPdf(
@@ -218,6 +415,7 @@ object PdfReportExporter {
     val textSink = StringBuilder()
     val clipTracker = BooleanArray(1) { false }
     val pageCountTracker = IntArray(1) { 1 }
+    val geometryRecorder = PdfLayoutGeometryRecorder()
     renderReviewToPdfStream(
       review = review,
       outputStream = baos,
@@ -225,15 +423,23 @@ object PdfReportExporter {
       precomputedQuantBlocks = precomputedQuantBlocks,
       renderedTextSink = textSink,
       clippedContentTracker = clipTracker,
-      pageCountTracker = pageCountTracker
+      pageCountTracker = pageCountTracker,
+      geometryRecorder = geometryRecorder
     )
     val bytes = baos.toByteArray()
+    val geometryReport = geometryRecorder.verify(
+      pageWidth = PAGE_WIDTH.toFloat(),
+      pageHeight = PAGE_HEIGHT.toFloat(),
+      marginH = MARGIN_H,
+      marginBottom = MARGIN_BOTTOM
+    )
     val diag = validateExportedPdfBytes(
       pdfBytes = bytes,
       fallbackText = textSink.toString(),
       clippedContentDetected = clipTracker[0],
       fallbackPageCount = pageCountTracker[0].coerceAtLeast(1),
-      requireByteExtraction = requireByteExtraction
+      requireByteExtraction = requireByteExtraction,
+      geometryReport = geometryReport
     )
     val inspectedText = extractTextFromPdfBytes(bytes)?.first ?: textSink.toString()
     return RenderedPdfResult(
@@ -427,7 +633,8 @@ object PdfReportExporter {
     precomputedQuantBlocks: List<ReportBlock>? = null,
     renderedTextSink: StringBuilder? = null,
     clippedContentTracker: BooleanArray? = null,
-    pageCountTracker: IntArray? = null
+    pageCountTracker: IntArray? = null,
+    geometryRecorder: PdfLayoutGeometryRecorder? = null
   ) {
     val document = PdfDocument()
     try {
@@ -620,11 +827,13 @@ object PdfReportExporter {
       val vw = headerFooterPaint.measureText(verdictTag)
       targetCanvas.drawText(verdictTag, PAGE_WIDTH - MARGIN_H - vw, headerY, headerFooterPaint)
       targetCanvas.drawLine(MARGIN_H, headerY + 7f, PAGE_WIDTH - MARGIN_H, headerY + 7f, dividerPaint)
+      geometryRecorder?.recordHeaderBand(pageNumber, headerY + 7f)
     }
 
     fun drawFooter(targetCanvas: Canvas, pgNum: Int) {
       val footerY = PAGE_HEIGHT - 22f
       targetCanvas.drawLine(MARGIN_H, footerY - 12f, PAGE_WIDTH - MARGIN_H, footerY - 12f, dividerPaint)
+      geometryRecorder?.recordFooterBand(pgNum, footerY - 12f)
       targetCanvas.drawText(
         "Paper Critic Critical Appraisal Engine  •  ${reviewMode.shortLabel}  •  $dateStr",
         MARGIN_H,
@@ -707,6 +916,9 @@ object PdfReportExporter {
         }
       }
 
+      var slicePage = pageNumber
+      var sliceTop = cursorY
+      var sliceBottom = cursorY
       var lineIdx = 0
       while (lineIdx < lineCount) {
         val lineTop = layout.getLineTop(lineIdx)
@@ -715,15 +927,21 @@ object PdfReportExporter {
 
         // Widow protection: if 2 lines remain and only 1 fits on current page, push both to next page
         val remainingLines = lineCount - lineIdx
-        if (remainingLines == 2 && lineIdx > 0) {
+        val needsNewPage = if (remainingLines == 2 && lineIdx > 0) {
           val twoLinesH = (layout.getLineBottom(lineIdx + 1) - lineTop).toFloat()
-          if (cursorY + lineHeight <= PAGE_HEIGHT - MARGIN_BOTTOM &&
+          cursorY + lineHeight <= PAGE_HEIGHT - MARGIN_BOTTOM &&
             cursorY + twoLinesH > PAGE_HEIGHT - MARGIN_BOTTOM
-          ) {
-            startNewPage()
+        } else {
+          cursorY + lineHeight > PAGE_HEIGHT - MARGIN_BOTTOM
+        }
+        if (needsNewPage) {
+          if (sliceBottom > sliceTop) {
+            geometryRecorder?.recordBodyBlock(slicePage, "paragraph", leftX, sliceTop, leftX + width, sliceBottom)
           }
-        } else if (cursorY + lineHeight > PAGE_HEIGHT - MARGIN_BOTTOM) {
           startNewPage()
+          slicePage = pageNumber
+          sliceTop = cursorY
+          sliceBottom = cursorY
         }
 
         val lineStart = layout.getLineStart(lineIdx)
@@ -735,7 +953,11 @@ object PdfReportExporter {
         }
         canvas.drawText(lineStr, leftX, cursorY + baselineOffset, paint)
         cursorY += lineHeight
+        sliceBottom = cursorY
         lineIdx++
+      }
+      if (sliceBottom > sliceTop) {
+        geometryRecorder?.recordBodyBlock(slicePage, "paragraph", leftX, sliceTop, leftX + width, sliceBottom)
       }
     }
 
@@ -805,6 +1027,7 @@ object PdfReportExporter {
         bodyLayout.draw(canvas)
         canvas.restore()
 
+        geometryRecorder?.recordBodyBlock(pageNumber, "boxed_card", MARGIN_H, boxTop, PAGE_WIDTH - MARGIN_H, boxTop + totalHeight)
         cursorY = boxTop + totalHeight + 6f
       } else {
         ensureSpace(48f)
@@ -1000,6 +1223,7 @@ object PdfReportExporter {
           canvas.restore()
         }
 
+        geometryRecorder?.recordBodyBlock(pageNumber, "finding_card", MARGIN_H, top, PAGE_WIDTH - MARGIN_H, top + totalH)
         cursorY = top + totalH + 6.5f
       } else {
         drawBoxedCard(
@@ -1042,7 +1266,9 @@ object PdfReportExporter {
             canvas.translate(xOffset, cursorY + 1f)
             titleLayout.draw(canvas)
             canvas.restore()
-            cursorY += maxOf(16f, titleLayout.height.toFloat() + 3f) + 3f
+            val subBottom = cursorY + maxOf(16f, titleLayout.height.toFloat() + 3f)
+            geometryRecorder?.recordBodyBlock(pageNumber, "subheader", MARGIN_H, cursorY, PAGE_WIDTH - MARGIN_H, subBottom)
+            cursorY = subBottom + 3f
           }
 
           is ReportBlock.SeverityCard -> {
@@ -1091,6 +1317,7 @@ object PdfReportExporter {
             canvas.translate(MARGIN_H + 9f, cursorY + 6f)
             eqLayout.draw(canvas)
             canvas.restore()
+            geometryRecorder?.recordBodyBlock(pageNumber, "equation", MARGIN_H, cursorY, PAGE_WIDTH - MARGIN_H, cursorY + boxH)
             cursorY += boxH + 5f
           }
 
@@ -1150,6 +1377,7 @@ object PdfReportExporter {
                 canvas.restore()
                 x += colWidths[c]
               }
+              geometryRecorder?.recordBodyBlock(pageNumber, "table_header", MARGIN_H, top, PAGE_WIDTH - MARGIN_H, top + headerH)
               cursorY = top + headerH
             }
 
@@ -1233,8 +1461,19 @@ object PdfReportExporter {
                     cellLayouts[c].draw(canvas)
                     canvas.restore()
                   }
+                  geometryRecorder?.recordTableCell(
+                    pageNumber = pageNumber,
+                    rowTop = top,
+                    rowBottom = top + rowH,
+                    cellLeft = x,
+                    cellRight = x + colWidths[c],
+                    measuredTextHeight = cellLayouts[c].height.toFloat(),
+                    padV = padV,
+                    maxPageRight = PAGE_WIDTH - MARGIN_H
+                  )
                   x += colWidths[c]
                 }
+                geometryRecorder?.recordBodyBlock(pageNumber, "table_row", MARGIN_H, top, PAGE_WIDTH - MARGIN_H, top + rowH)
                 cursorY = top + rowH
               }
             }
@@ -1303,6 +1542,7 @@ object PdfReportExporter {
         canvas.restore()
       }
 
+      geometryRecorder?.recordBodyBlock(pageNumber, "section_header", MARGIN_H, barTop, PAGE_WIDTH - MARGIN_H, barTop + barH)
       cursorY = barTop + barH + 9f
     }
 

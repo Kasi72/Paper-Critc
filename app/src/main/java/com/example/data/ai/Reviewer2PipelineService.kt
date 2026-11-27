@@ -3549,7 +3549,7 @@ class Reviewer2PipelineService {
       }.trim()
     }
 
-    private enum class ClaimPolarity {
+    internal enum class ClaimPolarity {
       ABSENT_OR_DEFICIENT,
       PRESENT_OR_ADEQUATE,
       NEUTRAL
@@ -3586,11 +3586,147 @@ class Reviewer2PipelineService {
       }
     }
 
+    internal data class ScientificProposition(
+      val polarity: ClaimPolarity,
+      val significance: Boolean?, // true=significant, false=non-significant, null=unspecified
+      val direction: Int, // +1=increase/harm/overestimate, -1=decrease/benefit/underestimate, 0=neutral
+      val populations: Set<String>,
+      val adjustmentStatus: String?, // "ADJUSTED", "UNADJUSTED", or null
+      val comparators: Set<String>,
+      val timePointDays: Set<Double>,
+      val effectMeasures: Set<String>,
+      val percentages: List<Double>,
+      val pValues: List<Double>,
+      val effectEstimates: List<Double>,
+      val intervals: List<Pair<Double, Double>>,
+      val sampleSizes: List<Int>
+    )
+
+    internal fun extractScientificProposition(text: String): ScientificProposition {
+      val clean = text.replace(Regex("""\[[A-Z]-\d{1,3}\]"""), " ").trim()
+      val polarity = classifyClaimPolarity(clean)
+
+      val hasSig = Regex("""(?i)\bstatistically\s+significant\b""").containsMatchIn(clean) &&
+        !Regex("""(?i)\b(?:not|non)[\s-]+(?:statistically\s+)?significant\b""").containsMatchIn(clean)
+      val hasNonSig = Regex("""(?i)\b(?:not|non)[\s-]+(?:statistically\s+)?significant\b""").containsMatchIn(clean)
+      val significance = when {
+        hasSig && !hasNonSig -> true
+        hasNonSig && !hasSig -> false
+        else -> null
+      }
+
+      val upRegex = Regex("""(?i)\b(?:overestimat\w*|inflat\w*|higher|increas\w*|positive\s+effect|harm(?:ful)?|worsen\w*|elevated\s+risk|excess\s+mortality)\b""")
+      val downRegex = Regex("""(?i)\b(?:underestimat\w*|deflat\w*|lower|decreas\w*|reduc\w*|negative\s+effect|protective|beneficial|improved\s+survival)\b""")
+      val hasUp = upRegex.containsMatchIn(clean)
+      val hasDown = downRegex.containsMatchIn(clean)
+      val direction = when {
+        hasUp && !hasDown -> 1
+        hasDown && !hasUp -> -1
+        else -> 0
+      }
+
+      val populations = buildSet {
+        if (Regex("""(?i)\b(?:adults?|elderly|older\s+adults?|geriatric|men\s+and\s+women|adult\s+patients?)\b""").containsMatchIn(clean)) add("ADULTS")
+        if (Regex("""(?i)\b(?:children|child|pediatric|paediatric|infants?|neonates?|adolescents?|youth)\b""").containsMatchIn(clean)) add("PEDIATRIC")
+        if (Regex("""(?i)\b(?:pregnant|maternal|obstetric|prenatal)\b""").containsMatchIn(clean)) add("PREGNANT")
+        if (Regex("""(?i)\b(?:mice|mouse|rats?|murine|rodents?|canine|porcine|in\s+vitro|cell\s+lines?|animal\s+models?)\b""").containsMatchIn(clean)) add("ANIMAL_PRECLINICAL")
+        if (Regex("""(?i)\b(?:healthy\s+(?:volunteers?|adults?|subjects?|controls?))\b""").containsMatchIn(clean)) add("HEALTHY_VOLUNTEERS")
+      }
+
+      val hasAdjusted = Regex("""(?i)\b(?:adjusted|multivariable|multivariate|propensity[\s-]?(?:score|matched|weighted)|controlling\s+for|aor|ahr)\b""").containsMatchIn(clean) &&
+        !Regex("""(?i)\bnot\s+adjusted\b""").containsMatchIn(clean)
+      val hasUnadjusted = Regex("""(?i)\b(?:unadjusted|crude|bivariate|univariate|without\s+adjustment|not\s+adjusted)\b""").containsMatchIn(clean)
+      val adjustmentStatus = when {
+        hasAdjusted && !hasUnadjusted -> "ADJUSTED"
+        hasUnadjusted && !hasAdjusted -> "UNADJUSTED"
+        else -> null
+      }
+
+      val comparators = buildSet {
+        if (Regex("""(?i)\b(?:placebo|sham)\b""").containsMatchIn(clean)) add("PLACEBO")
+        if (Regex("""(?i)\b(?:standard\s+of\s+care|usual\s+care|routine\s+care|wait[\s-]?list|no\s+treatment|untreated)\b""").containsMatchIn(clean)) add("STANDARD_CARE")
+        if (Regex("""(?i)\b(?:active\s+(?:control|comparator|drug|therapy)|standard\s+(?:drug|therapy|chemotherapy)|metformin|statin|aspirin|warfarin|insulin|amoxicillin|prednisone)\b""").containsMatchIn(clean)) add("ACTIVE_CONTROL")
+        if (Regex("""(?i)\b(?:surgery|surgical|operative|resection|angioplasty|stenting)\b""").containsMatchIn(clean)) add("SURGICAL")
+        if (Regex("""(?i)\b(?:historical\s+control|external\s+control|single[\s-]?arm)\b""").containsMatchIn(clean)) add("HISTORICAL_CONTROL")
+      }
+
+      val timePointDays = buildSet {
+        val timeRegex = Regex("""(?i)\b(\d+(?:\.\d+)?)\s*[-]?\s*(hours?|hrs?|days?|weeks?|wks?|months?|mos?|years?|yrs?)\b""")
+        timeRegex.findAll(clean).forEach { m ->
+          val qty = m.groupValues[1].toDoubleOrNull() ?: return@forEach
+          val unit = m.groupValues[2].lowercase(Locale.US)
+          val days = when {
+            unit.startsWith("h") -> qty / 24.0
+            unit.startsWith("d") -> qty
+            unit.startsWith("w") -> qty * 7.0
+            unit.startsWith("m") -> qty * 30.0
+            unit.startsWith("y") -> qty * 365.0
+            else -> return@forEach
+          }
+          add(days)
+        }
+      }
+
+      val effectMeasures = buildSet {
+        if (Regex("""(?i)\b(?:hazard\s+ratio|a?hr)\b""").containsMatchIn(clean)) add("HR")
+        if (Regex("""(?i)\b(?:odds\s+ratio|a?or)\b""").containsMatchIn(clean)) add("OR")
+        if (Regex("""(?i)\b(?:risk\s+ratio|relative\s+risk|a?rr)\b""").containsMatchIn(clean)) add("RR")
+        if (Regex("""(?i)\b(?:mean\s+difference|smd|md)\b""").containsMatchIn(clean)) add("MD")
+        if (Regex("""(?i)\b(?:auroc|auc|c[\s-]?statistic)\b""").containsMatchIn(clean)) add("AUC")
+      }
+
+      val percentages = Regex("""(?<![\d.])(\d+(?:\.\d+)?)\s*%""")
+        .findAll(clean)
+        .mapNotNull { it.groupValues[1].toDoubleOrNull() }
+        .toList()
+
+      val pValues = Regex("""(?i)\bp(?:-?value)?\s*[=<>≤≥]\s*(0?\.\d+)""")
+        .findAll(clean)
+        .mapNotNull { it.groupValues[1].toDoubleOrNull() }
+        .toList()
+
+      val intervals = Regex("""(?i)(?:95%\s*ci|ci)\s*[:=]?\s*\(?\s*([-+]?\d+(?:\.\d+)?)\s*(?:to|–|—|-|,)\s*([-+]?\d+(?:\.\d+)?)\s*\)?""")
+        .findAll(clean)
+        .mapNotNull { m ->
+          val lo = m.groupValues[1].toDoubleOrNull() ?: return@mapNotNull null
+          val hi = m.groupValues[2].toDoubleOrNull() ?: return@mapNotNull null
+          lo to hi
+        }
+        .toList()
+
+      val sampleSizes = Regex("""(?i)\b(?:[nN]\s*=\s*(\d{1,6})|(\d{2,6})\s+(?:patients?|participants?|subjects?|adults?|children|individuals?))\b""")
+        .findAll(clean)
+        .mapNotNull { m -> (m.groupValues[1].ifBlank { m.groupValues[2] }).toIntOrNull() }
+        .toList()
+
+      val effectEstimates = Regex("""(?i)\b(?:a?hr|a?or|a?rr|irr|pr|smd|md|auc|auroc|beta|β|r|rho)\s*(?:=|of|was)?\s*([-+]?\d+(?:\.\d+)?)""")
+        .findAll(clean)
+        .mapNotNull { it.groupValues[1].toDoubleOrNull() }
+        .toList()
+
+      return ScientificProposition(
+        polarity = polarity,
+        significance = significance,
+        direction = direction,
+        populations = populations,
+        adjustmentStatus = adjustmentStatus,
+        comparators = comparators,
+        timePointDays = timePointDays,
+        effectMeasures = effectMeasures,
+        percentages = percentages,
+        pValues = pValues,
+        effectEstimates = effectEstimates,
+        intervals = intervals,
+        sampleSizes = sampleSizes
+      )
+    }
+
     /**
-     * P0-04 Semantic Consistency Gate:
-     * Treats finding IDs as pointers, NOT proof. Verifies that an AI prose sentence expresses a
-     * proposition consistent in polarity, method-status, direction/significance, and domain scope
-     * with the referenced verified [ReviewFinding] before it can ever be promoted as verified.
+     * Finding 3 (P0) Typed Scientific Proposition Consistency Gate:
+     * Treats finding IDs as pointers, NOT proof. Extracts typed scientific propositions
+     * (polarity, direction, significance, population, adjustment status, comparator arm,
+     * follow-up time point, effect measure, percentages, intervals, p-values, sample sizes)
+     * and rejects any contradiction in a specified critical field before promoting prose as verified.
      */
     internal fun isProseSemanticallyConsistentWithFinding(
       sentence: String,
@@ -3600,33 +3736,122 @@ class Reviewer2PipelineService {
       if (cleanSentence.length < 8) return false
       val findingText = "${finding.title}. ${finding.allegation}"
 
+      val sentProp = extractScientificProposition(cleanSentence)
+      val findProp = extractScientificProposition(findingText)
+
       // 1. Polarity / Method-Status opposition check (e.g., "absent" vs "was performed" / "is present in Table 3")
-      val sentPolarity = classifyClaimPolarity(cleanSentence)
-      val findingPolarity = classifyClaimPolarity(findingText)
-      if ((sentPolarity == ClaimPolarity.PRESENT_OR_ADEQUATE && findingPolarity == ClaimPolarity.ABSENT_OR_DEFICIENT) ||
-        (sentPolarity == ClaimPolarity.ABSENT_OR_DEFICIENT && findingPolarity == ClaimPolarity.PRESENT_OR_ADEQUATE)
+      if ((sentProp.polarity == ClaimPolarity.PRESENT_OR_ADEQUATE && findProp.polarity == ClaimPolarity.ABSENT_OR_DEFICIENT) ||
+        (sentProp.polarity == ClaimPolarity.ABSENT_OR_DEFICIENT && findProp.polarity == ClaimPolarity.PRESENT_OR_ADEQUATE)
       ) {
         return false
       }
 
       // 2. Significance & directional opposition check (including clinical benefit vs harm)
-      val sentSig = Regex("""(?i)\bstatistically\s+significant\b""").containsMatchIn(cleanSentence) &&
-        !Regex("""(?i)\b(?:not|non)[\s-]+(?:statistically\s+)?significant\b""").containsMatchIn(cleanSentence)
-      val sentNonSig = Regex("""(?i)\b(?:not|non)[\s-]+(?:statistically\s+)?significant\b""").containsMatchIn(cleanSentence)
-      val findSig = Regex("""(?i)\bstatistically\s+significant\b""").containsMatchIn(findingText) &&
-        !Regex("""(?i)\b(?:not|non)[\s-]+(?:statistically\s+)?significant\b""").containsMatchIn(findingText)
-      val findNonSig = Regex("""(?i)\b(?:not|non)[\s-]+(?:statistically\s+)?significant\b""").containsMatchIn(findingText)
-      if ((sentSig && findNonSig) || (sentNonSig && findSig)) return false
+      if (sentProp.significance != null && findProp.significance != null && sentProp.significance != findProp.significance) {
+        return false
+      }
+      if (sentProp.direction != 0 && findProp.direction != 0 && sentProp.direction != findProp.direction) {
+        return false
+      }
 
-      val upRegex = Regex("""(?i)\b(?:overestimat\w*|inflat\w*|higher|increas\w*|positive\s+effect|harm(?:ful)?|worsen\w*|elevated\s+risk|excess\s+mortality)\b""")
-      val downRegex = Regex("""(?i)\b(?:underestimat\w*|deflat\w*|lower|decreas\w*|reduc\w*|negative\s+effect|protective|beneficial|improved\s+survival)\b""")
-      val sUp = upRegex.containsMatchIn(cleanSentence) && !downRegex.containsMatchIn(cleanSentence)
-      val sDown = downRegex.containsMatchIn(cleanSentence) && !upRegex.containsMatchIn(cleanSentence)
-      val fUp = upRegex.containsMatchIn(findingText) && !downRegex.containsMatchIn(findingText)
-      val fDown = downRegex.containsMatchIn(findingText) && !upRegex.containsMatchIn(findingText)
-      if ((sUp && fDown) || (sDown && fUp)) return false
+      // 3. Typed Population consistency (e.g. "adults" vs "children" MUST fail)
+      if (sentProp.populations.isNotEmpty() && findProp.populations.isNotEmpty() &&
+        sentProp.populations.intersect(findProp.populations).isEmpty()
+      ) {
+        return false
+      }
+      val restrictiveSubpops = setOf("PEDIATRIC", "PREGNANT", "ANIMAL_PRECLINICAL")
+      if (sentProp.populations.any { it in restrictiveSubpops } &&
+        findProp.populations.intersect(sentProp.populations).isEmpty()
+      ) {
+        return false
+      }
 
-      // 3. Domain / Subject scope overlap: prevent unrelated prose from borrowing a verified ID
+      // 4. Adjusted vs Unadjusted consistency
+      if (sentProp.adjustmentStatus != null && findProp.adjustmentStatus != null &&
+        sentProp.adjustmentStatus != findProp.adjustmentStatus
+      ) {
+        return false
+      }
+
+      // 5. Comparator arm consistency (e.g. placebo vs surgery/active control)
+      if (sentProp.comparators.isNotEmpty() && findProp.comparators.isNotEmpty() &&
+        sentProp.comparators.intersect(findProp.comparators).isEmpty()
+      ) {
+        return false
+      }
+
+      // 6. Follow-up / time-point consistency (e.g. 30-day vs 5-year)
+      if (sentProp.timePointDays.isNotEmpty() && findProp.timePointDays.isNotEmpty()) {
+        val allTimePointsSupported = sentProp.timePointDays.all { sDays ->
+          findProp.timePointDays.any { fDays ->
+            val tol = maxOf(2.0, 0.15 * maxOf(sDays, fDays))
+            kotlin.math.abs(sDays - fDays) <= tol
+          }
+        }
+        if (!allTimePointsSupported) return false
+      }
+
+      // 7. Effect measure consistency (e.g. HR vs OR)
+      if (sentProp.effectMeasures.isNotEmpty() && findProp.effectMeasures.isNotEmpty() &&
+        sentProp.effectMeasures.intersect(findProp.effectMeasures).isEmpty()
+      ) {
+        return false
+      }
+
+      // 8. Typed numerical consistency (rejects 5% vs 50%, contradictory OR/HR/CI/p-value/N)
+      if (sentProp.percentages.isNotEmpty()) {
+        if (findProp.percentages.isEmpty()) return false
+        val allPctConsistent = sentProp.percentages.all { sPct ->
+          findProp.percentages.any { fPct ->
+            val tol = maxOf(0.25, 0.05 * kotlin.math.abs(fPct))
+            kotlin.math.abs(sPct - fPct) <= tol
+          }
+        }
+        if (!allPctConsistent) return false
+      }
+      if (sentProp.effectEstimates.isNotEmpty()) {
+        if (findProp.effectEstimates.isEmpty()) return false
+        val allEstConsistent = sentProp.effectEstimates.all { sEst ->
+          findProp.effectEstimates.any { fEst ->
+            val tol = maxOf(0.03, 0.05 * kotlin.math.abs(fEst))
+            kotlin.math.abs(sEst - fEst) <= tol
+          }
+        }
+        if (!allEstConsistent) return false
+      }
+      if (sentProp.intervals.isNotEmpty()) {
+        if (findProp.intervals.isEmpty()) return false
+        val allCiConsistent = sentProp.intervals.all { (sLo, sHi) ->
+          findProp.intervals.any { (fLo, fHi) ->
+            val tolLo = maxOf(0.03, 0.05 * kotlin.math.abs(fLo))
+            val tolHi = maxOf(0.03, 0.05 * kotlin.math.abs(fHi))
+            kotlin.math.abs(sLo - fLo) <= tolLo && kotlin.math.abs(sHi - fHi) <= tolHi
+          }
+        }
+        if (!allCiConsistent) return false
+      }
+      if (sentProp.pValues.isNotEmpty() && findProp.pValues.isNotEmpty()) {
+        val allPConsistent = sentProp.pValues.all { sP ->
+          findProp.pValues.any { fP ->
+            val sameSideOfAlpha = (sP < 0.05) == (fP < 0.05)
+            val tol = maxOf(0.002, 0.25 * maxOf(sP, fP))
+            sameSideOfAlpha && kotlin.math.abs(sP - fP) <= tol
+          }
+        }
+        if (!allPConsistent) return false
+      }
+      if (sentProp.sampleSizes.isNotEmpty() && findProp.sampleSizes.isNotEmpty()) {
+        val allNConsistent = sentProp.sampleSizes.all { sN ->
+          findProp.sampleSizes.any { fN ->
+            val tol = maxOf(1.0, 0.02 * fN.toDouble())
+            kotlin.math.abs(sN - fN) <= tol
+          }
+        }
+        if (!allNConsistent) return false
+      }
+
+      // 9. Domain / Subject scope overlap: prevent unrelated prose from borrowing a verified ID
       val stopWords = setOf(
         "the", "and", "for", "with", "that", "this", "from", "were", "was", "are", "not", "but",
         "have", "has", "had", "into", "their", "they", "study", "paper", "authors", "reported",
@@ -3645,6 +3870,37 @@ class Reviewer2PipelineService {
       val sharedTokens = sentTokens.intersect(findTokens).size
 
       return sharedTokens >= 2 || (sharedTokens >= 1 && sharedNums >= 1)
+    }
+
+    /**
+     * Finding 4 (P0): Classifies whether an unanchored prose sentence makes a substantive
+     * scientific, clinical, methodological, quantitative, or editorial claim (either negative
+     * criticism OR affirmative efficacy/safety/causality/adequacy/certainty assertion) that
+     * MUST NOT enter unverified editorial [ReportSection.contextStatements].
+     */
+    internal fun isSubstantiveScientificAssertion(line: String): Boolean {
+      val trimmed = line.trim()
+      if (trimmed.isEmpty()) return false
+      // Explicit counterevidence/dismissal provenance disclosures are allowed as neutral context
+      if (trimmed.contains("dismissed", ignoreCase = true) ||
+        trimmed.contains("counterevidence", ignoreCase = true) ||
+        trimmed.startsWith("Scope:", ignoreCase = true) ||
+        trimmed.startsWith("Context:", ignoreCase = true)
+      ) {
+        return false
+      }
+      val negativeAllegationCueRegex = Regex(
+        """(?i)\b(?:flaw|error|contradict|invalid|fabricat|omitted|missing|failed\s+to|did\s+not|bias(?:ed)?|confound\w*|leakage|overfit\w*|unadjusted|violat\w*|miscalculat\w*|discrepancy|underpowered|unreliable|unproven|inconsistent)\b"""
+      )
+      val affirmativeScientificClaimRegex = Regex(
+        """(?i)\b(?:safe(?:ty)?|effective(?:ness)?|efficac\w+|beneficial|clinical\s+benefit|superior(?:ity)?|inferior(?:ity)?|non[\s-]?inferior\w*|improves?|improved|reduces?|reduced|increases?|increased|prevents?|prevented|cures?|cured|protective|causes?|caused|causal(?:ity)?|associated\s+with|demonstrates?|demonstrated|proves?|proved|proven|confirms?|confirmed|establishes?|established|statistically\s+significant|significant(?:ly)?|well[\s-]?tolerated|high\s+certainty|moderate\s+certainty|robust(?:ness)?|rigorous|well[\s-]?designed|well[\s-]?controlled|methodologically\s+sound|valid(?:ated)?|reliable|reproducible|trustworthy|credible|adequately\s+(?:powered|blinded|controlled|adjusted|reported)|properly\s+(?:randomized|blinded|controlled|adjusted)|free\s+of\s+bias|no\s+bias|recommend(?:s|ed)?\s+(?:accept\w*|adoption|clinical\s+use|implementation)|ready\s+for\s+(?:publication|clinical\s+use|practice)|supports?\s+(?:clinical\s+adoption|publication|approval))\b"""
+      )
+      val quantitativeClaimRegex = Regex(
+        """(?i)(?:\b(?:a?hr|a?or|a?rr|smd|md|auroc|auc)\s*[=:]?\s*\d|\b95%\s*ci\b|\bp(?:-?value)?\s*[=<>≤≥]\s*0?\.\d+|\b\d+(?:\.\d+)?\s*%)"""
+      )
+      return negativeAllegationCueRegex.containsMatchIn(trimmed) ||
+        affirmativeScientificClaimRegex.containsMatchIn(trimmed) ||
+        quantitativeClaimRegex.containsMatchIn(trimmed)
     }
 
     internal fun buildEvidenceGovernedReportSection(
@@ -3666,9 +3922,6 @@ class Reviewer2PipelineService {
       val verifiedById = verifiedFindings.associateBy { it.id.uppercase(Locale.US) }
       val unverifiedIdSet = unverifiedOrPartialFindings.map { it.id.uppercase(Locale.US) }.toSet()
       val findingIdRegex = Regex("""\[([A-Z]-\d{1,3})\]""")
-      val allegationCueRegex = Regex(
-        """(?i)\b(?:flaw|error|contradict|invalid|fabricat|omitted|missing|failed\s+to|did\s+not|bias|confound|leakage|overfit|unadjusted|violat|miscalculat|discrepancy)\b"""
-      )
       val stopWords = setOf(
         "the", "and", "for", "with", "that", "this", "from", "were", "was", "are", "not", "but",
         "study", "paper", "authors", "missing", "lacks", "omitted", "reported", "analysis", "results"
@@ -3694,7 +3947,7 @@ class Reviewer2PipelineService {
         val explicitVerifiedIds = explicitIds.filter { it in verifiedById }
         val matchedUnverifiedIds = explicitIds.filter { it in unverifiedIdSet }
 
-        // P0-04: Explicit finding IDs are pointers, NOT proof — verify semantic consistency!
+        // Finding 3: Explicit finding IDs are pointers, NOT proof — verify typed proposition consistency!
         val semanticallyConsistentVerifiedIds = explicitVerifiedIds.filter { id ->
           val target = verifiedById[id]
           target != null && isProseSemanticallyConsistentWithFinding(line, target)
@@ -3756,10 +4009,11 @@ class Reviewer2PipelineService {
           matchedUnverifiedIds.isNotEmpty() -> {
             openQuestions.add(line)
           }
-          adjudicatedFindings.isNotEmpty() && allegationCueRegex.containsMatchIn(line) &&
-            !line.contains("dismissed", ignoreCase = true) &&
-            !line.contains("counterevidence", ignoreCase = true) -> {
-            openQuestions.add(line)
+          // Finding 4: Quarantine ALL unanchored substantive scientific assertions (BOTH positive
+          // efficacy/safety/causality/adequacy claims AND negative methodological criticisms),
+          // even when adjudicatedFindings is empty, so unsupported claims never slip into contextStatements.
+          isSubstantiveScientificAssertion(line) -> {
+            openQuestions.add("Provisional (Unverified Assertion): $line")
           }
           else -> {
             contextStmts.add(line)
@@ -3822,6 +4076,16 @@ class Reviewer2PipelineService {
       NOT_ASSESSABLE("Not assessable", 0)
     }
 
+    data class OutcomeEvidenceProfile(
+      val outcomeName: String,
+      val effectMeasure: String,
+      val pointEstimate: Double?,
+      val ciLower: Double?,
+      val ciUpper: Double?,
+      val isDirectClinicalOutcome: Boolean,
+      val sourceSentence: String
+    )
+
     data class GradeCertaintyAssessment(
       val startingLevel: String,
       val startingRank: Int, // 3=HIGH (RCT), 1=LOW (Observational), -1=NOT_ASSESSABLE
@@ -3832,18 +4096,29 @@ class Reviewer2PipelineService {
       val publicationBias: GradeDomainConcern,
       val verdictEnum: String,
       val isAssessable: Boolean,
-      val rationale: String
+      val rationale: String,
+      val outcomeProfiles: List<OutcomeEvidenceProfile> = emptyList(),
+      val assessmentScopeLabel: String = "Automated Preliminary Clinical Certainty Screen (Non-Substitutive for Formal Multi-Reviewer GRADE)"
     ) {
       fun toSummaryBlock(): String = buildString {
+        appendLine("Scope: $assessmentScopeLabel")
+        if (outcomeProfiles.isNotEmpty()) {
+          val profileSummary = outcomeProfiles.take(3).joinToString("; ") { p ->
+            val ciPart = if (p.ciLower != null && p.ciUpper != null) " (95% CI ${p.ciLower}–${p.ciUpper})" else ""
+            val estPart = p.pointEstimate?.let { " ${p.effectMeasure}=$it$ciPart" } ?: ""
+            "${p.outcomeName}$estPart"
+          }
+          appendLine("• Extracted Outcome Profile(s): $profileSummary")
+        }
         if (!isAssessable) {
-          appendLine("GRADE Certainty: NOT ASSESSABLE ($verdictEnum)")
+          appendLine("Preliminary Certainty Screen: NOT ASSESSABLE ($verdictEnum)")
           appendLine("• Reason: $rationale")
-          append("• Note: The 6-axis weighted appraisal score is an internal methodological summary and is NOT substituted for GRADE clinical certainty.")
+          append("• Governance Note: The 6-axis weighted appraisal score is an internal methodological summary and is NOT substituted for GRADE clinical certainty.")
         } else {
-          appendLine("Outcome-Specific GRADE Certainty: ${verdictEnum.replace('_', ' ')} (Starting design level: $startingLevel)")
+          appendLine("Preliminary Outcome-Specific Certainty Screen: ${verdictEnum.replace('_', ' ')} (Starting design level: $startingLevel)")
           appendLine("• Risk of Bias: ${riskOfBias.label} | Inconsistency: ${inconsistency.label} | Indirectness: ${indirectness.label} | Imprecision: ${imprecision.label} | Publication Bias: ${publicationBias.label}")
           appendLine("• Rationale: $rationale")
-          append("• Governance Note: Derived strictly from GRADE evidence domains rather than writing clarity or originality scores.")
+          append("• Governance Note: Automated preliminary domain screen derived from clinical evidence domains; formal GRADE certainty requires independent multi-reviewer outcome-by-outcome consensus.")
         }
       }
     }
@@ -4074,14 +4349,17 @@ class Reviewer2PipelineService {
     }
 
     /**
-     * P1-11 Transparent Outcome-Specific GRADE Clinical Certainty Evaluator:
-     * Evaluates clinical evidence certainty strictly via explicit outcome evidence + GRADE domains.
-     * - Requires explicit clinical outcome / effect profile evidence before issuing a rating.
+     * Finding 10 (P1): Automated Preliminary Clinical Certainty Screen.
+     * - Builds explicit outcome-specific [OutcomeEvidenceProfile] records linking outcomes to
+     *   co-located quantitative effect estimates/CIs rather than disconnected document keywords.
      * - Systematic reviews start at High ONLY when Methods/inclusion criteria explicitly state
      *   randomized controlled trials were pooled/included (never from casual "RCT" mentions).
-     * - Unassessed GRADE domains default to NOT_ASSESSABLE rather than optimistically NOT_SERIOUS.
-     * - Returns INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT when outcome evidence is missing or critical
-     *   domains (Risk of Bias, Imprecision, or >=2 domains) are NOT_ASSESSABLE.
+     * - Checks Imprecision against clinical decision thresholds (ratio null 1.0, appreciable benefit
+     *   0.75, appreciable harm 1.25, relative CI width > 2.5) and OIS/event adequacy.
+     * - Protocol registration alone (NCT/ISRCTN/PROSPERO) does NOT satisfy Publication Bias as
+     *   NOT_SERIOUS; requires explicit dissemination-bias evaluation (funnel/Egger/Begg/trim-and-fill).
+     * - Explicitly framed as an Automated Preliminary Clinical Certainty Screen, never a substitute
+     *   for formal multi-reviewer outcome-by-outcome GRADE adjudication.
      */
     internal fun evaluateClinicalGradeCertainty(
       manuscriptText: String,
@@ -4095,7 +4373,7 @@ class Reviewer2PipelineService {
         .find(manuscriptText)?.range?.first ?: manuscriptText.length
       val bodyText = manuscriptText.substring(0, refCut)
 
-      // Determine GRADE starting level strictly from study design (RCT=High(3), Observational=Low(1))
+      // Determine starting level strictly from study design (RCT=High(3), Observational=Low(1))
       val (startingLevel, startingRank) = when (subDesign) {
         AuditSubDesign.RCT -> "High (Randomized Controlled Trial)" to 3
         AuditSubDesign.META_ANALYSIS, AuditSubDesign.SYSTEMATIC_REVIEW -> {
@@ -4110,14 +4388,76 @@ class Reviewer2PipelineService {
         else -> "Not Assessable (Non-Clinical / Uncertain Design)" to -1
       }
 
-      // P0-03: Require structured clinical PICO + quantitative outcome effect profile
+      // Extract outcome-specific PICO evidence profiles from co-located sentences & parsed claims
+      val directClinicalOutcomeRegex = Regex(
+        """(?i)\b(all[\s-]?cause\s+mortality|mortality|death|overall\s+survival|progression[\s-]?free\s+survival|heart\s+failure|stroke|myocardial\s+infarction|hospitalization|clinical\s+remission|major\s+bleeding|adverse\s+events?|primary\s+(?:clinical\s+)?(?:outcome|endpoint))\b"""
+      )
+      val surrogateOutcomeRegex = Regex(
+        """(?i)\b(surrogate\s+(?:outcome|endpoint)|biomarker\s+endpoint|hba1c|ldl\s+cholesterol|blood\s+pressure|viral\s+load|tumor\s+marker)\b"""
+      )
+      val activeClaims = statAudit?.claims?.filter { !it.isFromReferenceOrCitation }.orEmpty()
+      val outcomeProfiles = mutableListOf<OutcomeEvidenceProfile>()
+      val seenOutcomeKeys = mutableSetOf<String>()
+
+      // 1. Derive profiles from structured statistical claims with co-located outcome context
+      activeClaims.filter { it.pointEstimate != null || it.ciLower != null }.forEach { claim ->
+        val quote = claim.sourceQuote
+        val directMatch = directClinicalOutcomeRegex.find(quote)
+        val surrogateMatch = surrogateOutcomeRegex.find(quote)
+        val outcomeName = directMatch?.value?.trim()
+          ?: surrogateMatch?.value?.trim()
+          ?: if (quote.contains("rate", ignoreCase = true) || quote.contains("outcome", ignoreCase = true) || quote.contains("endpoint", ignoreCase = true)) {
+            "Reported quantitative outcome (${claim.effectMeasure})"
+          } else null
+        if (outcomeName != null) {
+          val key = "${outcomeName.lowercase(Locale.US)}|${claim.effectMeasure}|${claim.pointEstimate}|${claim.ciLower}|${claim.ciUpper}"
+          if (seenOutcomeKeys.add(key)) {
+            outcomeProfiles.add(
+              OutcomeEvidenceProfile(
+                outcomeName = outcomeName,
+                effectMeasure = claim.effectMeasure.ifBlank { "Effect" },
+                pointEstimate = claim.pointEstimate,
+                ciLower = claim.ciLower,
+                ciUpper = claim.ciUpper,
+                isDirectClinicalOutcome = directMatch != null && surrogateMatch == null,
+                sourceSentence = quote.take(220)
+              )
+            )
+          }
+        }
+      }
+
+      // 2. Fallback sentence-level co-location scan for comparative outcome sentences (e.g. "mortality 24/320 vs 42/320")
+      if (outcomeProfiles.isEmpty()) {
+        bodyText.split(Regex("""(?<=[.!?])\s+|\n+""")).forEach { sent ->
+          val directMatch = directClinicalOutcomeRegex.find(sent)
+          val surrogateMatch = surrogateOutcomeRegex.find(sent)
+          val outcomeName = directMatch?.value?.trim() ?: surrogateMatch?.value?.trim() ?: return@forEach
+          val hasLocalEffect = Regex(
+            """(?i)(?:\b(?:a?hr|a?or|a?rr|irr|pr|md|smd|ard|arr|nnt|risk\s+ratio|odds\s+ratio|hazard\s+ratio|mean\s+difference)\b[^.\n]{0,45}\d|\b\d+\s*/\s*\d+\b[^.\n]{0,35}\b(?:vs\.?|versus)\b[^.\n]{0,35}\b\d+\s*/\s*\d+\b)"""
+          ).containsMatchIn(sent)
+          if (hasLocalEffect) {
+            val key = "${outcomeName.lowercase(Locale.US)}|sent|${sent.take(40)}"
+            if (seenOutcomeKeys.add(key)) {
+              outcomeProfiles.add(
+                OutcomeEvidenceProfile(
+                  outcomeName = outcomeName,
+                  effectMeasure = "Comparative",
+                  pointEstimate = null,
+                  ciLower = null,
+                  ciUpper = null,
+                  isDirectClinicalOutcome = directMatch != null && surrogateMatch == null,
+                  sourceSentence = sent.trim().take(220)
+                )
+              )
+            }
+          }
+        }
+      }
+
       val hasPopulation = Regex("""(?i)\b(?:patients?|participants?|subjects?|adults?|children|infants?|cohorts?|individuals?)\b""").containsMatchIn(bodyText)
       val hasComparator = Regex("""(?i)\b(?:placebo|control\s+(?:group|arm)|standard\s+of\s+care|usual\s+care|comparator|versus|vs\.?\s+(?:standard|usual|placebo|control|sham)|randomized\s+to\s+[^.\n]{1,60}\bor\b)\b""").containsMatchIn(bodyText)
-      val hasOutcomeEffectEvidence = (statAudit?.claims?.any { !it.isFromReferenceOrCitation && (it.ciLower != null || it.pointEstimate != null) } == true) ||
-        Regex(
-          """(?i)\b(?:hr|or|rr|irr|md|smd|ard|arr|nnt|risk\s+ratio|odds\s+ratio|hazard\s+ratio|mean\s+difference|mortality|survival|remission|hospitalization|event\s+rate)\b[^.\n]{0,80}(?:\d+(?:\.\d+)?|\bci\b|\bp\s*[=<>])"""
-        ).containsMatchIn(bodyText) ||
-        Regex("""\b\d+\s*/\s*\d+\b[^.\n]{0,40}\b(?:vs\.?|versus)\b[^.\n]{0,40}\b\d+\s*/\s*\d+\b""", RegexOption.IGNORE_CASE).containsMatchIn(bodyText)
+      val hasOutcomeEffectEvidence = outcomeProfiles.isNotEmpty()
 
       if (startingRank < 0 || extractionConfidence <= 2 || statAudit?.designClassification?.abstained == true || !hasOutcomeEffectEvidence || !hasPopulation || !hasComparator) {
         val missingParts = buildList {
@@ -4125,7 +4465,7 @@ class Reviewer2PipelineService {
           if (extractionConfidence <= 2) add("sufficient extraction confidence")
           if (!hasPopulation) add("target clinical population")
           if (!hasComparator) add("explicit comparator/control arm")
-          if (!hasOutcomeEffectEvidence) add("outcome-specific quantitative effect estimate")
+          if (!hasOutcomeEffectEvidence) add("co-located outcome-specific quantitative effect profile")
         }
         return GradeCertaintyAssessment(
           startingLevel = startingLevel,
@@ -4137,7 +4477,8 @@ class Reviewer2PipelineService {
           publicationBias = GradeDomainConcern.NOT_ASSESSABLE,
           verdictEnum = "INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT",
           isAssessable = false,
-          rationale = "GRADE certainty withheld because structured outcome-specific PICO/evidence inputs are missing: ${missingParts.joinToString(", ")}."
+          rationale = "Preliminary certainty screen withheld because structured outcome-specific PICO/evidence inputs are missing: ${missingParts.joinToString(", ")}.",
+          outcomeProfiles = outcomeProfiles
         )
       }
 
@@ -4200,34 +4541,46 @@ class Reviewer2PipelineService {
         else -> GradeDomainConcern.NOT_ASSESSABLE
       }
 
-      // 3. Indirectness
+      // 3. Indirectness (outcome-specific directness check)
       val indirectnessCues = activeFindings.any { f ->
         val txt = "${f.title} ${f.allegation}".lowercase(Locale.US)
         txt.contains("surrogate") || txt.contains("indirect") || txt.contains("generalizab") || txt.contains("external validity")
-      } || Regex("""(?i)\b(?:surrogate\s+(?:outcome|endpoint)|biomarker\s+endpoint\s+only|indirect\s+comparison)\b""").containsMatchIn(bodyText)
-      val hasDirectClinicalOutcome = Regex(
-        """(?i)\b(?:all[\s-]?cause\s+mortality|mortality|death|overall\s+survival|heart\s+failure|stroke|myocardial\s+infarction|hospitalization|clinical\s+remission|primary\s+clinical\s+(?:outcome|endpoint))\b"""
-      ).containsMatchIn(bodyText)
+      } || Regex("""(?i)\b(?:surrogate\s+(?:outcome|endpoint)|biomarker\s+endpoint\s+only|indirect\s+comparison)\b""").containsMatchIn(bodyText) ||
+        (outcomeProfiles.isNotEmpty() && outcomeProfiles.none { it.isDirectClinicalOutcome })
+      val hasDirectClinicalOutcome = outcomeProfiles.any { it.isDirectClinicalOutcome }
       val indirectness = when {
         indirectnessCues -> GradeDomainConcern.SERIOUS
         hasDirectClinicalOutcome -> GradeDomainConcern.NOT_SERIOUS
         else -> GradeDomainConcern.NOT_ASSESSABLE
       }
 
-      // 4. Imprecision — NEVER treat bare presence of "CI" or small "N = 40" as NOT_SERIOUS!
-      val activeClaims = statAudit?.claims?.filter { !it.isFromReferenceOrCitation }.orEmpty()
+      // 4. Imprecision — Clinical decision threshold (null 1.0, appreciable benefit 0.75, harm 1.25)
+      //    + relative width + OIS/sample adequacy. NEVER award NOT_SERIOUS merely from N>=100 + CI!
       val ciClaims = activeClaims.filter { it.ciLower != null && it.ciUpper != null }
+      val ratioMeasures = setOf("OR", "RR", "HR", "IRR", "PR", "AOR", "ARR_RATIO", "AHR")
       val anyCiCrossesNull = ciClaims.any { c ->
         val lo = c.ciLower ?: return@any false
         val hi = c.ciUpper ?: return@any false
-        val isRatio = c.effectMeasure.uppercase(Locale.US) in setOf("OR", "RR", "HR", "IRR", "PR", "AOR", "ARR_RATIO", "AHR")
-        if (isRatio) lo <= 1.0 && hi >= 1.0 else lo <= 0.0 && hi >= 0.0
+        if (c.effectMeasure.uppercase(Locale.US) in ratioMeasures) lo <= 1.0 && hi >= 1.0 else lo <= 0.0 && hi >= 0.0
       }
-      val anyRatioCiVeryWide = ciClaims.any { c ->
+      val anyCiSpansBothClinicalThresholds = ciClaims.any { c ->
         val lo = c.ciLower ?: return@any false
         val hi = c.ciUpper ?: return@any false
-        val isRatio = c.effectMeasure.uppercase(Locale.US) in setOf("OR", "RR", "HR", "IRR", "PR", "AOR", "AHR")
-        isRatio && lo > 0.0 && (hi / lo) > 3.0
+        c.effectMeasure.uppercase(Locale.US) in ratioMeasures && lo <= 0.75 && hi >= 1.25
+      }
+      val anyCiCrossesClinicalDecisionThresholdWithWideSpan = ciClaims.any { c ->
+        val lo = c.ciLower ?: return@any false
+        val hi = c.ciUpper ?: return@any false
+        val isRatio = c.effectMeasure.uppercase(Locale.US) in ratioMeasures
+        if (isRatio && lo > 0.0) {
+          val widthRatio = hi / lo
+          val crossesBenefitThreshold = lo < 0.75 && hi > 0.75
+          val crossesHarmThreshold = lo < 1.25 && hi > 1.25
+          widthRatio > 2.5 || ((crossesBenefitThreshold || crossesHarmThreshold) && widthRatio > 1.8)
+        } else {
+          val est = c.pointEstimate
+          est != null && kotlin.math.abs(est) > 1e-6 && ((hi - lo) / kotlin.math.abs(est)) > 2.5
+        }
       }
       val maxSampleN = Regex("""(?i)\b(?:n\s*=\s*|total\s+of\s+|enrolled\s+|randomized\s+)(\d{2,6})\s*(?:patients?|participants?|subjects?|individuals?)?\b""")
         .findAll(bodyText)
@@ -4245,32 +4598,39 @@ class Reviewer2PipelineService {
         "${f.title} ${f.allegation}".lowercase(Locale.US).let { it.contains("imprecis") || it.contains("underpower") || it.contains("wide ci") }
       }
       val smallSample = maxSampleN != null && maxSampleN < 100
+      val adequateOisOrLargeSample = hasPowerOrOisEvidence || (maxSampleN != null && maxSampleN >= 300)
       val imprecision = when {
-        explicitUnderpoweredCue || imprecisionFindings || (smallSample && anyCiCrossesNull) -> GradeDomainConcern.VERY_SERIOUS
-        anyCiCrossesNull || anyRatioCiVeryWide || smallSample -> GradeDomainConcern.SERIOUS
-        ciClaims.isNotEmpty() && (maxSampleN != null && maxSampleN >= 100 || hasPowerOrOisEvidence) -> GradeDomainConcern.NOT_SERIOUS
+        explicitUnderpoweredCue || imprecisionFindings || anyCiSpansBothClinicalThresholds || (smallSample && anyCiCrossesNull) ->
+          GradeDomainConcern.VERY_SERIOUS
+        anyCiCrossesNull || anyCiCrossesClinicalDecisionThresholdWithWideSpan || smallSample ->
+          GradeDomainConcern.SERIOUS
+        ciClaims.isNotEmpty() && adequateOisOrLargeSample ->
+          GradeDomainConcern.NOT_SERIOUS
         else -> GradeDomainConcern.NOT_ASSESSABLE
       }
 
-      // 5. Publication Bias — Guard against negated mentions ("publication bias was not assessed", "not registered")!
+      // 5. Publication Bias — Protocol registration ALONE is NOT sufficient for NOT_SERIOUS!
+      //    Requires formal dissemination-bias evaluation (funnel/Egger/Begg/trim-and-fill or explicit negative assessment).
       val pubBiasNotAssessed = Regex(
         """(?i)\b(?:publication\s+bias\s+(?:was\s+|could\s+)?not\s+(?:be\s+)?(?:assessed|evaluated|tested|examined)|did\s+not\s+(?:assess|evaluate|test)\s+publication\s+bias|too\s+few\s+studies\s+to\s+(?:assess|evaluate)\s+publication\s+bias|not\s+(?:pre)?registered|unregistered\s+(?:trial|protocol|review)|no\s+protocol\s+registration)\b"""
       ).containsMatchIn(bodyText)
       val pubBiasDetected = activeFindings.any { f ->
         "${f.title} ${f.allegation}".lowercase(Locale.US).let { it.contains("publication bias") || it.contains("funnel") || it.contains("selective reporting") }
       } || Regex(
-        """(?i)\b(?:asymmetric(?:al)?\s+funnel|evidence\s+of\s+publication\s+bias|significant\s+egger(?:'s)?\s+test|egger(?:'s)?[^.\n]{0,30}p\s*[<≤=]\s*0\.0\d|selective\s+outcome\s+reporting\s+detected)\b"""
+        """(?i)(?<!no\s)(?<!without\s)(?<!not\s)(?<!non-)(?<!non\s)\b(?:asymmetric(?:al)?\s+funnel|evidence\s+of\s+publication\s+bias|significant\s+egger(?:'s)?\s+test|selective\s+outcome\s+reporting\s+detected)\b|(?i)\begger(?:'s)?[^.\n]{0,30}p\s*(?:<\s*0\.05|[<≤=]\s*0\.0[0-4]\d*)\b"""
       ).containsMatchIn(bodyText)
       val hasAffirmativeRegistration = Regex(
         """(?i)\b(?:nct\d{6,}|isrctn\d{6,}|prospero\s*(?:crd)?\d{5,}|crd4\d{7,}|prospectively\s+registered\s+at\s+clinicaltrials\.gov)\b"""
       ).containsMatchIn(bodyText) && !Regex("""(?i)\b(?:not\s+registered|unregistered)\b""").containsMatchIn(bodyText)
-      val hasNegativeFunnelTest = Regex(
-        """(?i)\b(?:no\s+evidence\s+of\s+publication\s+bias|symmetrical\s+funnel\s+plot|egger(?:'s)?[^.\n]{0,30}p\s*[=>]\s*0\.[1-9]\d*)\b"""
+      val hasFormalDisseminationBiasAssessment = Regex(
+        """(?i)\b(?:no\s+evidence\s+of\s+publication\s+bias|symmetrical\s+funnel\s+plot|funnel\s+plot\s+(?:showed\s+)?no\s+asymmetry|egger(?:'s)?[^.\n]{0,35}p\s*[=>]\s*0\.[1-9]\d*|begg(?:'s)?[^.\n]{0,35}p\s*[=>]\s*0\.[1-9]\d*|trim[\s-]?and[\s-]?fill\s+(?:analysis\s+)?(?:confirmed|showed\s+no\s+missing|unchanged))\b"""
       ).containsMatchIn(bodyText)
       val publicationBias = when {
         pubBiasDetected -> GradeDomainConcern.SERIOUS
         pubBiasNotAssessed -> GradeDomainConcern.NOT_ASSESSABLE
-        hasAffirmativeRegistration || hasNegativeFunnelTest -> GradeDomainConcern.NOT_SERIOUS
+        hasFormalDisseminationBiasAssessment -> GradeDomainConcern.NOT_SERIOUS
+        // Registration alone reduces selective reporting risk within a single trial, but does NOT
+        // establish absence of publication/dissemination bias across the evidence body.
         else -> GradeDomainConcern.NOT_ASSESSABLE
       }
 
@@ -4290,7 +4650,8 @@ class Reviewer2PipelineService {
           publicationBias = publicationBias,
           verdictEnum = "INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT",
           isAssessable = false,
-          rationale = "GRADE certainty withheld: $unassessedCount domain(s) lack structured evidence (RoB=${riskOfBias.label}, Imprecision=${imprecision.label}, Publication Bias=${publicationBias.label})."
+          rationale = "Preliminary clinical certainty screen withheld: $unassessedCount domain(s) lack structured evidence (RoB=${riskOfBias.label}, Imprecision=${imprecision.label}, Publication Bias=${publicationBias.label}).",
+          outcomeProfiles = outcomeProfiles
         )
       }
 
@@ -4315,10 +4676,17 @@ class Reviewer2PipelineService {
         1 -> "LOW_CERTAINTY"
         else -> "VERY_LOW_CERTAINTY"
       }
+      val registrationCaveat = if (publicationBias == GradeDomainConcern.NOT_ASSESSABLE && hasAffirmativeRegistration) {
+        " (protocol registration detected, which mitigates selective reporting but does not replace formal publication-bias assessment)"
+      } else ""
       val reasonDetail = if (downgradeReasons.isEmpty()) {
-        if (unassessedCount > 0) "capped at Moderate due to 1 unassessed domain" else "all 5 GRADE domains affirmatively supported with zero downgrades"
+        if (unassessedCount > 0) {
+          "capped at Moderate due to 1 unassessed domain$registrationCaveat"
+        } else {
+          "all 5 screened domains affirmatively supported with zero downgrades"
+        }
       } else {
-        "downgraded for ${downgradeReasons.joinToString(", ")}"
+        "downgraded for ${downgradeReasons.joinToString(", ")}$registrationCaveat"
       }
       return GradeCertaintyAssessment(
         startingLevel = startingLevel,
@@ -4330,7 +4698,8 @@ class Reviewer2PipelineService {
         publicationBias = publicationBias,
         verdictEnum = verdictEnum,
         isAssessable = true,
-        rationale = "Started at $startingLevel; $reasonDetail."
+        rationale = "Automated preliminary clinical certainty screen across ${outcomeProfiles.size} outcome profile(s); started at $startingLevel; $reasonDetail.",
+        outcomeProfiles = outcomeProfiles
       )
     }
 

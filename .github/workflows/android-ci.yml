@@ -19,7 +19,9 @@ jobs:
           distribution: temurin
           java-version: "21"
 
-      - name: Ensure debug.keystore is provisioned for CI
+      - name: Provision debug.keystore and CI google-services.json
+        env:
+          GOOGLE_SERVICES_JSON_BASE64: ${{ secrets.GOOGLE_SERVICES_JSON_BASE64 }}
         run: |
           if [ ! -f debug.keystore ]; then
             if [ -f debug.keystore.base64 ]; then
@@ -36,6 +38,48 @@ jobs:
                 -dname "CN=Android Debug,O=Android,C=US"
             fi
           fi
+          if [ ! -f app/google-services.json ]; then
+            if [ -n "$GOOGLE_SERVICES_JSON_BASE64" ]; then
+              printf '%s' "$GOOGLE_SERVICES_JSON_BASE64" | base64 -d > app/google-services.json
+            else
+              cat <<'EOF' > app/google-services.json
+          {
+            "project_info": {
+              "project_number": "123456789012",
+              "project_id": "paper-critic-ci-test",
+              "storage_bucket": "paper-critic-ci-test.appspot.com"
+            },
+            "client": [
+              {
+                "client_info": {
+                  "mobilesdk_app_id": "1:123456789012:android:0000000000000000000000",
+                  "android_client_info": {
+                    "package_name": "com.aistudio.papercritic.jqkvwx"
+                  }
+                },
+                "oauth_client": [
+                  {
+                    "client_id": "CI_TEST_PLACEHOLDER_WEB_CLIENT_ID",
+                    "client_type": 3
+                  }
+                ],
+                "api_key": [
+                  {
+                    "current_key": "CI_TEST_PLACEHOLDER_API_KEY"
+                  }
+                ],
+                "services": {
+                  "appinvite_service": {
+                    "other_platform_oauth_client": []
+                  }
+                }
+              }
+            ],
+            "configuration_version": "1"
+          }
+          EOF
+            fi
+          fi
           chmod +x ./gradlew
 
       - name: Setup Gradle
@@ -44,16 +88,20 @@ jobs:
       - name: Assemble Debug APK
         run: ./gradlew :app:assembleDebug --no-daemon
 
-      - name: Run Local Unit & Robolectric Test Suites
+      - name: Run Pure Kotlin Unit Test Suites
         run: >
           ./gradlew :app:testDebugUnitTest --no-daemon
           --tests "com.example.ExampleUnitTest"
-          --tests "com.example.ExampleRobolectricTest"
           --tests "com.example.StatisticalAuditSubsystemTest"
           --tests "com.example.EpistemicSafeguardsAndCalibrationTest"
           --tests "com.example.Phase8TrustAbstentionSemanticTest"
           --tests "com.example.Phase9TrustValidationRevisionTest"
           --tests "com.example.Phase10PdfIdentityApplicabilityTest"
+
+      - name: Run Robolectric & End-to-End Integration Test Suites
+        run: >
+          ./gradlew :app:testDebugUnitTest --no-daemon
+          --tests "com.example.ExampleRobolectricTest"
           --tests "com.example.EnterpriseAndScientificTruthGateTest"
 
       - name: Run Android Lint
@@ -76,7 +124,9 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Provision debug.keystore and gradlew permissions
+      - name: Provision debug.keystore, CI google-services.json, and gradlew permissions
+        env:
+          GOOGLE_SERVICES_JSON_BASE64: ${{ secrets.GOOGLE_SERVICES_JSON_BASE64 }}
         run: |
           if [ ! -f debug.keystore ]; then
             if [ -f debug.keystore.base64 ]; then
@@ -91,6 +141,48 @@ jobs:
                 -keysize 2048 \
                 -validity 10000 \
                 -dname "CN=Android Debug,O=Android,C=US"
+            fi
+          fi
+          if [ ! -f app/google-services.json ]; then
+            if [ -n "$GOOGLE_SERVICES_JSON_BASE64" ]; then
+              printf '%s' "$GOOGLE_SERVICES_JSON_BASE64" | base64 -d > app/google-services.json
+            else
+              cat <<'EOF' > app/google-services.json
+          {
+            "project_info": {
+              "project_number": "123456789012",
+              "project_id": "paper-critic-ci-test",
+              "storage_bucket": "paper-critic-ci-test.appspot.com"
+            },
+            "client": [
+              {
+                "client_info": {
+                  "mobilesdk_app_id": "1:123456789012:android:0000000000000000000000",
+                  "android_client_info": {
+                    "package_name": "com.aistudio.papercritic.jqkvwx"
+                  }
+                },
+                "oauth_client": [
+                  {
+                    "client_id": "CI_TEST_PLACEHOLDER_WEB_CLIENT_ID",
+                    "client_type": 3
+                  }
+                ],
+                "api_key": [
+                  {
+                    "current_key": "CI_TEST_PLACEHOLDER_API_KEY"
+                  }
+                ],
+                "services": {
+                  "appinvite_service": {
+                    "other_platform_oauth_client": []
+                  }
+                }
+              }
+            ],
+            "configuration_version": "1"
+          }
+          EOF
             fi
           fi
           chmod +x ./gradlew

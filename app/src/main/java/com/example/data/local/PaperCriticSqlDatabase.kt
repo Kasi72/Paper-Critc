@@ -78,6 +78,8 @@ data class SqlReviewCacheEntity(
   val personalNotes: String,
   val bookmarkDirty: Boolean = false,
   val personalNotesDirty: Boolean = false,
+  val bookmarkRevision: Long = 0L,
+  val personalNotesRevision: Long = 0L,
   val localAnnotationUpdatedAtMs: Long = 0L,
   val searchGroundingReport: String = "",
   val createdAtSeconds: Long = System.currentTimeMillis() / 1000L,
@@ -151,6 +153,8 @@ data class SqlReviewCacheEntity(
       searchGroundingReport: String = "",
       bookmarkDirty: Boolean = false,
       personalNotesDirty: Boolean = false,
+      bookmarkRevision: Long = 0L,
+      personalNotesRevision: Long = 0L,
       localAnnotationUpdatedAtMs: Long = 0L
     ): SqlReviewCacheEntity {
       val rubric = review.toRubric()
@@ -207,6 +211,8 @@ data class SqlReviewCacheEntity(
         personalNotes = review.personalNotes,
         bookmarkDirty = bookmarkDirty,
         personalNotesDirty = personalNotesDirty,
+        bookmarkRevision = bookmarkRevision,
+        personalNotesRevision = personalNotesRevision,
         localAnnotationUpdatedAtMs = localAnnotationUpdatedAtMs,
         searchGroundingReport = searchGroundingReport,
         createdAtSeconds = review.createdAt?.seconds ?: 0L,
@@ -307,6 +313,7 @@ interface PaperCriticSqlDao {
 
   @Query(
     "UPDATE sql_review_cache SET bookmarked = :bookmarked, bookmarkDirty = :dirty, " +
+      "bookmarkRevision = bookmarkRevision + 1, " +
       "localAnnotationUpdatedAtMs = :updatedAtEpochMs, updatedAtEpochMs = :updatedAtEpochMs " +
       "WHERE id = :reviewId AND ownerScope = :ownerScope"
   )
@@ -320,6 +327,7 @@ interface PaperCriticSqlDao {
 
   @Query(
     "UPDATE sql_review_cache SET personalNotes = :personalNotes, personalNotesDirty = :dirty, " +
+      "personalNotesRevision = personalNotesRevision + 1, " +
       "localAnnotationUpdatedAtMs = :updatedAtEpochMs, updatedAtEpochMs = :updatedAtEpochMs " +
       "WHERE id = :reviewId AND ownerScope = :ownerScope"
   )
@@ -332,14 +340,24 @@ interface PaperCriticSqlDao {
   ): Int
 
   @Query(
-    "UPDATE sql_review_cache SET bookmarkDirty = 0 WHERE id = :reviewId AND ownerScope = :ownerScope"
+    "UPDATE sql_review_cache SET bookmarkDirty = 0 " +
+      "WHERE id = :reviewId AND ownerScope = :ownerScope AND bookmarkRevision = :acknowledgedRevision"
   )
-  suspend fun clearBookmarkDirtyForOwner(reviewId: String, ownerScope: String)
+  suspend fun clearBookmarkDirtyIfRevisionMatches(
+    reviewId: String,
+    ownerScope: String,
+    acknowledgedRevision: Long
+  ): Int
 
   @Query(
-    "UPDATE sql_review_cache SET personalNotesDirty = 0 WHERE id = :reviewId AND ownerScope = :ownerScope"
+    "UPDATE sql_review_cache SET personalNotesDirty = 0 " +
+      "WHERE id = :reviewId AND ownerScope = :ownerScope AND personalNotesRevision = :acknowledgedRevision"
   )
-  suspend fun clearPersonalNotesDirtyForOwner(reviewId: String, ownerScope: String)
+  suspend fun clearPersonalNotesDirtyIfRevisionMatches(
+    reviewId: String,
+    ownerScope: String,
+    acknowledgedRevision: Long
+  ): Int
 
   @Query(
     "SELECT * FROM sql_review_cache WHERE ownerScope = :ownerScope AND (bookmarkDirty = 1 OR personalNotesDirty = 1)"
@@ -427,7 +445,7 @@ interface PaperCriticSqlDao {
     SqlChatMessageEntity::class,
     SqlApiProviderEntity::class
   ],
-  version = 8,
+  version = 9,
   exportSchema = false
 )
 abstract class PaperCriticSqlDatabase : RoomDatabase() {
@@ -641,6 +659,18 @@ abstract class PaperCriticSqlDatabase : RoomDatabase() {
       }
     }
 
+    /**
+     * Non-destructive v8 -> v9 upgrade:
+     * - Adds per-field monotonic annotation revision counters ([bookmarkRevision],
+     *   [personalNotesRevision]) so an older cloud acknowledgment NEVER clears a newer local edit.
+     */
+    val MIGRATION_8_9 = object : Migration(8, 9) {
+      override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE sql_review_cache ADD COLUMN bookmarkRevision INTEGER NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE sql_review_cache ADD COLUMN personalNotesRevision INTEGER NOT NULL DEFAULT 0")
+      }
+    }
+
     fun getDatabase(context: Context): PaperCriticSqlDatabase {
       return INSTANCE ?: synchronized(this) {
         val instance = Room.databaseBuilder(
@@ -648,7 +678,14 @@ abstract class PaperCriticSqlDatabase : RoomDatabase() {
           PaperCriticSqlDatabase::class.java,
           "paper_critic_sql_database"
         )
-          .addMigrations(MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8)
+          .addMigrations(
+            MIGRATION_3_4,
+            MIGRATION_4_5,
+            MIGRATION_5_6,
+            MIGRATION_6_7,
+            MIGRATION_7_8,
+            MIGRATION_8_9
+          )
           .build()
         INSTANCE = instance
         instance

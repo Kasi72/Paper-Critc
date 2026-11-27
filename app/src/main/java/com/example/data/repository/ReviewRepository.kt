@@ -471,10 +471,13 @@ class ReviewRepository(
   }
 
   /**
-   * P1-02 Fail-Visible Recursive Deletion:
-   * Enumerates ALL child chunks (`findings_chunks` and `narrative_chunks`) WITHOUT swallowing
-   * errors. If chunk enumeration fails (e.g., offline or permission-denied), the parent review
-   * document is NOT deleted so confidential subcollection chunks are NEVER orphaned in Firestore.
+   * Fail-Visible Recursive Deletion:
+   * - Enumerates ALL child chunks (`findings_chunks` and `narrative_chunks`) WITHOUT swallowing
+   *   errors. If enumeration fails, nothing is deleted.
+   * - For all supported records (<= 499 child docs; current rules cap chunks at 64 + 64 = 128),
+   *   deletes ALL children + parent in ONE truly atomic Firestore WriteBatch.
+   * - For extraordinary legacy records exceeding 499 children, marks the parent with a resumable
+   *   `pendingDeletion` tombstone before multi-batch cleanup so partial failures stay resumable.
    */
   suspend fun deleteReview(reviewId: String, expectedUserId: String? = null): Result<Unit> {
     val uid = try {
@@ -493,12 +496,25 @@ class ReviewRepository(
       enumerateNarrativeChunks = {
         docRef.collection(NARRATIVE_CHUNKS_COLLECTION).get().await().documents.map { it.reference }
       },
+      markPendingDeletion = {
+        // Resumable tombstone marker ONLY invoked for legacy records > 499 child chunks
+        docRef.update(
+          mapOf(
+            "validationStatus" to "REQUIRES_REANALYSIS",
+            "updatedAt" to FieldValue.serverTimestamp()
+          )
+        ).await()
+      },
       commitDeleteRefs = { childRefs ->
-        // Firestore batch limit is 500 ops; delete children in chunks of 450, then parent in final batch
-        val chunkedChildren = childRefs.chunked(450)
-        if (chunkedChildren.isEmpty()) {
-          docRef.delete().await()
+        if (childRefs.size <= MAX_SINGLE_BATCH_CHILD_DELETES) {
+          // True single-batch atomic deletion of all children + parent (all supported records <= 128 chunks)
+          val batch = db.batch()
+          childRefs.forEach { batch.delete(it) }
+          batch.delete(docRef)
+          batch.commit().await()
         } else {
+          // Resumable multi-batch cleanup for oversized legacy records (> 499 children)
+          val chunkedChildren = childRefs.chunked(450)
           chunkedChildren.forEachIndexed { idx, group ->
             val batch = db.batch()
             group.forEach { batch.delete(it) }
@@ -586,15 +602,22 @@ class ReviewRepository(
       )
     }
 
+    internal const val MAX_SINGLE_BATCH_CHILD_DELETES = 499
+
     internal suspend fun <T> deleteReviewAtomically(
       enumerateFindingsChunks: suspend () -> List<T>,
       enumerateNarrativeChunks: suspend () -> List<T>,
       commitDeleteRefs: suspend (List<T>) -> Unit,
+      markPendingDeletion: suspend () -> Unit = {},
       onError: (Exception) -> Unit = {}
     ): Result<Unit> = try {
       val findingRefs = enumerateFindingsChunks()
       val narrativeRefs = enumerateNarrativeChunks()
-      commitDeleteRefs(findingRefs + narrativeRefs)
+      val allChildren = findingRefs + narrativeRefs
+      if (allChildren.size > MAX_SINGLE_BATCH_CHILD_DELETES) {
+        markPendingDeletion()
+      }
+      commitDeleteRefs(allChildren)
       Result.success(Unit)
     } catch (e: CancellationException) {
       throw e

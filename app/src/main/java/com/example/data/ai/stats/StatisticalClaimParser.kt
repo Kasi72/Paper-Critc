@@ -32,7 +32,8 @@ object StatisticalClaimParser {
     val sanitizedResult: SemanticValidityEngine.SanitizedTextResult? = null,
     val totalDiscoveredClaims: Int = claims.size,
     val truncatedClaimCount: Int = 0,
-    val truncatedPages: List<Int> = emptyList()
+    val truncatedPages: List<Int> = emptyList(),
+    val skippedDiscoveryCategories: List<String> = emptyList()
   )
 
   private const val MAX_PER_FAMILY_DISCOVERY = 500
@@ -229,8 +230,13 @@ object StatisticalClaimParser {
     var totalDiscoveredCount = 0
     var truncatedCount = 0
     val truncatedPages = linkedSetOf<Int>()
+    val skippedDiscoveryCategories = linkedSetOf<String>()
 
-    fun prioritizeAndCap(matches: Sequence<MatchResult>, limit: Int): List<MatchResult> {
+    fun prioritizeAndCap(
+      matches: Sequence<MatchResult>,
+      limit: Int,
+      categoryLabel: String = "quantitative_claims"
+    ): List<MatchResult> {
       val all = matches.toList()
       totalDiscoveredCount += all.size
       if (all.size <= limit) return all
@@ -247,6 +253,7 @@ object StatisticalClaimParser {
       }
       val omitted = ranked.drop(limit)
       truncatedCount += omitted.size
+      skippedDiscoveryCategories.add("$categoryLabel(-${omitted.size})")
       omitted.forEach { m ->
         val pg = contextAt(m.range.first).page
         if (pg > 0) truncatedPages.add(pg)
@@ -472,7 +479,8 @@ object StatisticalClaimParser {
     fun recordEffectCiMatch(m: MatchResult, requireExplicitCiLabel: Boolean) {
       if (effectCiRanges.any { existing -> m.range.first <= existing.last && m.range.last >= existing.first }) return
       effectCiRanges.add(m.range)
-      val label = m.groupValues[1].trim()
+      val rawLabel = m.groupValues[1].trim()
+      val label = rawLabel.replace(Regex("""(?i)^pooled\s+"""), "").trim().ifBlank { rawLabel }
       val point = parseSignedDouble(m.groupValues[2])
       val levelPct = m.groupValues[3].toDoubleOrNull()
       val intervalToken = m.groupValues[4]
@@ -598,12 +606,17 @@ object StatisticalClaimParser {
       )
     }
 
-    // 6. Table-only rows (pipe-delimited & tab-delimited) — ensures stats inside tables without narrative prose are captured!
-    parseStructuredTableRows(clean, ::contextAt, ::nextClaimId, claims, twoByTwoTables, metaStudies)
+    // 6. Table-only rows (pipe-delimited & tab-delimited) — tracked through prioritizeAndCap
+    val cappedTableRows = prioritizeAndCap(
+      pipeTableRowRegex.findAll(clean) + tabTableRowRegex.findAll(clean),
+      limit = 80,
+      categoryLabel = "structured_table_rows"
+    )
+    parseStructuredTableRows(clean, cappedTableRows, ::contextAt, ::nextClaimId, claims, twoByTwoTables, metaStudies)
 
-    // 7. Narrative 2x2 contingency pairs & explicit a,b,c,d cells
+    // 7. Narrative 2x2 contingency pairs & explicit a,b,c,d cells (tracked through prioritizeAndCap)
     var tblIdx = twoByTwoTables.size + 1
-    twoByTwoPairRegex.findAll(clean).take(120).forEach { m ->
+    prioritizeAndCap(twoByTwoPairRegex.findAll(clean), limit = 120, categoryLabel = "two_by_two_pairs").forEach { m ->
       val e1 = m.groupValues[1].toIntOrNull() ?: return@forEach
       val n1 = m.groupValues[2].toIntOrNull() ?: return@forEach
       val e2 = m.groupValues[3].toIntOrNull() ?: return@forEach
@@ -622,7 +635,7 @@ object StatisticalClaimParser {
         }
       }
     }
-    explicit2x2CellsRegex.findAll(clean).take(60).forEach { m ->
+    prioritizeAndCap(explicit2x2CellsRegex.findAll(clean), limit = 60, categoryLabel = "explicit_2x2_cells").forEach { m ->
       val a = m.groupValues[1].toIntOrNull() ?: return@forEach
       val b = m.groupValues[2].toIntOrNull() ?: return@forEach
       val c = m.groupValues[3].toIntOrNull() ?: return@forEach
@@ -634,8 +647,8 @@ object StatisticalClaimParser {
       }
     }
 
-    // 8. Individual study effects for Meta-Analysis pooling & LOO diagnostics
-    metaStudyCiRegex.findAll(clean).take(250).forEach { m ->
+    // 8. Individual study effects for Meta-Analysis pooling & LOO diagnostics (tracked through prioritizeAndCap)
+    prioritizeAndCap(metaStudyCiRegex.findAll(clean), limit = 250, categoryLabel = "meta_study_effects").forEach { m ->
       val studyLabel = m.groupValues[1].trim()
       val measure = m.groupValues[2].trim().uppercase(Locale.US)
       val est = parseSignedDouble(m.groupValues[3]) ?: return@forEach
@@ -704,8 +717,8 @@ object StatisticalClaimParser {
       )
     }
 
-    // 10. Sample-size & denominator flow extraction
-    extractSampleFlow(clean, ::contextAt, sampleFlow)
+    // 10. Sample-size & denominator flow extraction (tracked through prioritizeAndCap)
+    extractSampleFlow(clean, ::contextAt, sampleFlow) { seq, lim, cat -> prioritizeAndCap(seq, lim, cat) }
 
     // 11. Cross-section linkage & contradiction checks
     val crossLinks = buildCrossSectionLinks(clean, claims, sampleFlow, lower)
@@ -718,8 +731,13 @@ object StatisticalClaimParser {
       } else {
         ""
       }
+      val catLabel = if (skippedDiscoveryCategories.isNotEmpty()) {
+        " [${skippedDiscoveryCategories.joinToString(", ")}]"
+      } else {
+        ""
+      }
       unsupportedDisclosures.add(
-        "Quantitative claim discovery cap reached: $truncatedCount additional claim(s)$pageLabel were omitted beyond the $MAX_PER_FAMILY_DISCOVERY-per-family cap (total discovered: $totalDiscoveredCount); quantitative coverage is incomplete."
+        "Quantitative discovery cap reached: $truncatedCount additional item(s)$pageLabel were omitted$catLabel (total discovered: $totalDiscoveredCount); quantitative coverage is incomplete."
       )
     }
 
@@ -735,19 +753,20 @@ object StatisticalClaimParser {
       sanitizedResult = sanitized,
       totalDiscoveredClaims = maxOf(totalDiscoveredCount, claims.size),
       truncatedClaimCount = truncatedCount,
-      truncatedPages = truncatedPages.sorted()
+      truncatedPages = truncatedPages.sorted(),
+      skippedDiscoveryCategories = skippedDiscoveryCategories.toList()
     )
   }
 
   private fun parseStructuredTableRows(
     clean: String,
+    allRowMatches: List<MatchResult>,
     contextAt: (Int) -> ContextInfo,
     nextClaimId: () -> String,
     claims: MutableList<QuantitativeClaim>,
     twoByTwoTables: MutableList<TwoByTwoTableClaim>,
     metaStudies: MutableList<MetaStudyEffectClaim>
   ) {
-    val allRowMatches = (pipeTableRowRegex.findAll(clean) + tabTableRowRegex.findAll(clean)).take(80)
     var tblIdx = twoByTwoTables.size + 1
 
     for (m in allRowMatches) {
@@ -939,10 +958,11 @@ object StatisticalClaimParser {
   private fun extractSampleFlow(
     clean: String,
     contextAt: (Int) -> ContextInfo,
-    out: MutableList<SampleFlowRecord>
+    out: MutableList<SampleFlowRecord>,
+    capper: (Sequence<MatchResult>, Int, String) -> List<MatchResult>
   ) {
     fun addMatches(regex: Regex, stage: String) {
-      regex.findAll(clean).take(15).forEach { m ->
+      capper(regex.findAll(clean), 15, "sample_flow_${stage.lowercase(Locale.US)}").forEach { m ->
         val n = m.groupValues[1].replace(",", "").toIntOrNull() ?: return@forEach
         val ctx = contextAt(m.range.first)
         if (!ctx.isReferenceOrCitation && n > 0) {
@@ -954,14 +974,14 @@ object StatisticalClaimParser {
     addMatches(flowEnrolledRegex, "ENROLLED")
     addMatches(flowAnalyzedRegex, "ANALYZED")
     addMatches(flowLostRegex, "MISSING_OR_LOST")
-    totalNRegex.findAll(clean).take(20).forEach { m ->
+    capper(totalNRegex.findAll(clean), 20, "sample_flow_total_n").forEach { m ->
       val n = m.groupValues[1].replace(",", "").toIntOrNull() ?: return@forEach
       val ctx = contextAt(m.range.first)
       if (!ctx.isReferenceOrCitation && n >= 10) {
         out.add(SampleFlowRecord("TOTAL_N", "N = $n", n, ctx.page, ctx.section, ctx.tableFig, m.value.trim()))
       }
     }
-    subgroupNRegex.findAll(clean).take(20).forEach { m ->
+    capper(subgroupNRegex.findAll(clean), 20, "sample_flow_subgroup_n").forEach { m ->
       val n = m.groupValues[1].replace(",", "").toIntOrNull() ?: return@forEach
       val ctx = contextAt(m.range.first)
       if (!ctx.isReferenceOrCitation && n >= 1) {

@@ -118,13 +118,41 @@ object NumericalReconstructionEngine {
     val adjustedQValues: List<Pair<String, Double>>
   )
 
+  data class ReconstructionRunResult(
+    val results: List<NumericalReconstructionResult>,
+    val eligibleCount: Int,
+    val completedCount: Int,
+    val skippedCount: Int,
+    val skippedCategories: List<String>
+  )
+
   fun runAllReconstructions(
     ledger: StatisticalClaimParser.ParsedManuscriptLedger,
     rawText: String
-  ): List<NumericalReconstructionResult> {
+  ): List<NumericalReconstructionResult> = runAllReconstructionsWithCoverage(ledger, rawText).results
+
+  fun runAllReconstructionsWithCoverage(
+    ledger: StatisticalClaimParser.ParsedManuscriptLedger,
+    rawText: String
+  ): ReconstructionRunResult {
     val results = mutableListOf<NumericalReconstructionResult>()
     var idx = 1
     fun nextId() = "NR-%03d".format(Locale.US, idx++)
+
+    var eligibleCount = 0
+    var skippedCount = 0
+    val skippedCategories = mutableListOf<String>()
+
+    fun <T> capCategory(items: List<T>, limit: Int, categoryLabel: String): List<T> {
+      eligibleCount += items.size
+      if (items.size > limit) {
+        val omitted = items.size - limit
+        skippedCount += omitted
+        skippedCategories.add("$categoryLabel(-$omitted)")
+        return items.take(limit)
+      }
+      return items
+    }
 
     val activeClaims = ledger.claims
       .filter { !it.isFromReferenceOrCitation }
@@ -153,42 +181,41 @@ object NumericalReconstructionEngine {
       )
 
     // 1. Test-statistic reconstructions (t, z, chi2, F, r) with one-sided/two-sided & custom alpha
-    activeClaims.filter { it.testStatisticName.isNotBlank() && it.testStatisticValue != null && it.pValue != null }
-      .take(150)
-      .forEach { claim ->
-        reconstructTestStatistic(nextId(), claim)?.let { results.add(it) }
-      }
+    val testStatCandidates = activeClaims.filter { it.testStatisticName.isNotBlank() && it.testStatisticValue != null && it.pValue != null }
+    capCategory(testStatCandidates, 150, "reconstruct_test_stats").forEach { claim ->
+      reconstructTestStatistic(nextId(), claim)?.let { results.add(it) }
+    }
 
     // 2. 2x2 Table reconstructions (OR, RR, ARR, NNT, chi2, Exact Fisher)
-    ledger.twoByTwoTables.take(60).forEach { tbl ->
+    capCategory(ledger.twoByTwoTables, 60, "reconstruct_2x2_tables").forEach { tbl ->
       results.addAll(reconstructTwoByTwoTable(tbl, ::nextId))
     }
 
     // 3. Binomial proportions (x/n vs reported %) & Wilson 95% CI
-    activeClaims.filter { it.numerator != null && it.denominator != null && it.effectMeasure == "Proportion (%)" }
-      .take(150)
-      .forEach { claim ->
-        reconstructProportion(nextId(), claim)?.let { results.add(it) }
-      }
+    val proportionCandidates = activeClaims.filter { it.numerator != null && it.denominator != null && it.effectMeasure == "Proportion (%)" }
+    capCategory(proportionCandidates, 150, "reconstruct_proportions").forEach { claim ->
+      reconstructProportion(nextId(), claim)?.let { results.add(it) }
+    }
 
     // 4. Regression beta / SE / Wald z / CI reconstruction
-    activeClaims.filter { it.effectMeasure.equals("beta", true) && it.pointEstimate != null && it.standardError != null }
-      .take(150)
-      .forEach { claim ->
-        reconstructRegressionClaim(nextId(), claim)?.let { results.add(it) }
-      }
+    val regressionCandidates = activeClaims.filter { it.effectMeasure.equals("beta", true) && it.pointEstimate != null && it.standardError != null }
+    capCategory(regressionCandidates, 150, "reconstruct_regression").forEach { claim ->
+      reconstructRegressionClaim(nextId(), claim)?.let { results.add(it) }
+    }
 
     // 5. Ratio / Survival HR & OR/RR/PR CI log-symmetry & implied SE consistency
-    activeClaims.filter {
+    val ratioCiCandidates = activeClaims.filter {
       it.pointEstimate != null && it.ciLower != null && it.ciUpper != null &&
         it.parseStatus != ClaimParseStatus.AMBIGUOUS &&
         it.effectMeasure.uppercase(Locale.US) in setOf("OR", "AOR", "RR", "ARR", "HR", "AHR", "IRR", "PR")
-    }.take(150).forEach { claim ->
+    }
+    capCategory(ratioCiCandidates, 150, "reconstruct_ratio_cis").forEach { claim ->
       reconstructRatioOrSurvivalCi(nextId(), claim)?.let { results.add(it) }
     }
 
     // 6. Meta-analysis executable pooling (IVW, DL/PM τ², Q, I², HK CI, 95% PI, LOO influence)
     if (ledger.metaStudyEffects.size >= 3) {
+      eligibleCount += 1
       results.addAll(reconstructMetaAnalysisSuite(ledger.metaStudyEffects, rawText, ::nextId))
     }
 
@@ -276,7 +303,13 @@ object NumericalReconstructionEngine {
       }
     }
 
-    return results
+    return ReconstructionRunResult(
+      results = results,
+      eligibleCount = eligibleCount,
+      completedCount = (eligibleCount - skippedCount).coerceAtLeast(0),
+      skippedCount = skippedCount,
+      skippedCategories = skippedCategories.distinct()
+    )
   }
 
   // ============================================================================

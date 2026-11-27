@@ -28,6 +28,7 @@ import com.example.data.local.SqlChatMessageEntity
 import com.example.data.local.SqlReviewCacheEntity
 import com.example.data.model.AiApiProviderEntry
 import com.example.data.model.ApiProtocolType
+import com.example.data.model.BenchmarkManuscriptCatalog
 import com.example.data.model.EvidenceAnchor
 import com.example.data.model.FindingStatus
 import com.example.data.model.LedgerLoadState
@@ -38,16 +39,19 @@ import com.example.data.model.ReviewFindingCodec
 import com.example.data.model.ReviewMode
 import com.example.data.repository.LocalReviewRepository
 import com.example.data.repository.ReviewRepository
+import com.example.ui.auth.resolveDefaultWebClientId
 import com.example.ui.screens.isSafeExternalWebUrl
 import com.example.ui.viewmodel.AiProviderRoute
 import com.example.ui.viewmodel.AppSettingsState
 import com.example.ui.viewmodel.PaperCriticViewModel
+import com.example.ui.viewmodel.PipelineExecutionState
 import com.example.util.DocumentCoverageReport
 import com.example.util.DossierFormattingEngine
 import com.example.util.ExtractedManuscriptFile
 import com.example.util.ManuscriptExtractor
 import com.example.util.ManuscriptInputFormat
 import com.example.util.PdfExportScope
+import com.example.util.PdfLayoutGeometryRecorder
 import com.example.util.PdfReportExporter
 import com.example.util.ReportBlock
 import android.database.sqlite.SQLiteDatabase
@@ -468,8 +472,8 @@ class EnterpriseAndScientificTruthGateTest {
     val rctText = """
       [PAGE 1]
       A Double-Blind Randomized Controlled Trial of Drug X vs Placebo in Acute Heart Failure
-      Methods: This prospectively registered trial (NCT04123456) used centralized concealed allocation and double-blind outcome adjudication. Patients (N = 640; powered at 80% for 60 events) were randomized 1:1 to Drug X (n = 320) or placebo (n = 320) with low risk of bias and intention-to-treat analysis.
-      Results: Primary mortality endpoint occurred in 24/320 vs 42/320 (HR = 0.56, 95% CI 0.34 to 0.92, p = 0.02).
+      Methods: This prospectively registered trial (NCT04123456) used centralized concealed allocation and double-blind outcome adjudication. Patients (N = 2400; powered at 90% for 400 events; optimal information size met) were randomized 1:1 to Drug X (n = 1200) or placebo (n = 1200) with low risk of bias and intention-to-treat analysis. Formal dissemination assessment found a symmetrical funnel plot and no evidence of publication bias (Egger's test p = 0.64).
+      Results: Primary all-cause mortality endpoint occurred in 120/1200 vs 240/1200 (HR = 0.50, 95% CI 0.42 to 0.60, p < 0.001).
     """.trimIndent()
     val rctForensics = ManuscriptForensicEngine.analyzeManuscript(
       text = rctText,
@@ -483,8 +487,9 @@ class EnterpriseAndScientificTruthGateTest {
       adjudicatedFindings = emptyList(),
       extractionConfidence = 5
     )
-    assertTrue("Clean RCT with RoB, precision, and registration evidence should be GRADE assessable", cleanRctGrade.isAssessable)
+    assertTrue("Clean RCT with RoB, tight clinical-threshold CI, OIS, and dissemination bias evidence should be assessable", cleanRctGrade.isAssessable)
     assertEquals("HIGH_CERTAINTY", cleanRctGrade.verdictEnum)
+    assertTrue("Outcome-specific profiles must be extracted", cleanRctGrade.outcomeProfiles.isNotEmpty())
   }
 
   // =========================================================================
@@ -1956,12 +1961,13 @@ class EnterpriseAndScientificTruthGateTest {
         rawDb.close()
       }
 
-      // 2. Open with Room at v8 running real MIGRATION_5_6 -> MIGRATION_6_7 -> MIGRATION_7_8
+      // 2. Open with Room at v9 running real MIGRATION_5_6 -> MIGRATION_6_7 -> MIGRATION_7_8 -> MIGRATION_8_9
       migratedDb = Room.databaseBuilder(context, PaperCriticSqlDatabase::class.java, dbName)
         .addMigrations(
           PaperCriticSqlDatabase.MIGRATION_5_6,
           PaperCriticSqlDatabase.MIGRATION_6_7,
-          PaperCriticSqlDatabase.MIGRATION_7_8
+          PaperCriticSqlDatabase.MIGRATION_7_8,
+          PaperCriticSqlDatabase.MIGRATION_8_9
         )
         .allowMainThreadQueries()
         .build()
@@ -2201,5 +2207,803 @@ class EnterpriseAndScientificTruthGateTest {
     val falsePositives = listOf(cleanRctFalseCriticals > 0, cleanCohortFalseCriticals > 0).count { it }
     assertEquals("Multi-design calibration suite must achieve 4/4 (100%) TPR across positive controls", 4, truePositives)
     assertEquals("Multi-design calibration suite must achieve 0/2 (0%) FPR across clean negative controls", 0, falsePositives)
+  }
+
+  // =========================================================================
+  // NEW CODE AUDIT (27 NOV 2026) — FINDINGS 1 THROUGH 14 REGRESSION SUITE
+  // =========================================================================
+
+  @Test
+  fun auditV2_01_revisionAwareDirtySync_delayedAckForNoteA_neverClearsNewerNoteB() = runBlocking {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val db = Room.inMemoryDatabaseBuilder(context, PaperCriticSqlDatabase::class.java)
+      .allowMainThreadQueries()
+      .build()
+    try {
+      val repo = LocalReviewRepository(db.sqlDao())
+      val owner = "uid_race_test"
+      val rev = PaperReview(id = "race_rev_1", userId = owner, title = "Concurrent Annotation Race Test", personalNotes = "")
+      repo.cacheReviewOffline(rev, ownerScope = owner)
+
+      // 1. User saves Note A -> captures revA
+      val revA = repo.updatePersonalNotes(review = rev, personalNotes = "Note A", ownerScope = owner)
+      assertTrue("Revision must be strictly positive", revA >= 1L)
+
+      // 2. Before Note A's cloud write completes, user edits to Note B -> captures revB > revA
+      val revB = repo.updatePersonalNotes(review = rev, personalNotes = "Note B", ownerScope = owner)
+      assertTrue("Newer edit must strictly increment revision", revB > revA)
+
+      // 3. Stale cloud ack for Note A arrives and tries to clear dirty flag using revA
+      repo.clearPersonalNotesDirtyIfRevisionMatches("race_rev_1", owner, revA)
+      val dirtyAfterStaleAck = repo.getDirtyAnnotationReviews(owner)
+      assertEquals("Note B MUST remain dirty after stale ack for Note A", 1, dirtyAfterStaleAck.size)
+      assertTrue("personalNotesDirty must still be true", dirtyAfterStaleAck.first().personalNotesDirty)
+      assertEquals("Note B", dirtyAfterStaleAck.first().personalNotes)
+
+      // 4. Same race test for bookmarks
+      val bmRev1 = repo.updateBookmark(review = rev, bookmarked = true, ownerScope = owner)
+      val bmRev2 = repo.updateBookmark(review = rev, bookmarked = false, ownerScope = owner)
+      assertTrue(bmRev2 > bmRev1)
+      repo.clearBookmarkDirtyIfRevisionMatches("race_rev_1", owner, bmRev1)
+      assertTrue("Newer bookmark toggle must remain dirty after stale ack", repo.getDirtyAnnotationReviews(owner).first().bookmarkDirty)
+
+      // 5. Once current revisions revB and bmRev2 are acknowledged, dirty flags clear cleanly
+      repo.clearPersonalNotesDirtyIfRevisionMatches("race_rev_1", owner, revB)
+      repo.clearBookmarkDirtyIfRevisionMatches("race_rev_1", owner, bmRev2)
+      assertTrue("Both dirty flags must clear once latest revisions are acknowledged", repo.getDirtyAnnotationReviews(owner).isEmpty())
+    } finally {
+      db.close()
+    }
+  }
+
+  @Test
+  fun auditV2_02_oauthClientIdResolution_failsClosedOnPlaceholderOrMissingConfig() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val resolved = resolveDefaultWebClientId(context)
+    // In CI/test without real OAuth client ID, placeholder strings must be rejected; if real google-services.json
+    // is present locally, it must end in .apps.googleusercontent.com and never equal the CI placeholder.
+    if (resolved != null) {
+      assertFalse(resolved.contains("PLACEHOLDER", ignoreCase = true))
+      assertFalse(resolved.contains("CI_TEST", ignoreCase = true))
+      assertTrue(resolved.isNotBlank())
+    }
+  }
+
+  @Test
+  fun auditV2_03_typedScientificPropositionGate_rejectsConflictingNumbersPopulationsAdjustmentsComparatorsAndTimepoints() {
+    val adultMortalityFinding = ReviewFinding(
+      id = "Q-10",
+      title = "Mortality increase in adults",
+      allegation = "Treatment increased 30-day mortality by 5% in adults compared with placebo in adjusted analysis (HR = 1.15, 95% CI 1.04 to 1.27, p = 0.008).",
+      status = FindingStatus.VERIFIED,
+      severity = "CRITICAL"
+    )
+    // 1. Consistent restatement MUST pass
+    assertTrue(
+      "Consistent restatement matching magnitude, population, comparator, adjustment, and timepoint must pass",
+      Reviewer2PipelineService.isProseSemanticallyConsistentWithFinding(
+        "[Q-10] In adjusted analysis, treatment increased 30-day mortality by 5% in adults versus placebo (HR = 1.15, 95% CI 1.04 to 1.27).",
+        adultMortalityFinding
+      )
+    )
+    // 2. Conflicting percentage (5% vs 50%) MUST fail
+    assertFalse(
+      "Conflicting magnitude (50% vs 5%) must NEVER be certified as verified",
+      Reviewer2PipelineService.isProseSemanticallyConsistentWithFinding(
+        "[Q-10] Treatment increased mortality by 50% in adults compared with placebo.",
+        adultMortalityFinding
+      )
+    )
+    // 3. Conflicting population (adults vs children) MUST fail
+    assertFalse(
+      "Conflicting population (children vs adults) must NEVER be certified as verified",
+      Reviewer2PipelineService.isProseSemanticallyConsistentWithFinding(
+        "[Q-10] Treatment increased mortality by 5% in children compared with placebo.",
+        adultMortalityFinding
+      )
+    )
+    // 4. Conflicting adjustment status (unadjusted vs adjusted) MUST fail
+    assertFalse(
+      "Conflicting adjustment status (unadjusted vs adjusted) must fail",
+      Reviewer2PipelineService.isProseSemanticallyConsistentWithFinding(
+        "[Q-10] In unadjusted analysis, treatment increased 30-day mortality by 5% in adults.",
+        adultMortalityFinding
+      )
+    )
+    // 5. Conflicting follow-up period (5-year vs 30-day) MUST fail
+    assertFalse(
+      "Conflicting follow-up period (5-year vs 30-day) must fail",
+      Reviewer2PipelineService.isProseSemanticallyConsistentWithFinding(
+        "[Q-10] Treatment increased 5-year mortality by 5% in adults compared with placebo.",
+        adultMortalityFinding
+      )
+    )
+    // 6. Conflicting comparator arm (surgery vs placebo) MUST fail
+    assertFalse(
+      "Conflicting comparator arm (surgery vs placebo) must fail",
+      Reviewer2PipelineService.isProseSemanticallyConsistentWithFinding(
+        "[Q-10] Treatment increased 30-day mortality by 5% in adults compared with surgery.",
+        adultMortalityFinding
+      )
+    )
+    // 7. Conflicting effect measure (OR vs HR) MUST fail
+    assertFalse(
+      "Conflicting effect measure (OR vs HR) must fail",
+      Reviewer2PipelineService.isProseSemanticallyConsistentWithFinding(
+        "[Q-10] Treatment increased 30-day mortality in adults with OR = 1.15.",
+        adultMortalityFinding
+      )
+    )
+  }
+
+  @Test
+  fun auditV2_04_evidenceGate_quarantinesUnsupportedPositiveAndConclusiveScientificClaims() {
+    val prose = """
+      Scope: Editorial appraisal of the supplied clinical trial draft.
+      The treatment is safe and clinically effective for routine adoption.
+      This study is methodologically sound and proves causal benefit with high certainty.
+      Outcomes were reduced by 28% (p = 0.003).
+    """.trimIndent()
+
+    // Test BOTH with empty adjudicatedFindings and with an unrelated verified finding
+    val sectionEmptyLedger = Reviewer2PipelineService.buildEvidenceGovernedReportSection(
+      title = "Editorial Verdict",
+      rawProse = prose,
+      adjudicatedFindings = emptyList()
+    )
+    assertEquals(
+      "Only neutral scope framing may remain in contextStatements",
+      1,
+      sectionEmptyLedger.contextStatements.size
+    )
+    assertTrue(sectionEmptyLedger.contextStatements.first().startsWith("Scope:"))
+    assertEquals(
+      "All 3 unsupported positive/quantitative claims MUST be quarantined to openQuestionsForInvestigation",
+      3,
+      sectionEmptyLedger.openQuestionsForInvestigation.size
+    )
+    assertTrue(
+      "Quarantined claims must be explicitly labeled provisional",
+      sectionEmptyLedger.openQuestionsForInvestigation.all { it.contains("Provisional (Unverified Assertion)") }
+    )
+    assertTrue(sectionEmptyLedger.verifiedStatements.isEmpty())
+  }
+
+  @Test
+  fun auditV2_05_twoStageStatisticalCoverage_tracksBothDiscoveryAndReconstructionSkipsAndDowngradesValidation() {
+    // 1. Trigger Stage-1 discovery cap on structured table rows (>80 rows)
+    val manyTableRowsManuscript = buildString {
+      appendLine("[PAGE 1]")
+      appendLine("Results")
+      appendLine("| Endpoint | Events | Rate | Effect |")
+      appendLine("|---|---|---|---|")
+      for (i in 1..95) {
+        appendLine("| Outcome $i | 12/100 (12.0%) | 10/100 (10.0%) | OR = 1.22 (95% CI 0.50 to 2.98, p = 0.65) |")
+      }
+    }
+    val tableAudit = StatisticalAuditOrchestrator.audit(
+      text = manyTableRowsManuscript,
+      parentArchetype = StudyDesignArchetype.CLINICAL_EPIDEMIOLOGICAL,
+      coverageReport = DocumentCoverageReport.forCompleteText(manyTableRowsManuscript)
+    )
+    assertTrue(
+      "Stage-1 table-row cap must be reflected in coverageMetrics.discoverySkipped",
+      tableAudit.coverageMetrics.discoverySkipped > 0
+    )
+    assertTrue(
+      "Skipped category must mention table rows",
+      tableAudit.coverageMetrics.skippedCategories.any { it.contains("table", ignoreCase = true) }
+    )
+
+    // 2. Trigger Stage-2 reconstruction cap (>150 ratio CI claims inside the 500 Stage-1 discovery limit)
+    val manyRatioCiManuscript = buildString {
+      appendLine("[PAGE 1]")
+      appendLine("Results")
+      for (i in 1..175) {
+        appendLine("Subgroup $i showed HR = 1.25 (95% CI 1.05 to 1.49, p = 0.012).")
+      }
+    }
+    val reconAudit = StatisticalAuditOrchestrator.audit(
+      text = manyRatioCiManuscript,
+      parentArchetype = StudyDesignArchetype.CLINICAL_EPIDEMIOLOGICAL,
+      coverageReport = DocumentCoverageReport.forCompleteText(manyRatioCiManuscript)
+    )
+    assertTrue(
+      "Stage-2 reconstruction cap must be reflected in coverageMetrics.reconstructionSkipped (${reconAudit.coverageMetrics})",
+      reconAudit.coverageMetrics.reconstructionSkipped > 0
+    )
+    assertTrue(reconAudit.truncatedClaimCount >= reconAudit.coverageMetrics.reconstructionSkipped)
+    assertTrue(reconAudit.toPromptBlock().contains("QUANTITATIVE COVERAGE PARTIAL"))
+
+    val verifiedFinding = ReviewFinding(
+      id = "S-01",
+      title = "Sample check",
+      allegation = "Verified check.",
+      status = FindingStatus.VERIFIED,
+      severity = "MINOR"
+    )
+    val status = Reviewer2PipelineService.computeValidationStatus(
+      resolvedVerdict = "SOUND_WITH_CAVEATS",
+      adjudicatedFindings = listOf(verifiedFinding),
+      anyJsonRepaired = false,
+      omittedOrPartialPromptPagesCount = 0,
+      wasPromptTrimmed = false,
+      extractionConfidence = 5,
+      hasSubstantiveEditorialProse = true,
+      truncatedStatisticalClaimCount = reconAudit.truncatedClaimCount
+    )
+    assertEquals("PARTIALLY_VALIDATED", status)
+  }
+
+  @Test
+  fun auditV2_06_and_11_manuscriptReplacement_detachesStaleReplicationCodeAndSeparatesUserEditedMetadata() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val db = Room.inMemoryDatabaseBuilder(context, PaperCriticSqlDatabase::class.java)
+      .allowMainThreadQueries()
+      .build()
+    try {
+      val vm = buildTestViewModel(context, db, initialUserId = "uid_draft_binding")
+      // 1. Load Paper A and attach Replication Code A
+      vm.updateManuscriptText("Paper A: A randomized trial of Drug Alpha versus placebo in 400 adults with acute heart failure. Results: HR = 0.72 (95% CI 0.58 to 0.89).")
+      vm.updateTitle("Paper A Custom User Title")
+      vm.updateAuthors("Dr. User Entered")
+      vm.updateReplicationCodeText("import pandas as pd\ndf = pd.read_csv('paper_a.csv')\n")
+      val draftIdA = vm.formState.value.draftId
+      assertEquals(draftIdA, vm.formState.value.replicationCodeBoundDraftId)
+      assertTrue(PaperCriticViewModel.resolveBoundReplicationCode(vm.formState.value).contains("paper_a.csv"))
+
+      // 2. Replace with a completely different Paper B via manual text replacement
+      vm.updateManuscriptText("Paper B: A prospective cohort study of Biomarker Beta in 1200 oncology patients followed for 5 years. Results: OR = 1.84 (95% CI 1.32 to 2.56, p < 0.001).")
+      val stateB = vm.formState.value
+      assertNotEquals("Substantive manuscript replacement must mint a fresh draftId", draftIdA, stateB.draftId)
+      assertEquals("Stale replication code from Paper A must be cleared automatically", "", stateB.replicationCodeText)
+      assertEquals("Unbound/stale code must never pass the analysis boundary", "", PaperCriticViewModel.resolveBoundReplicationCode(stateB))
+      assertTrue(
+        "User-edited metadata must be flagged for reconfirmation instead of silently carried onto Paper B",
+        stateB.metadataNeedsReconfirmation
+      )
+
+      // 3. Loading a benchmark case must also clear stale replication code and reset user-edited flags
+      vm.updateReplicationCodeText("# stale code for B")
+      vm.loadBenchmarkManuscript(BenchmarkManuscriptCatalog.samples.first())
+      assertEquals("", vm.formState.value.replicationCodeText)
+      assertFalse(vm.formState.value.metadataNeedsReconfirmation)
+    } finally {
+      db.close()
+    }
+  }
+
+  @Test
+  fun auditV2_07_losslessNarrativeRecovery_restoresAll12FieldsByChecksumWithoutLengthHeuristics() = runBlocking {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val db = Room.inMemoryDatabaseBuilder(context, PaperCriticSqlDatabase::class.java)
+      .allowMainThreadQueries()
+      .build()
+    try {
+      val repo = LocalReviewRepository(db.sqlDao())
+      val owner = "uid_lossless_12"
+      val checksum = "sha256_narrative_v1_exact"
+      val fullReview = PaperReview(
+        id = "rev_12_fields",
+        userId = owner,
+        title = "Complete 12-Field Narrative Dossier",
+        ledgerLoadState = LedgerLoadState.COMPLETE,
+        narrativeChunkCount = 2,
+        narrativeChecksum = checksum,
+        abstractSummary = "Full abstract summary text",
+        researchQuestion = "Full research question text",
+        keyMethodology = "Full key methodology text",
+        coreContributions = "Full core contributions text",
+        redTeamCritique = "Full red team critique",
+        blueTeamVerification = "Full blue team defense",
+        mathAuditReport = "Full math audit",
+        codeAuditReport = "Full code audit",
+        editorNote = "Full editor note",
+        copyeditSuggestions = "Full copyedit suggestions",
+        reviewerQuestions = "Full reviewer questions",
+        formattedDossier = "Full formatted dossier"
+      )
+      repo.cacheReviewOffline(fullReview, ownerScope = owner)
+
+      // Simulate partial cloud hydration failure (all 12 narrative fields empty, same checksum, TEMPORARILY_UNAVAILABLE)
+      val degradedIncoming = PaperReview(
+        id = "rev_12_fields",
+        userId = owner,
+        title = "Complete 12-Field Narrative Dossier",
+        ledgerLoadState = LedgerLoadState.TEMPORARILY_UNAVAILABLE,
+        narrativeChunkCount = 2,
+        narrativeChecksum = checksum
+      )
+      repo.cacheReviewsOffline(listOf(degradedIncoming), ownerScope = owner)
+      val recovered = repo.getCachedReviewsOnce(owner).first()
+      assertEquals(LedgerLoadState.COMPLETE, recovered.ledgerLoadState)
+      assertEquals("Full abstract summary text", recovered.abstractSummary)
+      assertEquals("Full research question text", recovered.researchQuestion)
+      assertEquals("Full key methodology text", recovered.keyMethodology)
+      assertEquals("Full core contributions text", recovered.coreContributions)
+      assertEquals("Full copyedit suggestions", recovered.copyeditSuggestions)
+      assertEquals("Full reviewer questions", recovered.reviewerQuestions)
+      assertEquals("Full red team critique", recovered.redTeamCritique)
+      assertEquals("Full formatted dossier", recovered.formattedDossier)
+
+      // If checksum mismatches (cloud updated to a new version whose narrative failed to hydrate),
+      // MUST NOT silently overwrite with stale cached narrative!
+      val mismatchedIncoming = PaperReview(
+        id = "rev_12_fields",
+        userId = owner,
+        title = "Complete 12-Field Narrative Dossier",
+        ledgerLoadState = LedgerLoadState.TEMPORARILY_UNAVAILABLE,
+        narrativeChunkCount = 2,
+        narrativeChecksum = "different_checksum_v2"
+      )
+      repo.cacheReviewsOffline(listOf(mismatchedIncoming), ownerScope = owner)
+      val notOverwritten = repo.getCachedReviewsOnce(owner).first()
+      assertEquals(LedgerLoadState.TEMPORARILY_UNAVAILABLE, notOverwritten.ledgerLoadState)
+      assertEquals("", notOverwritten.abstractSummary)
+    } finally {
+      db.close()
+    }
+  }
+
+  @Test
+  fun auditV2_08_contentBoundRemoteConsent_blocksExecutionUntilConfirmedAndInvalidatesOnAnyContentEdit() = runBlocking {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val db = Room.inMemoryDatabaseBuilder(context, PaperCriticSqlDatabase::class.java)
+      .allowMainThreadQueries()
+      .build()
+    try {
+      val vm = buildTestViewModel(context, db, initialUserId = "uid_consent_gate")
+      vm.updateSettings { it.copy(confidentialLocalOnly = true) }
+      vm.updateManuscriptText("Draft 1 manuscript text with clinical RCT results HR = 0.78 (95% CI 0.64 to 0.95).")
+
+      // 1. Without consent, consent is invalid and runAdversarialReviewAndSave is blocked!
+      assertFalse(vm.isRemoteInferenceConsentValidNow())
+      vm.runAdversarialReviewAndSave()
+      val blockedState = vm.pipelineState.value as? PipelineExecutionState.Error
+      assertTrue(
+        "Execution must be blocked at ViewModel boundary without content-bound consent (got: ${vm.pipelineState.value})",
+        blockedState != null && blockedState.message.contains("remote ai inference", ignoreCase = true)
+      )
+
+      // 2. Confirming consent binds to exact SHA-256 of manuscript + code + provider
+      vm.confirmRemoteInferenceForCurrentDraft()
+      assertTrue("Consent must be valid for the exact confirmed draft", vm.isRemoteInferenceConsentValidNow())
+
+      // 3. Editing even 1 character of manuscript invalidates consent immediately!
+      vm.updateManuscriptText("Draft 1 manuscript text with clinical RCT results HR = 0.78 (95% CI 0.64 to 0.96).")
+      assertFalse("Any manuscript edit must invalidate prior remote inference consent", vm.isRemoteInferenceConsentValidNow())
+
+      // 4. Re-confirm, then edit replication code -> invalidates consent!
+      vm.confirmRemoteInferenceForCurrentDraft()
+      assertTrue(vm.isRemoteInferenceConsentValidNow())
+      vm.updateReplicationCodeText("x = 42\n")
+      assertFalse("Attaching or editing replication code must invalidate prior consent", vm.isRemoteInferenceConsentValidNow())
+    } finally {
+      db.close()
+    }
+  }
+
+  @Test
+  fun auditV2_09_atomicFirestoreDeletion_usesSingleBatchUpTo499ChildrenAndTombstoneOnlyAbove499() {
+    assertEquals(499, ReviewRepository.MAX_SINGLE_BATCH_CHILD_DELETES)
+    assertTrue("Supported records (<=499 child docs) must delete atomically in 1 batch", 499 <= ReviewRepository.MAX_SINGLE_BATCH_CHILD_DELETES)
+    assertFalse("Oversized legacy records (>499 child docs) require tombstone fallback", 500 <= ReviewRepository.MAX_SINGLE_BATCH_CHILD_DELETES)
+  }
+
+  @Test
+  fun auditV2_10_clinicalGradeScreen_checksClinicalDecisionThresholds_rejectsRegistrationOnlyPubBias_andFramesHonestly() {
+    // 1. N = 150 with wide CI crossing clinical decision threshold 0.75 (0.50 to 0.99, ratio 1.98 > 1.8)
+    //    AND protocol registration NCT05001122 WITHOUT formal funnel/Egger publication bias assessment
+    val rctRegistrationOnly = """
+      [PAGE 1]
+      A Double-Blind Randomized Controlled Trial of Therapy Y vs Placebo in Chronic Heart Failure
+      Methods: Prospectively registered (NCT05001122). Centralized concealed allocation randomized 150 patients 1:1 (n = 75 vs n = 75) with double-blind outcome adjudication and low risk of bias.
+      Results: All-cause mortality HR = 0.70 (95% CI 0.50 to 0.99, p = 0.044).
+    """.trimIndent()
+    val forensics = ManuscriptForensicEngine.analyzeManuscript(
+      text = rctRegistrationOnly,
+      isEmpiricalTrack = true,
+      replicationCode = "",
+      coverageReport = DocumentCoverageReport.forCompleteText(rctRegistrationOnly)
+    )
+    val screen = Reviewer2PipelineService.evaluateClinicalGradeCertainty(
+      manuscriptText = rctRegistrationOnly,
+      forensicReport = forensics,
+      adjudicatedFindings = emptyList(),
+      extractionConfidence = 5
+    )
+    assertEquals(
+      "Protocol registration alone must NEVER earn NOT_SERIOUS for publication bias",
+      Reviewer2PipelineService.Companion.GradeDomainConcern.NOT_ASSESSABLE,
+      screen.publicationBias
+    )
+    assertEquals(
+      "CI crossing 0.75 appreciable-benefit threshold with width ratio 1.98 must be rated SERIOUS imprecision, never NOT_SERIOUS",
+      Reviewer2PipelineService.Companion.GradeDomainConcern.SERIOUS,
+      screen.imprecision
+    )
+    assertNotEquals("HIGH_CERTAINTY", screen.verdictEnum)
+    assertTrue(
+      "Scope label must honestly frame output as an automated preliminary clinical certainty screen",
+      screen.assessmentScopeLabel.contains("Preliminary", ignoreCase = true)
+    )
+    assertTrue(screen.toSummaryBlock().contains("Automated Preliminary Clinical Certainty Screen"))
+  }
+
+  @Test
+  fun auditV2_14_geometryAwarePdfVerification_passesCleanExportsAndCatchesOverlapsOutOfBoundsAndCellOverflow() {
+    // 1. Clean export with long title, Unicode math, and wrapped table passes geometry verification
+    val richReview = PaperReview(
+      id = "geom_clean_1",
+      title = "A Very Long Multi-Line Title Evaluating Bayesian Hierarchical Survival Models (χ² = 12.4, I² = 18%, α = 0.05) Across Multi-Center Randomized Cohorts",
+      authors = "A. Researcher, B. Biostatistician",
+      publicationYear = "2026",
+      venueOrCitation = "Journal of Clinical Methodology",
+      verdict = "SOUND_WITH_CAVEATS",
+      credibilityScore = 78L,
+      methodologyScore = 8,
+      clarityScore = 8,
+      significanceScore = 8,
+      originalityScore = 7,
+      mathRigorScore = 8,
+      reproducibilityScore = 8,
+      abstractSummary = "Primary outcome HR = 0.78 (95% CI 0.65 to 0.93, p = 0.006) across N = 1,240 patients.",
+      redTeamCritique = "Minor caveat regarding subgroup heterogeneity in secondary endpoints.",
+      editorNote = "Manuscript is well-structured with transparent sensitivity analyses."
+    )
+    val rendered = PdfReportExporter.renderAndInspectPdf(
+      review = richReview,
+      scope = PdfExportScope.SCIENTIFIC_APPRAISAL_REPORT,
+      requireByteExtraction = false
+    )
+    assertTrue(
+      "Clean report must have zero geometry issues (found: ${rendered.diagnostics.geometryIssues})",
+      rendered.diagnostics.geometryClean
+    )
+    assertTrue("Geometry recorder must inspect rendered blocks", rendered.diagnostics.geometryBlocksChecked > 0)
+
+    // 2. Synthetic geometry violations (vertical overlap, margin out-of-bounds, header collision, cell overflow) MUST fail!
+    val badRecorder = PdfLayoutGeometryRecorder()
+    badRecorder.recordHeaderBand(pageNumber = 2, bottomY = 33f)
+    badRecorder.recordFooterBand(pageNumber = 2, topY = 808f)
+    badRecorder.recordBodyBlock(pageNumber = 2, kind = "paragraph", left = 40f, top = 20f, right = 555f, bottom = 80f) // collides with header!
+    badRecorder.recordBodyBlock(pageNumber = 2, kind = "paragraph", left = 40f, top = 70f, right = 610f, bottom = 120f) // overlaps prev + exceeds right margin!
+    badRecorder.recordTableCell(pageNumber = 2, rowTop = 140f, rowBottom = 160f, cellLeft = 40f, cellRight = 200f, measuredTextHeight = 45f, padV = 4f, maxPageRight = 555f)
+    val badReport = badRecorder.verify()
+    assertFalse("Synthetic geometry violations must fail verification", badReport.isGeometryClean)
+    assertTrue(badReport.overlapDetected)
+    assertTrue(badReport.outOfBoundsDetected)
+    assertTrue(badReport.headerFooterCollisionDetected)
+    assertTrue(badReport.tableCellOverflowDetected)
+  }
+
+  @Test
+  fun auditV2_13_expanded12ManuscriptCalibrationAndAdjudicationBenchmark_reportsPrecisionRecallFprAndWilsonCIs() {
+    data class BenchmarkManuscript(
+      val id: String,
+      val design: String,
+      val isFlawedPositiveControl: Boolean,
+      val text: String,
+      val candidateFindingForAdjudication: ReviewFinding,
+      val expectedFindingVerified: Boolean
+    )
+
+    val corpus = listOf(
+      // --- 6 CLEAN NEGATIVE CONTROLS (across 6 designs) ---
+      BenchmarkManuscript(
+        id = "CLEAN_RCT",
+        design = "RCT",
+        isFlawedPositiveControl = false,
+        text = """
+          [PAGE 1]
+          Multi-Center Double-Blind Randomized Controlled Trial of Drug A vs Placebo
+          Abstract: We randomized 800 adults 1:1 to Drug A or placebo.
+          Methods: Prospectively registered (NCT06110001). Centralized concealed allocation randomized 800 patients (400 Drug A, 400 placebo). Double-blind outcome adjudication and intention-to-treat analysis were performed. Sensitivity analysis for missing outcome data was conducted using multiple imputation in Table 3.
+          Results: All-cause mortality occurred in 32/400 (8.0%) vs 56/400 (14.0%), HR = 0.56 (95% CI 0.36 to 0.87, p = 0.010).
+        """.trimIndent(),
+        candidateFindingForAdjudication = ReviewFinding(
+          id = "C-01",
+          title = "Missing sensitivity analysis",
+          allegation = "Authors did not perform sensitivity analysis for missing outcome data.",
+          severity = "MAJOR",
+          status = FindingStatus.VERIFIED
+        ),
+        expectedFindingVerified = false
+      ),
+      BenchmarkManuscript(
+        id = "CLEAN_COHORT",
+        design = "Observational Cohort",
+        isFlawedPositiveControl = false,
+        text = """
+          [PAGE 1]
+          Prospective Cohort Study of Antihypertensive Adherence and Stroke Risk
+          Methods: We enrolled 2,400 adults followed for 5 years. Multivariable Cox regression adjusted for age, sex, smoking, blood pressure, and diabetes was combined with propensity score weighting.
+          Results: Adjusted HR = 0.78 (95% CI 0.65 to 0.94, p = 0.009).
+        """.trimIndent(),
+        candidateFindingForAdjudication = ReviewFinding(
+          id = "C-02",
+          title = "Unadjusted observational analysis",
+          allegation = "Study failed to adjust for confounding factors in the observational cohort.",
+          severity = "MAJOR",
+          status = FindingStatus.VERIFIED
+        ),
+        expectedFindingVerified = false
+      ),
+      BenchmarkManuscript(
+        id = "CLEAN_META",
+        design = "Meta-Analysis",
+        isFlawedPositiveControl = false,
+        text = """
+          [PAGE 1]
+          Systematic Review and Meta-Analysis of Randomized Trials of Beta-Blockers
+          Methods: Following PRISMA guidelines, we pooled 4 randomized controlled trials using DerSimonian-Laird random-effects models. Risk of bias was low on RoB 2. Funnel plot showed no asymmetry (Egger's test p = 0.54).
+          Results:
+          Smith (2020): OR = 0.72 (95% CI 0.56 to 0.93)
+          Jones (2021): OR = 0.75 (95% CI 0.58 to 0.97)
+          Lee (2022): OR = 0.70 (95% CI 0.52 to 0.94)
+          Patel (2023): OR = 0.74 (95% CI 0.57 to 0.96)
+          Pooled OR = 0.73 (95% CI 0.64 to 0.83, I² = 0%, p < 0.001).
+        """.trimIndent(),
+        candidateFindingForAdjudication = ReviewFinding(
+          id = "C-03",
+          title = "No heterogeneity or publication bias assessment",
+          allegation = "Meta-analysis omitted heterogeneity and funnel plot publication bias assessment.",
+          severity = "MAJOR",
+          status = FindingStatus.VERIFIED
+        ),
+        expectedFindingVerified = false
+      ),
+      BenchmarkManuscript(
+        id = "CLEAN_DIAGNOSTIC",
+        design = "Diagnostic Accuracy",
+        isFlawedPositiveControl = false,
+        text = """
+          [PAGE 1]
+          Diagnostic Accuracy of High-Sensitivity Troponin Assay for Myocardial Infarction
+          Methods: Prospective consecutive cohort of 420 emergency department patients using blinded reference standard angiography (STARD compliant).
+          Results: Sensitivity was 92.0% (92/100) and specificity was 87.5% (280/320), AUROC = 0.93 (95% CI 0.90 to 0.96).
+        """.trimIndent(),
+        candidateFindingForAdjudication = ReviewFinding(
+          id = "C-04",
+          title = "Unblinded reference standard",
+          allegation = "Reference standard interpretation was unblinded to index test results.",
+          severity = "MAJOR",
+          status = FindingStatus.VERIFIED
+        ),
+        expectedFindingVerified = false
+      ),
+      BenchmarkManuscript(
+        id = "CLEAN_SURVIVAL",
+        design = "Survival Analysis",
+        isFlawedPositiveControl = false,
+        text = """
+          [PAGE 1]
+          Long-Term Survival Following Transcatheter Valve Replacement
+          Methods: Kaplan-Meier curves and multivariable Cox proportional hazards regression were evaluated in 1,100 patients. Proportional hazards assumption was tested via Schoenfeld residuals (p = 0.42).
+          Results: 5-year survival HR = 0.81 (95% CI 0.69 to 0.95, p = 0.011).
+        """.trimIndent(),
+        candidateFindingForAdjudication = ReviewFinding(
+          id = "C-05",
+          title = "Proportional hazards not tested",
+          allegation = "Authors did not test the proportional hazards assumption for Cox regression.",
+          severity = "MAJOR",
+          status = FindingStatus.VERIFIED
+        ),
+        expectedFindingVerified = false
+      ),
+      BenchmarkManuscript(
+        id = "CLEAN_ML",
+        design = "Clinical ML Prediction",
+        isFlawedPositiveControl = false,
+        text = """
+          [PAGE 1]
+          External Validation of a Gradient-Boosted Sepsis Prediction Model
+          Methods: Training split (n = 3,200) and held-out external validation cohort (n = 1,400) from an independent hospital were separated prior to feature preprocessing and scaling. Calibration slope = 0.98 and Brier score = 0.11.
+          Results: External validation AUROC = 0.86 (95% CI 0.83 to 0.89).
+        """.trimIndent(),
+        candidateFindingForAdjudication = ReviewFinding(
+          id = "C-06",
+          title = "No external validation",
+          allegation = "Prediction model lacked external validation and calibration metrics.",
+          severity = "MAJOR",
+          status = FindingStatus.VERIFIED
+        ),
+        expectedFindingVerified = false
+      ),
+      // --- 6 FLAWED POSITIVE CONTROLS (across 6 designs) ---
+      BenchmarkManuscript(
+        id = "FLAW_RCT_IMPOSSIBLE_CI",
+        design = "RCT",
+        isFlawedPositiveControl = true,
+        text = """
+          [PAGE 1]
+          Randomized Controlled Trial of Agent K vs Standard Care
+          Methods: Total of 100 patients were enrolled and randomized. 18 patients were lost to follow-up, leaving 97 patients in the primary analysis.
+          Results: Mortality OR = 3.20 (95% CI 0.85 to 1.45, p = 0.004).
+        """.trimIndent(),
+        candidateFindingForAdjudication = ReviewFinding(
+          id = "F-01",
+          title = "Point estimate outside confidence interval",
+          allegation = "Mortality OR = 3.20 falls outside its reported 95% CI 0.85 to 1.45.",
+          severity = "CRITICAL",
+          status = FindingStatus.VERIFIED,
+          supportingEvidence = listOf(
+            EvidenceAnchor(exactQuote = "Mortality OR = 3.20 (95% CI 0.85 to 1.45, p = 0.004).", pageNumber = 1, section = "Results")
+          )
+        ),
+        expectedFindingVerified = true
+      ),
+      BenchmarkManuscript(
+        id = "FLAW_COHORT_IMPOSSIBLE_T_P",
+        design = "Observational Cohort",
+        isFlawedPositiveControl = true,
+        text = """
+          [PAGE 1]
+          Observational Cohort Study of Dietary Sodium and Blood Pressure
+          Methods: Retrospective cohort of 120 adults analyzed with two-sided t-tests.
+          Results: Blood pressure difference t(118) = 0.45, p = 0.001 between high and low sodium groups.
+        """.trimIndent(),
+        candidateFindingForAdjudication = ReviewFinding(
+          id = "F-02",
+          title = "Incompatible t-statistic and p-value",
+          allegation = "Reported t(118) = 0.45 is mathematically incompatible with p = 0.001.",
+          severity = "CRITICAL",
+          status = FindingStatus.VERIFIED,
+          supportingEvidence = listOf(
+            EvidenceAnchor(exactQuote = "Blood pressure difference t(118) = 0.45, p = 0.001 between high and low sodium groups.", pageNumber = 1, section = "Results")
+          )
+        ),
+        expectedFindingVerified = true
+      ),
+      BenchmarkManuscript(
+        id = "FLAW_META_CI_ORDER",
+        design = "Meta-Analysis",
+        isFlawedPositiveControl = true,
+        text = """
+          [PAGE 1]
+          Systematic Review and Meta-Analysis of Intervention P
+          Methods: Random-effects meta-analysis pooling 14 clinical studies.
+          Results: Pooled RR = 0.72 (95% CI 1.15 to 0.48, p = 0.02) across included studies.
+        """.trimIndent(),
+        candidateFindingForAdjudication = ReviewFinding(
+          id = "F-03",
+          title = "Inverted confidence interval bounds",
+          allegation = "Pooled RR = 0.72 reports inverted 95% CI 1.15 to 0.48.",
+          severity = "CRITICAL",
+          status = FindingStatus.VERIFIED,
+          supportingEvidence = listOf(
+            EvidenceAnchor(exactQuote = "Pooled RR = 0.72 (95% CI 1.15 to 0.48, p = 0.02) across included studies.", pageNumber = 1, section = "Results")
+          )
+        ),
+        expectedFindingVerified = true
+      ),
+      BenchmarkManuscript(
+        id = "FLAW_DIAGNOSTIC_2X2_PCT",
+        design = "Diagnostic Accuracy",
+        isFlawedPositiveControl = true,
+        text = """
+          [PAGE 1]
+          Diagnostic Accuracy of Biomarker M for Sepsis
+          Methods: Cross-sectional diagnostic study of 200 emergency patients.
+          Results: Positive rate was 18/100 (45.0%) in cases versus 10/100 (10.0%) in controls; OR = 4.50 (95% CI 5.10 to 6.20, p = 0.001).
+        """.trimIndent(),
+        candidateFindingForAdjudication = ReviewFinding(
+          id = "F-04",
+          title = "Proportion and CI arithmetic errors",
+          allegation = "Positive rate 18/100 is reported as 45.0% and OR = 4.50 lies outside 95% CI 5.10 to 6.20.",
+          severity = "CRITICAL",
+          status = FindingStatus.VERIFIED,
+          supportingEvidence = listOf(
+            EvidenceAnchor(exactQuote = "Positive rate was 18/100 (45.0%) in cases versus 10/100 (10.0%) in controls; OR = 4.50 (95% CI 5.10 to 6.20, p = 0.001).", pageNumber = 1, section = "Results")
+          )
+        ),
+        expectedFindingVerified = true
+      ),
+      BenchmarkManuscript(
+        id = "FLAW_SURVIVAL_HR_OUTSIDE_CI",
+        design = "Survival Analysis",
+        isFlawedPositiveControl = true,
+        text = """
+          [PAGE 1]
+          Survival Analysis of Adjuvant Chemotherapy in Stage III Cancer
+          Methods: Cox proportional hazards regression in 340 oncology patients.
+          Results: Overall survival HR = 2.10 (95% CI 1.15 to 1.85, p = 0.03).
+        """.trimIndent(),
+        candidateFindingForAdjudication = ReviewFinding(
+          id = "F-05",
+          title = "Hazard ratio outside confidence interval",
+          allegation = "Overall survival HR = 2.10 falls outside its reported 95% CI 1.15 to 1.85.",
+          severity = "CRITICAL",
+          status = FindingStatus.VERIFIED,
+          supportingEvidence = listOf(
+            EvidenceAnchor(exactQuote = "Overall survival HR = 2.10 (95% CI 1.15 to 1.85, p = 0.03).", pageNumber = 1, section = "Results")
+          )
+        ),
+        expectedFindingVerified = true
+      ),
+      BenchmarkManuscript(
+        id = "FLAW_ML_SUBGROUP_DRIFT",
+        design = "Clinical ML Prediction",
+        isFlawedPositiveControl = true,
+        text = """
+          [PAGE 1]
+          Machine Learning Readmission Classifier in 250 Hospitalized Adults
+          Methods: Total N = 250 patients were analyzed; training subgroup (n = 310) was used for feature selection.
+          Results: Reported odds ratio OR = 2.40 (95% CI 3.10 to 4.80, p = 0.002).
+        """.trimIndent(),
+        candidateFindingForAdjudication = ReviewFinding(
+          id = "F-06",
+          title = "Impossible OR outside CI",
+          allegation = "Reported odds ratio OR = 2.40 falls outside its 95% CI 3.10 to 4.80.",
+          severity = "CRITICAL",
+          status = FindingStatus.VERIFIED,
+          supportingEvidence = listOf(
+            EvidenceAnchor(exactQuote = "Reported odds ratio OR = 2.40 (95% CI 3.10 to 4.80, p = 0.002).", pageNumber = 1, section = "Results")
+          )
+        ),
+        expectedFindingVerified = true
+      )
+    )
+
+    fun wilsonCi95(successes: Int, total: Int): Pair<Double, Double> {
+      if (total <= 0) return 0.0 to 1.0
+      val z = 1.95996398454
+      val p = successes.toDouble() / total.toDouble()
+      val denom = 1.0 + (z * z) / total
+      val center = (p + (z * z) / (2.0 * total)) / denom
+      val margin = (z * kotlin.math.sqrt((p * (1.0 - p) + (z * z) / (4.0 * total)) / total)) / denom
+      return (center - margin).coerceIn(0.0, 1.0) to (center + margin).coerceIn(0.0, 1.0)
+    }
+
+    var tp = 0
+    var fp = 0
+    var tn = 0
+    var fn = 0
+    var adjCorrect = 0
+
+    for (item in corpus) {
+      val report = ManuscriptForensicEngine.analyzeManuscript(
+        text = item.text,
+        isEmpiricalTrack = true,
+        replicationCode = "",
+        coverageReport = DocumentCoverageReport.forCompleteText(item.text)
+      )
+      val audit = report.quantForensics?.statisticalAudit
+      val detectedCritical = ((audit?.verifiedArithmeticErrorCount ?: 0) +
+        (audit?.verifiedContradictionCount ?: 0) +
+        (audit?.reconstructions?.count { it.status == QuantFindingStatus.FAIL } ?: 0)) > 0
+
+      if (item.isFlawedPositiveControl) {
+        if (detectedCritical) tp++ else fn++
+      } else {
+        if (detectedCritical) fp++ else tn++
+      }
+
+      // Adjudicate candidate finding against full manuscript text
+      val adj = BidirectionalAdjudicator.adjudicate(
+        findings = listOf(item.candidateFindingForAdjudication),
+        manuscriptText = item.text,
+        epistemicReport = null
+      ).findings.first()
+      val actuallyVerified = adj.status == FindingStatus.VERIFIED
+      if (actuallyVerified == item.expectedFindingVerified) adjCorrect++
+    }
+
+    val precision = if (tp + fp > 0) tp.toDouble() / (tp + fp) else 0.0
+    val recall = if (tp + fn > 0) tp.toDouble() / (tp + fn) else 0.0
+    val fpr = if (fp + tn > 0) fp.toDouble() / (fp + tn) else 0.0
+    val adjAcc = adjCorrect.toDouble() / corpus.size
+    val recallCi = wilsonCi95(tp, tp + fn)
+    val adjCi = wilsonCi95(adjCorrect, corpus.size)
+
+    // Controlled synthetic benchmark assertions (explicitly scoped to deterministic engine + adjudicator;
+    // NOT a claim of general real-world peer-review accuracy across uncurated papers).
+    assertEquals("All 6 positive controls across 6 designs must be detected (TP=6, FN=$fn)", 6, tp)
+    assertEquals("All 6 clean negative controls across 6 designs must have 0 false critical errors (FP=$fp)", 0, fp)
+    assertEquals("Precision on controlled 12-manuscript benchmark", 1.0, precision, 1e-6)
+    assertEquals("Recall on controlled 12-manuscript benchmark", 1.0, recall, 1e-6)
+    assertEquals("False positive rate on controlled 12-manuscript benchmark", 0.0, fpr, 1e-6)
+    assertTrue("Adjudication accuracy must be >= 90% (got $adjAcc, 95% Wilson CI ${adjCi.first}..${adjCi.second})", adjAcc >= 0.90)
+    assertTrue("Wilson 95% CI lower bound for recall must be finite and valid", recallCi.first in 0.5..1.0)
   }
 }

@@ -188,18 +188,22 @@ class LocalReviewRepository(private val sqlDao: PaperCriticSqlDao) {
     val preservedGrounding = searchGroundingReport.ifBlank { existing?.searchGroundingReport.orEmpty() }
     val incomingUpdatedMs = incoming.updatedAt?.toDate()?.time ?: 0L
 
-    // 1. Protect intact local structured findings if incoming cloud snapshot failed chunk hydration
+    // 1. Protect intact local structured findings if incoming cloud snapshot failed transient chunk hydration
+    //    (NEVER paper over a cloud-verified CORRUPT checksum failure — keep CORRUPT visible!)
     var safeReview = if (
       existing != null &&
       existing.structuredFindingsJson.isNotBlank() &&
+      existing.ledgerLoadState == LedgerLoadState.COMPLETE.name &&
+      incoming.ledgerLoadState != LedgerLoadState.CORRUPT &&
       ((incoming.findingsChunkCount > 0 && incoming.structuredFindingsJson.isBlank()) ||
-        incoming.ledgerLoadState != LedgerLoadState.COMPLETE) &&
+        incoming.ledgerLoadState == LedgerLoadState.TEMPORARILY_UNAVAILABLE) &&
       (incoming.findingsChecksum.isBlank() ||
         existing.findingsChecksum.isBlank() ||
         incoming.findingsChecksum == existing.findingsChecksum)
     ) {
       incoming.copy(
         structuredFindingsJson = existing.structuredFindingsJson,
+        validationStatus = existing.validationStatus,
         ledgerLoadState = LedgerLoadState.COMPLETE
       )
     } else {
@@ -207,7 +211,10 @@ class LocalReviewRepository(private val sqlDao: PaperCriticSqlDao) {
     }
 
     // 2. Protect intact local narrative sections if incoming cloud snapshot has shorter truncated fields
-    if (existing != null && incoming.narrativeChunkCount > 0 && incoming.ledgerLoadState != LedgerLoadState.COMPLETE) {
+    if (existing != null &&
+      incoming.narrativeChunkCount > 0 &&
+      incoming.ledgerLoadState == LedgerLoadState.TEMPORARILY_UNAVAILABLE
+    ) {
       safeReview = safeReview.copy(
         redTeamCritique = if (existing.redTeamCritique.length > safeReview.redTeamCritique.length) existing.redTeamCritique else safeReview.redTeamCritique,
         blueTeamVerification = if (existing.blueTeamVerification.length > safeReview.blueTeamVerification.length) existing.blueTeamVerification else safeReview.blueTeamVerification,
@@ -228,11 +235,11 @@ class LocalReviewRepository(private val sqlDao: PaperCriticSqlDao) {
         (existing.localAnnotationUpdatedAtMs > 0L && incomingUpdatedMs in 1L until existing.localAnnotationUpdatedAtMs)
       )
 
-    if (keepLocalBookmark && existing != null) {
-      safeReview = safeReview.copy(bookmarked = existing.bookmarked)
+    if (keepLocalBookmark) {
+      safeReview = safeReview.copy(bookmarked = existing!!.bookmarked)
     }
-    if (keepLocalNotes && existing != null) {
-      safeReview = safeReview.copy(personalNotes = existing.personalNotes)
+    if (keepLocalNotes) {
+      safeReview = safeReview.copy(personalNotes = existing!!.personalNotes)
     }
 
     return SqlReviewCacheEntity.fromPaperReview(

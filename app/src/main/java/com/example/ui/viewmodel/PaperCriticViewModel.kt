@@ -304,9 +304,35 @@ class PaperCriticViewModel(
       if (!uid.isNullOrBlank()) {
         repository.observeReviews(uid)
           .onEach { cloudList ->
+            val snapSession = sessionGeneration.get()
             if (_authenticatedUserId.value == uid) {
               runSuspendCatching {
                 localRepository.cacheReviewsOffline(cloudList, ownerScope = uid)
+              }
+              // P1-03: Automatically flush pending offline dirty annotations when cloud connectivity resumes
+              if (!_settingsState.value.confidentialLocalOnly &&
+                canCommitInferenceResult(uid, snapSession, currentOwnerScope(), sessionGeneration.get())
+              ) {
+                runSuspendCatching {
+                  val dirtyRows = localRepository.getDirtyAnnotationReviews(uid)
+                  for (dirty in dirtyRows) {
+                    if (!canCommitInferenceResult(uid, snapSession, currentOwnerScope(), sessionGeneration.get())) break
+                    val isCloudDoc = dirty.id.isNotBlank() &&
+                      !dirty.id.startsWith("local_") &&
+                      !dirty.id.startsWith("sql_")
+                    if (!isCloudDoc) continue
+                    if (dirty.bookmarkDirty) {
+                      if (repository.updateBookmark(dirty.id, dirty.bookmarked, expectedUserId = uid).isSuccess) {
+                        localRepository.clearBookmarkDirty(dirty.id, uid)
+                      }
+                    }
+                    if (dirty.personalNotesDirty) {
+                      if (repository.updatePersonalNotes(dirty.id, dirty.personalNotes, expectedUserId = uid).isSuccess) {
+                        localRepository.clearPersonalNotesDirty(dirty.id, uid)
+                      }
+                    }
+                  }
+                }
               }
             }
           }
@@ -360,12 +386,23 @@ class PaperCriticViewModel(
         val scopedCloud = cloudState.reviews
           .filter(::belongsToActiveAccount)
           .map { cloudReview ->
-            // Preserve local merged annotations (dirty offline notes/bookmarks) while surfacing cloud ledger state
+            // Preserve local merged annotations (dirty offline notes/bookmarks) and intact local ledger
+            // when a transient hydration failure occurs (NEVER mask CORRUPT cloud ledgers).
             val localCached = sqlById[cloudReview.id]
             if (localCached != null) {
+              val restoreIntactLocalLedger =
+                cloudReview.ledgerLoadState == LedgerLoadState.TEMPORARILY_UNAVAILABLE &&
+                  localCached.ledgerLoadState == LedgerLoadState.COMPLETE &&
+                  localCached.structuredFindingsJson.isNotBlank() &&
+                  (cloudReview.findingsChecksum.isBlank() ||
+                    localCached.findingsChecksum.isBlank() ||
+                    cloudReview.findingsChecksum == localCached.findingsChecksum)
               cloudReview.copy(
                 bookmarked = localCached.bookmarked,
-                personalNotes = localCached.personalNotes
+                personalNotes = localCached.personalNotes,
+                structuredFindingsJson = if (restoreIntactLocalLedger) localCached.structuredFindingsJson else cloudReview.structuredFindingsJson,
+                validationStatus = if (restoreIntactLocalLedger) localCached.validationStatus else cloudReview.validationStatus,
+                ledgerLoadState = if (restoreIntactLocalLedger) LedgerLoadState.COMPLETE else cloudReview.ledgerLoadState
               )
             } else {
               cloudReview
@@ -1150,8 +1187,8 @@ class PaperCriticViewModel(
 
         val scopedReview = generatedReview.copy(userId = initiatingUid.orEmpty())
         val shouldSyncCloud = !settings.confidentialLocalOnly && settings.autoSaveToCloud && initiatingUid != null
-        val finalReview = if (shouldSyncCloud && initiatingUid != null) {
-          val saveResult = repository.createReview(scopedReview, expectedUserId = initiatingUid)
+        val finalReview = if (shouldSyncCloud) {
+          val saveResult = repository.createReview(scopedReview, expectedUserId = initiatingUid!!)
           if (!canCommitInferenceResult(initiatingOwnerScope, initiatingSessionGen, currentOwnerScope(), sessionGeneration.get())) {
             return@launch
           }

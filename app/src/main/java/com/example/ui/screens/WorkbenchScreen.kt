@@ -37,15 +37,19 @@ import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.UploadFile
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -116,8 +120,56 @@ fun WorkbenchScreen(
   onImportReplicationCodeUri: (Uri) -> Unit = {},
   onRunPipeline: () -> Unit,
   onCancelPipeline: () -> Unit = {},
-  onOpenCompletedDossier: (PaperReview) -> Unit
+  onOpenCompletedDossier: (PaperReview) -> Unit,
+  confidentialLocalOnly: Boolean = false,
+  activeAiProviderSummary: String = "Firebase Gemini (Cloud AI)"
 ) {
+  var remoteInferenceConfirmed by remember(
+    confidentialLocalOnly,
+    activeAiProviderSummary,
+    formState.importedFileName,
+    formState.title
+  ) { mutableStateOf(false) }
+  var showConfidentialProviderDialog by remember { mutableStateOf(false) }
+  val triggerRunPipeline: () -> Unit = {
+    if (confidentialLocalOnly && !remoteInferenceConfirmed) {
+      showConfidentialProviderDialog = true
+    } else {
+      onRunPipeline()
+    }
+  }
+
+  if (showConfidentialProviderDialog) {
+    AlertDialog(
+      onDismissRequest = { showConfidentialProviderDialog = false },
+      title = { Text("Confirm Remote AI Inference Provider") },
+      text = {
+        Text(
+          "Local-Only Report Storage keeps your generated review dossier strictly on-device in Room SQLite (no Firestore upload), " +
+            "but AI appraisal still sends manuscript text to your selected remote AI provider:\n\n" +
+            "Active Provider: $activeAiProviderSummary\n\n" +
+            "Confirm that you are authorized to transmit this manuscript to $activeAiProviderSummary, or change your provider in Settings → AI Engine."
+        )
+      },
+      confirmButton = {
+        Button(
+          onClick = {
+            remoteInferenceConfirmed = true
+            showConfidentialProviderDialog = false
+            onRunPipeline()
+          },
+          modifier = Modifier.testTag("confirm_remote_provider_inference_button")
+        ) {
+          Text("Confirm & Run Analysis")
+        }
+      },
+      dismissButton = {
+        TextButton(onClick = { showConfidentialProviderDialog = false }) {
+          Text("Cancel")
+        }
+      }
+    )
+  }
   // Zero-permission Storage Access Framework launchers for PDF, Word (.docx/.doc), Text, and Replication Code
   val pdfPickerLauncher = rememberLauncherForActivityResult(
     contract = ActivityResultContracts.OpenDocument()
@@ -356,7 +408,7 @@ fun WorkbenchScreen(
               }
             )
             .clip(runPillShape)
-            .clickable(enabled = !isRunningNow) { onRunPipeline() }
+            .clickable(enabled = !isRunningNow) { triggerRunPipeline() }
             .padding(horizontal = 12.dp, vertical = 14.dp)
             .testTag("hero_quick_run_audit_button")
         ) {
@@ -1343,11 +1395,29 @@ fun WorkbenchScreen(
           PipelineExecutionState.Idle -> Unit
         }
 
+        if (confidentialLocalOnly) {
+          Surface(
+            color = CupertinoAmber.copy(alpha = 0.12f),
+            shape = SquircleShape(10.dp),
+            modifier = Modifier
+              .fillMaxWidth()
+              .testTag("confidential_local_only_inference_disclosure")
+          ) {
+            Text(
+              text = "Local-Only Storage active (reports stay on-device; zero Firestore upload). " +
+                "AI analysis still transmits manuscript text to: $activeAiProviderSummary.",
+              style = MaterialTheme.typography.labelSmall,
+              color = MaterialTheme.colorScheme.onSurface,
+              modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)
+            )
+          }
+        }
+
         IosSquircleButton(
           text = "Analyze Paper & Generate Review",
           icon = Icons.Default.Gavel,
           enabled = pipelineState !is PipelineExecutionState.Running,
-          onClick = onRunPipeline,
+          onClick = triggerRunPipeline,
           cornerRadius = 10.dp,
           modifier = Modifier
             .fillMaxWidth()

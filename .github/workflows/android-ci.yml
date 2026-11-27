@@ -36,16 +36,17 @@ jobs:
                 -dname "CN=Android Debug,O=Android,C=US"
             fi
           fi
+          chmod +x ./gradlew
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
       - name: Assemble Debug APK
-        run: gradle :app:assembleDebug --no-daemon
+        run: ./gradlew :app:assembleDebug --no-daemon
 
       - name: Run Local Unit & Robolectric Test Suites
         run: >
-          gradle :app:testDebugUnitTest --no-daemon
+          ./gradlew :app:testDebugUnitTest --no-daemon
           --tests "com.example.ExampleUnitTest"
           --tests "com.example.ExampleRobolectricTest"
           --tests "com.example.StatisticalAuditSubsystemTest"
@@ -56,7 +57,7 @@ jobs:
           --tests "com.example.EnterpriseAndScientificTruthGateTest"
 
       - name: Run Android Lint
-        run: gradle :app:lintDebug --no-daemon
+        run: ./gradlew :app:lintDebug --no-daemon
 
   firestore-rules-tests:
     runs-on: ubuntu-latest
@@ -64,7 +65,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up JDK 21 (for Firestore Emulator)
+      - name: Set up JDK 21 (for Firebase Emulators & Gradle)
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -75,8 +76,35 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Install Firestore Rules Test Dependencies
-        run: npm ci || npm install --no-audit --no-fund
+      - name: Provision debug.keystore and gradlew permissions
+        run: |
+          if [ ! -f debug.keystore ]; then
+            if [ -f debug.keystore.base64 ]; then
+              base64 -d debug.keystore.base64 > debug.keystore
+            else
+              keytool -genkeypair -v \
+                -keystore debug.keystore \
+                -storepass android \
+                -alias androiddebugkey \
+                -keypass android \
+                -keyalg RSA \
+                -keysize 2048 \
+                -validity 10000 \
+                -dname "CN=Android Debug,O=Android,C=US"
+            fi
+          fi
+          chmod +x ./gradlew
 
-      - name: Run Firestore Security Rules Emulator Suite
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Install Firestore Rules Test Runner Dependency
+        run: npm install --no-save --no-audit --no-fund @firebase/rules-unit-testing
+
+      - name: Run Firestore Security Rules Emulator Suite (Node)
         run: npx --yes firebase-tools emulators:exec --only firestore "node --test firestore.test.js"
+
+      - name: Run Android Repository Security Rules Suite (Auth + Firestore Emulators)
+        run: >
+          npx --yes firebase-tools emulators:exec --only auth,firestore
+          './gradlew :app:testDebugUnitTest --no-daemon --tests "com.example.data.repository.ReviewRepositoryRuleTest"'

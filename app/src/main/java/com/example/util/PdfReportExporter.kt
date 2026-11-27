@@ -18,6 +18,7 @@ import androidx.core.content.FileProvider
 import com.example.data.ai.epistemic.FlawSeverityTier
 import com.example.data.ai.epistemic.ReportingStatus
 import com.example.data.model.FindingStatus
+import com.example.data.model.LedgerLoadState
 import com.example.data.model.PaperReview
 import com.example.data.model.ReviewFinding
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
@@ -614,7 +615,8 @@ object PdfReportExporter {
     fun drawRunningHeader(targetCanvas: Canvas) {
       val headerY = 26f
       targetCanvas.drawText("${scope.shortLabel.uppercase(Locale.US)}  •  $runningTitle", MARGIN_H, headerY, headerFooterPaint)
-      val verdictTag = "$verdictUpper ($authoritativeScore/100)"
+      val scoreSuffix = if (rubric.isAssessed) "$authoritativeScore/100" else "Not Assessed"
+      val verdictTag = "$verdictUpper ($scoreSuffix)"
       val vw = headerFooterPaint.measureText(verdictTag)
       targetCanvas.drawText(verdictTag, PAGE_WIDTH - MARGIN_H - vw, headerY, headerFooterPaint)
       targetCanvas.drawLine(MARGIN_H, headerY + 7f, PAGE_WIDTH - MARGIN_H, headerY + 7f, dividerPaint)
@@ -1429,15 +1431,17 @@ object PdfReportExporter {
       verifiedQuoteCount == findings.size -> "All ${findings.size} quotes matched"
       else -> "$verifiedQuoteCount/${findings.size} quotes matched"
     }
-    val scientificVerificationLabel = when (review.validationStatus.uppercase(Locale.US)) {
-      "VERIFIED" -> "Source-Anchored & Entailed"
-      "ADJUDICATED_WITH_CAVEATS" -> "Adjudicated with Caveats"
-      "PARTIALLY_VALIDATED" -> "Partially Validated"
-      "PROVISIONAL" -> "Provisional / Incomplete Coverage"
+    val scientificVerificationLabel = when {
+      review.ledgerLoadState != LedgerLoadState.COMPLETE ->
+        "Evidence Ledger ${review.ledgerLoadState.name.replace('_', ' ')}"
+      review.validationStatus.equals("VERIFIED", ignoreCase = true) -> "Source-Anchored & Entailed"
+      review.validationStatus.equals("ADJUDICATED_WITH_CAVEATS", ignoreCase = true) -> "Adjudicated with Caveats"
+      review.validationStatus.equals("PARTIALLY_VALIDATED", ignoreCase = true) -> "Partially Validated"
+      review.validationStatus.equals("PROVISIONAL", ignoreCase = true) -> "Provisional / Incomplete Coverage"
       else -> "Legacy Unvalidated"
     }
     val editorialValidationLabel = when (review.validationStatus.uppercase(Locale.US)) {
-      "VERIFIED" -> "Editorial Gate Passed"
+      "VERIFIED" -> if (review.ledgerLoadState == LedgerLoadState.COMPLETE) "Editorial Gate Passed" else "Evidence Incomplete"
       "LEGACY_UNVALIDATED" -> "Legacy Unvalidated"
       else -> review.validationStatus.replace('_', ' ')
     }
@@ -1460,6 +1464,38 @@ object PdfReportExporter {
     covLayout.draw(canvas)
     canvas.restore()
     cursorY += covH + 9f
+
+    if (review.ledgerLoadState != LedgerLoadState.COMPLETE) {
+      val degradedTitle = when (review.ledgerLoadState) {
+        LedgerLoadState.CORRUPT -> "EVIDENCE LEDGER INTEGRITY WARNING — CORRUPT OR TAMPERED PAYLOAD"
+        LedgerLoadState.INCOMPLETE -> "EVIDENCE LEDGER INCOMPLETE — MISSING CLOUD CHUNKS"
+        LedgerLoadState.TEMPORARILY_UNAVAILABLE -> "EVIDENCE LEDGER TEMPORARILY UNAVAILABLE AT EXPORT TIME"
+        LedgerLoadState.COMPLETE -> ""
+      }
+      val degradedDetail = "One or more chunked evidence-ledger or narrative payloads could not be verified when this PDF was generated. Do not treat this export as a complete verified dossier; reconnect and re-fetch cloud findings in Paper Critic before re-exporting."
+      val warningText = "$degradedTitle: $degradedDetail"
+      recordText(warningText)
+      val warnLayout = buildLayout(warningText, bodyBoldPaint, CONTENT_WIDTH - 18f, 1.8f)
+      val warnH = warnLayout.height + 14f
+      ensureSpace(warnH + 6f)
+      val isCorrupt = review.ledgerLoadState == LedgerLoadState.CORRUPT
+      val warnBg = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = if (isCorrupt) Color.rgb(254, 242, 242) else Color.rgb(255, 251, 235)
+      }
+      val warnStroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 1.1f
+        color = if (isCorrupt) Color.rgb(220, 38, 38) else Color.rgb(217, 119, 6)
+      }
+      val warnRect = RectF(MARGIN_H, cursorY, PAGE_WIDTH - MARGIN_H, cursorY + warnH)
+      canvas.drawRoundRect(warnRect, 5f, 5f, warnBg)
+      canvas.drawRoundRect(warnRect, 5f, 5f, warnStroke)
+      canvas.save()
+      canvas.translate(MARGIN_H + 9f, cursorY + 7f)
+      warnLayout.draw(canvas)
+      canvas.restore()
+      cursorY += warnH + 9f
+    }
 
     // =========================================================================
     // 3. STRUCTURED 6-AXIS WEIGHTED RUBRIC (DYNAMIC MULTI-LINE — ZERO TRUNCATION!)

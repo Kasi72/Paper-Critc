@@ -1086,7 +1086,10 @@ object StatisticalAuditOrchestrator {
       domainFindings = gatedDomainFindings,
       unsupportedDisclosures = ledger.unsupportedDisclosures,
       designClassification = designClassification,
-      semanticValidity = semanticValidity
+      semanticValidity = semanticValidity,
+      totalDiscoveredClaims = ledger.totalDiscoveredClaims,
+      truncatedClaimCount = ledger.truncatedClaimCount,
+      truncatedPages = ledger.truncatedPages
     )
   }
 }

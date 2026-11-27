@@ -117,7 +117,7 @@ data class SqlReviewCacheEntity(
       extractionConfidence = extractionConfidence,
       reviewMode = reviewMode,
       coverageDisclosure = coverageDisclosure,
-      validationStatus = validationStatus,
+      validationStatus = validationStatus.ifBlank { "LEGACY_UNVALIDATED" },
       structuredFindingsJson = structuredFindingsJson,
       schemaVersion = schemaVersion,
       findingsChunkCount = findingsChunkCount,

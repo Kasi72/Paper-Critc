@@ -1037,7 +1037,7 @@ object NumericalReconstructionEngine {
         detail = "$label=$est (${claim.intervalType.label} $lo–$hi) is properly ordered; skipped frequentist Wald CI-vs-p contradiction flag.",
         assumptionContract = ratioContract
       )
-      pContradictsCi && repP != null -> NumericalReconstructionResult(
+      pContradictsCi -> NumericalReconstructionResult(
         checkId = checkId,
         calculatorName = "Ratio / Survival CI-vs-p ($label)",
         reportedValue = "${claim.sourceQuote}, p=${formatP(repP)}",
@@ -1053,7 +1053,7 @@ object NumericalReconstructionEngine {
         detail = "$label=$est ($ciPctLabel CI $lo–$hi) ${if (ciExcludesNull) "excludes" else "crosses"} 1.0, contradicting reported p=${formatP(repP)} relative to α=${formatNum(alphaLevel)} (implied Wald p≈${formatP(impliedP)}). Verify whether p-value was multiplicity-adjusted or computed from a different test.",
         assumptionContract = ratioContract
       )
-      pRequiresProcedureVerification && repP != null -> NumericalReconstructionResult(
+      pRequiresProcedureVerification -> NumericalReconstructionResult(
         checkId = checkId,
         calculatorName = "Ratio / Survival CI-vs-p ($label • Adjusted/One-Sided Guard)",
         reportedValue = "${claim.sourceQuote}, p=${formatP(repP)}",

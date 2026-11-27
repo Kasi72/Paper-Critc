@@ -1292,6 +1292,8 @@ class Reviewer2PipelineService {
       reviewMode = options.reviewMode
     )
     val anyJsonRepaired = pass1Result.wasRepaired || pass2Result.wasRepaired || (quantResultOrNull?.wasRepaired == true)
+    val statTruncatedCount = forensicReport.quantForensics?.statisticalAudit?.truncatedClaimCount ?: 0
+    val statTruncatedPages = forensicReport.quantForensics?.statisticalAudit?.truncatedPages.orEmpty()
     val validationStatus = computeValidationStatus(
       resolvedVerdict = verdict,
       adjudicatedFindings = adjudicated.adjudicatedFindings,
@@ -1300,7 +1302,8 @@ class Reviewer2PipelineService {
       wasPromptTrimmed = primaryPrepared.wasTrimmed,
       extractionConfidence = extractionConfidence,
       hasSubstantiveEditorialProse = pass2Json.optString("stage08aTo08bAlchemistEditorNote", "").isNotBlank() ||
-        pass2Json.optString("stage04aIsItCredibleEssay", "").isNotBlank()
+        pass2Json.optString("stage04aIsItCredibleEssay", "").isNotBlank(),
+      truncatedStatisticalClaimCount = statTruncatedCount
     )
     // P1-11: Record ACTUAL executed models, routes, image pages processed, and fallback history
     val actualFallbackNotes = (pass1Result.fallbackHistory + pass2Result.fallbackHistory + quantResultOrNull?.fallbackHistory.orEmpty()).distinct()
@@ -1331,6 +1334,10 @@ class Reviewer2PipelineService {
       }
       if (actualFallbackNotes.isNotEmpty()) {
         append(" • Fallbacks: ${actualFallbackNotes.joinToString(" | ")}")
+      }
+      if (statTruncatedCount > 0) {
+        val pageDesc = if (statTruncatedPages.isNotEmpty()) " (pages ${statTruncatedPages.joinToString(",")})" else ""
+        append(" • Quantitative Coverage Partial: $statTruncatedCount statistical claim(s) omitted by cap$pageDesc")
       }
       if (primaryPrepared.wasTrimmed && primaryPrepared.trimmedNote.isNotBlank()) {
         append(" • ${primaryPrepared.trimmedNote}")
@@ -3549,20 +3556,27 @@ class Reviewer2PipelineService {
     }
 
     private fun classifyClaimPolarity(text: String): ClaimPolarity {
+      // Mask prepositional domain noun phrases such as "for missing outcome data" or "handling missing values"
+      // so a positive claim ("Sensitivity analysis for missing outcome data is present in Table 3") is not
+      // misclassified as ABSENT_OR_DEFICIENT merely because its topic is missingness.
+      val normalizedText = text.replace(
+        Regex("""(?i)\b(?:for|of|with|on|regarding|handling|addressing|imputing|accounting\s+for)\s+missing(?:\s+[a-z0-9-]+){0,2}\s+(?:data|outcomes?|values?|observations?|cases?|covariates?|follow[\s-]?up|records?|entries)\b"""),
+        " for_missingness_topic "
+      )
       val absentRegex = Regex(
         """(?i)\b(?:absent|missing|omitted|not\s+(?:properly\s+|adequately\s+|fully\s+)?(?:performed|conducted|reported|assessed|included|adjusted|blinded|registered|validated|verified)|(?:was|were)\s+(?:not|never)\s+(?:properly\s+|adequately\s+|fully\s+)?(?:performed|conducted|reported|assessed|included|adjusted|blinded|registered|validated|verified)|did\s+not\s+(?:perform|conduct|report|assess|include|adjust|control|blind|preregister|validate|verify)|never\s+(?:performed|conducted|reported|assessed|blinded|adjusted|validated)|no\s+(?:sensitivity\s+analysis|blinding|allocation\s+concealment|adjustment|control|protocol|preregistration|calibration|external\s+validation)|failed\s+to|lacks?|lacked|without\s+(?:sensitivity|blinding|adjustment|control|calibration|correction)|unadjusted|unblinded|open[\s-]?label|unregistered|contradict(?:s|ed|ion)?|discrepancy|miscalculat(?:ed|ion)|invalid(?:ate|ated)?|arithmetic\s+error|leakage|overfit(?:ting)?|violat(?:es|ed|ion)|flaw(?:ed|s)?|bias(?:ed)?)\b"""
       )
       val presentRegex = Regex(
-        """(?i)\b(?:(?:was|were)\s+(?:(?:properly|adequately|fully|rigorously|thoroughly|explicitly|appropriately|formally|successfully|clearly)\s+)?(?:performed|conducted|reported|assessed|included|adjusted|blinded|preregistered|registered|verified|confirmed|validated|implemented|executed)|(?:authors|study|investigators|trial)\s+(?:(?:properly|adequately|fully|rigorously|explicitly)\s+)?(?:performed|conducted|reported|included|adjusted|controlled|blinded|assessed|validated|verified|confirmed)|performed\s+(?:a\s+|an\s+|the\s+)?(?:sensitivity|blinding|adjustment|calibration|external\s+validation|funnel|egger)|conducted\s+(?:a\s+|an\s+|the\s+)?(?:sensitivity|blinding|adjustment|calibration|external\s+validation)|confirmed\s+(?:robustness|consistency|validity|results)|adequately\s+(?:reported|controlled|adjusted|blinded|powered|conducted|performed|validated)|properly\s+(?:blinded|controlled|adjusted|randomized|conducted|performed|validated|assessed|reported)|no\s+(?:discrepancy|contradiction|bias|leakage|error|flaw)|fully\s+(?:consistent|reproducible|transparent|adjusted|validated)|well[\s-]?controlled|robust\s+to\s+sensitivity)\b"""
+        """(?i)\b(?:(?:was|were)\s+(?:(?:properly|adequately|fully|rigorously|thoroughly|explicitly|appropriately|formally|successfully|clearly)\s+)?(?:performed|conducted|reported|assessed|included|adjusted|blinded|preregistered|registered|verified|confirmed|validated|implemented|executed)|(?:authors|study|investigators|trial|manuscript|paper)\s+(?:(?:properly|adequately|fully|rigorously|explicitly)\s+)?(?:performed|conducted|reported|included|adjusted|controlled|blinded|assessed|validated|verified|confirmed|provides?|includes?|contains?|presents?)|(?:is|are)\s+(?:present|included|reported|provided|documented)\s+in\b|appears?\s+in\s+(?:table|figure|section|methods|results|appendix|supplement)|performed\s+(?:a\s+|an\s+|the\s+)?(?:sensitivity|blinding|adjustment|calibration|external\s+validation|funnel|egger)|conducted\s+(?:a\s+|an\s+|the\s+)?(?:sensitivity|blinding|adjustment|calibration|external\s+validation)|confirmed\s+(?:robustness|consistency|validity|results)|adequately\s+(?:reported|controlled|adjusted|blinded|powered|conducted|performed|validated)|properly\s+(?:blinded|controlled|adjusted|randomized|conducted|performed|validated|assessed|reported)|no\s+(?:discrepancy|contradiction|bias|leakage|error|flaw)|fully\s+(?:consistent|reproducible|transparent|adjusted|validated)|well[\s-]?controlled|robust\s+to\s+sensitivity|clearly\s+(?:stated|described|reported|addressed|controlled))\b"""
       )
-      val hasAbsent = absentRegex.containsMatchIn(text)
-      val hasPresent = presentRegex.containsMatchIn(text)
+      val hasAbsent = absentRegex.containsMatchIn(normalizedText)
+      val hasPresent = presentRegex.containsMatchIn(normalizedText)
       return when {
         hasAbsent && !hasPresent -> ClaimPolarity.ABSENT_OR_DEFICIENT
         hasPresent && !hasAbsent -> ClaimPolarity.PRESENT_OR_ADEQUATE
         hasAbsent && hasPresent -> {
-          // Compare which cue appears closer to the main verb/clause: explicit negation ("not performed") dominates
-          if (Regex("""(?i)\b(?:not\s+(?:properly\s+|adequately\s+|fully\s+)?(?:performed|conducted|reported|assessed|validated)|did\s+not|was\s+(?:not|never)|were\s+(?:not|never)|absent|omitted|missing|failed\s+to|lacks?)\b""").containsMatchIn(text)) {
+          // Compare which cue appears closer to the main verb/clause: explicit negation ("not performed" / "no sensitivity analysis") dominates
+          if (Regex("""(?i)\b(?:not\s+(?:properly\s+|adequately\s+|fully\s+)?(?:performed|conducted|reported|assessed|validated)|did\s+not|was\s+(?:not|never)|were\s+(?:not|never)|no\s+(?:sensitivity\s+analysis|blinding|allocation\s+concealment|adjustment|control|protocol|preregistration|calibration|external\s+validation)|absent|omitted|missing|failed\s+to|lacks?)\b""").containsMatchIn(normalizedText)) {
             ClaimPolarity.ABSENT_OR_DEFICIENT
           } else {
             ClaimPolarity.NEUTRAL
@@ -3586,7 +3600,7 @@ class Reviewer2PipelineService {
       if (cleanSentence.length < 8) return false
       val findingText = "${finding.title}. ${finding.allegation}"
 
-      // 1. Polarity / Method-Status opposition check (e.g., "absent" vs "was performed")
+      // 1. Polarity / Method-Status opposition check (e.g., "absent" vs "was performed" / "is present in Table 3")
       val sentPolarity = classifyClaimPolarity(cleanSentence)
       val findingPolarity = classifyClaimPolarity(findingText)
       if ((sentPolarity == ClaimPolarity.PRESENT_OR_ADEQUATE && findingPolarity == ClaimPolarity.ABSENT_OR_DEFICIENT) ||
@@ -3595,7 +3609,7 @@ class Reviewer2PipelineService {
         return false
       }
 
-      // 2. Significance & directional opposition check
+      // 2. Significance & directional opposition check (including clinical benefit vs harm)
       val sentSig = Regex("""(?i)\bstatistically\s+significant\b""").containsMatchIn(cleanSentence) &&
         !Regex("""(?i)\b(?:not|non)[\s-]+(?:statistically\s+)?significant\b""").containsMatchIn(cleanSentence)
       val sentNonSig = Regex("""(?i)\b(?:not|non)[\s-]+(?:statistically\s+)?significant\b""").containsMatchIn(cleanSentence)
@@ -3604,8 +3618,8 @@ class Reviewer2PipelineService {
       val findNonSig = Regex("""(?i)\b(?:not|non)[\s-]+(?:statistically\s+)?significant\b""").containsMatchIn(findingText)
       if ((sentSig && findNonSig) || (sentNonSig && findSig)) return false
 
-      val upRegex = Regex("""(?i)\b(?:overestimat\w*|inflat\w*|higher|increas\w*|positive\s+effect)\b""")
-      val downRegex = Regex("""(?i)\b(?:underestimat\w*|deflat\w*|lower|decreas\w*|negative\s+effect)\b""")
+      val upRegex = Regex("""(?i)\b(?:overestimat\w*|inflat\w*|higher|increas\w*|positive\s+effect|harm(?:ful)?|worsen\w*|elevated\s+risk|excess\s+mortality)\b""")
+      val downRegex = Regex("""(?i)\b(?:underestimat\w*|deflat\w*|lower|decreas\w*|reduc\w*|negative\s+effect|protective|beneficial|improved\s+survival)\b""")
       val sUp = upRegex.containsMatchIn(cleanSentence) && !downRegex.containsMatchIn(cleanSentence)
       val sDown = downRegex.containsMatchIn(cleanSentence) && !upRegex.containsMatchIn(cleanSentence)
       val fUp = upRegex.containsMatchIn(findingText) && !downRegex.containsMatchIn(findingText)
@@ -4035,14 +4049,15 @@ class Reviewer2PipelineService {
       omittedOrPartialPromptPagesCount: Int,
       wasPromptTrimmed: Boolean,
       extractionConfidence: Int,
-      hasSubstantiveEditorialProse: Boolean = true
+      hasSubstantiveEditorialProse: Boolean = true,
+      truncatedStatisticalClaimCount: Int = 0
     ): String {
       if (resolvedVerdict == "PROVISIONAL_APPRAISAL_DESIGN_UNCERTAIN" ||
         resolvedVerdict == "INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT"
       ) {
         return "PROVISIONAL"
       }
-      if (anyJsonRepaired || omittedOrPartialPromptPagesCount > 0 || extractionConfidence <= 2) {
+      if (anyJsonRepaired || omittedOrPartialPromptPagesCount > 0 || extractionConfidence <= 2 || truncatedStatisticalClaimCount > 0) {
         return "PARTIALLY_VALIDATED"
       }
       val hasPartialOrUnverified = adjudicatedFindings.any {

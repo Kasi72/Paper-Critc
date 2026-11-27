@@ -403,6 +403,18 @@ fun PaperCriticAuthenticatedShell(
         ) {
           when (activeMainTab) {
             0 -> {
+              val activeProviderSummary = if (settingsState.useCustomApiProvider) {
+                val selectedCustom = apiProviders.firstOrNull {
+                  it.id == settingsState.activeProviderId && it.enabled
+                } ?: apiProviders.firstOrNull { it.enabled && it.apiKey.isNotBlank() }
+                if (selectedCustom != null) {
+                  "${selectedCustom.serviceName} (${selectedCustom.modelId})"
+                } else {
+                  "Custom API Provider (not yet configured)"
+                }
+              } else {
+                "Firebase Gemini (Built-in Cloud AI)"
+              }
               WorkbenchScreen(
                 formState = formState,
                 preFlight = preFlightReport,
@@ -421,7 +433,9 @@ fun PaperCriticAuthenticatedShell(
                 onImportReplicationCodeUri = { uri -> viewModel.importReplicationCodeFromUri(context, uri) },
                 onRunPipeline = viewModel::runAdversarialReviewAndSave,
                 onCancelPipeline = viewModel::cancelRunningPipeline,
-                onOpenCompletedDossier = viewModel::openDossier
+                onOpenCompletedDossier = viewModel::openDossier,
+                confidentialLocalOnly = settingsState.confidentialLocalOnly,
+                activeAiProviderSummary = activeProviderSummary
               )
             }
 

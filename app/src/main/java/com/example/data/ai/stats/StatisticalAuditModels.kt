@@ -315,7 +315,10 @@ data class StatisticalAuditReport(
   val unsupportedDisclosures: List<String>,
   val scoreBreakdown: ScoreCalculationBreakdown? = null,
   val designClassification: DesignClassificationResult? = null,
-  val semanticValidity: SemanticValidityReport? = null
+  val semanticValidity: SemanticValidityReport? = null,
+  val totalDiscoveredClaims: Int = claims.size,
+  val truncatedClaimCount: Int = 0,
+  val truncatedPages: List<Int> = emptyList()
 ) {
   val exactClaimCount: Int get() = claims.count { !it.isFromReferenceOrCitation && it.parseStatus == ClaimParseStatus.EXACT }
   val partialClaimCount: Int get() = claims.count { !it.isFromReferenceOrCitation && it.parseStatus == ClaimParseStatus.PARTIAL }
@@ -359,6 +362,12 @@ data class StatisticalAuditReport(
         "($exactClaimCount EXACT, $partialClaimCount PARTIAL, $ambiguousClaimCount AMBIGUOUS, $unsupportedClaimCount UNSUPPORTED; " +
         "$excludedReferenceClaimCount reference/citation claim(s) excluded from testing families)."
     )
+    if (truncatedClaimCount > 0) {
+      val pagesDesc = if (truncatedPages.isNotEmpty()) " on page(s) ${truncatedPages.joinToString(", ")}" else ""
+      appendLine(
+        "QUANTITATIVE COVERAGE PARTIAL (TRUNCATION NOTICE): $truncatedClaimCount additional claim(s)$pagesDesc omitted beyond per-family discovery cap (total discovered: $totalDiscoveredClaims). Do NOT claim complete quantitative coverage."
+      )
+    }
     appendLine(
       "Deterministic Audit Counts: $verifiedArithmeticErrorCount ARITHMETIC_ERROR, " +
         "$verifiedContradictionCount INTERNAL_CONTRADICTION, " +

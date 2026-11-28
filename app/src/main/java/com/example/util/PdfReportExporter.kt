@@ -22,7 +22,12 @@ import com.example.data.model.LedgerLoadState
 import com.example.data.model.PaperReview
 import com.example.data.model.ReviewFinding
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
+import com.tom_roush.pdfbox.cos.COSDictionary
 import com.tom_roush.pdfbox.pdmodel.PDDocument
+import com.tom_roush.pdfbox.pdmodel.interactive.documentnavigation.destination.PDPageFitWidthDestination
+import com.tom_roush.pdfbox.pdmodel.interactive.documentnavigation.outline.PDDocumentOutline
+import com.tom_roush.pdfbox.pdmodel.interactive.documentnavigation.outline.PDOutlineItem
+import com.tom_roush.pdfbox.pdmodel.interactive.viewerpreferences.PDViewerPreferences
 import com.tom_roush.pdfbox.text.PDFTextStripper
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
@@ -71,6 +76,15 @@ data class PdfLayoutBlockBounds(
   val top: Float,
   val right: Float,
   val bottom: Float
+)
+
+/**
+ * P2-14: Recorded PDF bookmark entry pointing to a rendered section heading (0-based page index).
+ */
+data class PdfOutlineEntry(
+  val title: String,
+  val pageIndex: Int,
+  val yTop: Float
 )
 
 /**
@@ -237,7 +251,9 @@ data class PdfRenderDiagnostics(
   val headerFooterCollisionDetected: Boolean = false,
   val tableCellOverflowDetected: Boolean = false,
   val geometryIssues: List<String> = emptyList(),
-  val geometryBlocksChecked: Int = 0
+  val geometryBlocksChecked: Int = 0,
+  val outlineEntryCount: Int = 0,
+  val hasPdfAccessibilityMetadata: Boolean = false
 ) {
   val geometryClean: Boolean
     get() = !overlapDetected &&
@@ -297,12 +313,14 @@ object PdfReportExporter {
     )
   }
 
-  /**
-   * Attempts real byte-level PDF text extraction via PDFBox from rendered PDF bytes.
-   * Returns Pair(extractedText, pageCount) when [pdfBytes] is a standard PDF document with text,
-   * or null when running in headless bitmap-fallback test mode.
-   */
-  internal fun extractTextFromPdfBytes(pdfBytes: ByteArray): Pair<String, Int>? {
+  internal data class PdfByteInspection(
+    val extractedText: String,
+    val pageCount: Int,
+    val outlineEntryCount: Int,
+    val hasAccessibilityMetadata: Boolean
+  )
+
+  internal fun inspectPdfBytesWithMetadata(pdfBytes: ByteArray): PdfByteInspection? {
     if (pdfBytes.size < 8) return null
     val header = String(pdfBytes, 0, 5, Charsets.US_ASCII)
     if (header != "%PDF-") return null
@@ -317,14 +335,106 @@ object PdfReportExporter {
         }
         if (!validBoxes) return@use null
         val text = PDFTextStripper().getText(doc).orEmpty()
-        if (text.isNotBlank()) text to pages else null
+        if (text.isBlank()) return@use null
+        var outlineCount = 0
+        var node = doc.documentCatalog?.documentOutline?.firstChild
+        while (node != null && outlineCount < 200) {
+          outlineCount++
+          node = node.nextSibling
+        }
+        val hasTitle = !doc.documentInformation?.title.isNullOrBlank()
+        val hasLang = !doc.documentCatalog?.language.isNullOrBlank()
+        val displayTitle = doc.documentCatalog?.viewerPreferences?.displayDocTitle() == true
+        PdfByteInspection(
+          extractedText = text,
+          pageCount = pages,
+          outlineEntryCount = outlineCount,
+          hasAccessibilityMetadata = hasTitle && hasLang && displayTitle
+        )
       }
     }.getOrNull()
   }
 
   /**
+   * Attempts real byte-level PDF text extraction via PDFBox from rendered PDF bytes.
+   * Returns Pair(extractedText, pageCount) when [pdfBytes] is a standard PDF document with text,
+   * or null when running in headless bitmap-fallback test mode.
+   */
+  internal fun extractTextFromPdfBytes(pdfBytes: ByteArray): Pair<String, Int>? {
+    val inspected = inspectPdfBytesWithMetadata(pdfBytes) ?: return null
+    return inspected.extractedText to inspected.pageCount
+  }
+
+  /**
+   * P2-14: Post-processes native Android [PdfDocument] bytes with PDFBox to embed:
+   * - Interactive PDF Document Outline (bookmarks) targeting every rendered section heading.
+   * - PDF/UA accessibility & catalog metadata (Title, Author, Subject, Creator, Language, DisplayDocTitle).
+   * Returns [rawPdfBytes] unchanged if bytes are not a standard PDF (e.g., headless Robolectric shadow).
+   */
+  internal fun enrichPdfWithOutlineAndAccessibilityMetadata(
+    rawPdfBytes: ByteArray,
+    review: PaperReview,
+    outlineEntries: List<PdfOutlineEntry>
+  ): ByteArray {
+    if (rawPdfBytes.size < 8) return rawPdfBytes
+    val header = String(rawPdfBytes, 0, 5, Charsets.US_ASCII)
+    if (header != "%PDF-") return rawPdfBytes
+    return runCatching {
+      PDDocument.load(ByteArrayInputStream(rawPdfBytes)).use { doc ->
+        if (doc.numberOfPages <= 0) return@use rawPdfBytes
+        val normalizedTitle = DossierFormattingEngine.normalizeTitle(review.title)
+          .ifBlank { "Scientific Appraisal Dossier" }
+        val info = doc.documentInformation
+        info.title = normalizedTitle
+        info.author = review.authors.ifBlank { "Paper Critic Automated Appraisal" }
+        val statusLabel = review.validationStatus.ifBlank { "LEGACY_UNVALIDATED" }
+          .replace('_', ' ')
+          .lowercase(Locale.US)
+          .replaceFirstChar { it.uppercaseChar() }
+        info.subject = "Structured Scientific Peer-Review Dossier ($statusLabel)"
+        info.creator = "Paper Critic"
+        info.keywords = listOfNotNull(
+          "peer review",
+          "scientific appraisal",
+          "statistical forensics",
+          review.venueOrCitation.takeIf { it.isNotBlank() }
+        ).joinToString(", ")
+
+        val catalog = doc.documentCatalog
+        catalog.language = "en-US"
+        catalog.viewerPreferences = PDViewerPreferences(COSDictionary()).apply {
+          setDisplayDocTitle(true)
+        }
+
+        if (outlineEntries.isNotEmpty()) {
+          val outline = PDDocumentOutline()
+          catalog.documentOutline = outline
+          val deduped = outlineEntries.distinctBy { "${it.pageIndex}:${it.title}" }
+          deduped.forEach { entry ->
+            val targetIdx = entry.pageIndex.coerceIn(0, doc.numberOfPages - 1)
+            val dest = PDPageFitWidthDestination().apply {
+              page = doc.getPage(targetIdx)
+              top = (PAGE_HEIGHT - entry.yTop).toInt().coerceIn(0, PAGE_HEIGHT)
+            }
+            val item = PDOutlineItem().apply {
+              title = entry.title.take(120)
+              destination = dest
+            }
+            outline.addLast(item)
+          }
+          outline.openNode()
+        }
+
+        val enriched = ByteArrayOutputStream()
+        doc.save(enriched)
+        enriched.toByteArray()
+      }
+    }.getOrDefault(rawPdfBytes)
+  }
+
+  /**
    * Renders [review] to PDF bytes and returns both the rendered PDF payload, the captured/extracted
-   * rendered text stream, and the P0.3 + Finding 14 [PdfRenderDiagnostics] verification result.
+   * rendered text stream, and the P0.3 + Finding 14 + P2-14 [PdfRenderDiagnostics] verification result.
    */
   data class RenderedPdfResult(
     val pdfBytes: ByteArray,
@@ -362,15 +472,17 @@ object PdfReportExporter {
     requireByteExtraction: Boolean = true,
     geometryReport: PdfGeometryVerificationReport? = null
   ): PdfRenderDiagnostics {
-    val pdfBoxExtracted = extractTextFromPdfBytes(pdfBytes)
-    if (pdfBoxExtracted != null) {
-      val (text, pages) = pdfBoxExtracted
+    val pdfBoxInspected = inspectPdfBytesWithMetadata(pdfBytes)
+    if (pdfBoxInspected != null) {
       val base = inspectRenderedText(
-        extractedText = text,
+        extractedText = pdfBoxInspected.extractedText,
         clippedContentDetected = clippedContentDetected,
         extractedFromPdfBytes = true,
-        pageCount = pages
-      ).withGeometry(geometryReport)
+        pageCount = pdfBoxInspected.pageCount
+      ).withGeometry(geometryReport).copy(
+        outlineEntryCount = pdfBoxInspected.outlineEntryCount,
+        hasPdfAccessibilityMetadata = pdfBoxInspected.hasAccessibilityMetadata
+      )
       return base.copy(
         pdfByteIntegrityFailed = false,
         verificationFailureReason = base.verificationFailureReason
@@ -416,6 +528,7 @@ object PdfReportExporter {
     val clipTracker = BooleanArray(1) { false }
     val pageCountTracker = IntArray(1) { 1 }
     val geometryRecorder = PdfLayoutGeometryRecorder()
+    val outlineEntries = mutableListOf<PdfOutlineEntry>()
     renderReviewToPdfStream(
       review = review,
       outputStream = baos,
@@ -424,9 +537,14 @@ object PdfReportExporter {
       renderedTextSink = textSink,
       clippedContentTracker = clipTracker,
       pageCountTracker = pageCountTracker,
-      geometryRecorder = geometryRecorder
+      geometryRecorder = geometryRecorder,
+      outlineEntriesSink = outlineEntries
     )
-    val bytes = baos.toByteArray()
+    val bytes = enrichPdfWithOutlineAndAccessibilityMetadata(
+      rawPdfBytes = baos.toByteArray(),
+      review = review,
+      outlineEntries = outlineEntries
+    )
     val geometryReport = geometryRecorder.verify(
       pageWidth = PAGE_WIDTH.toFloat(),
       pageHeight = PAGE_HEIGHT.toFloat(),
@@ -440,7 +558,9 @@ object PdfReportExporter {
       fallbackPageCount = pageCountTracker[0].coerceAtLeast(1),
       requireByteExtraction = requireByteExtraction,
       geometryReport = geometryReport
-    )
+    ).let { d ->
+      if (d.extractedFromPdfBytes) d else d.copy(outlineEntryCount = outlineEntries.size)
+    }
     val inspectedText = extractTextFromPdfBytes(bytes)?.first ?: textSink.toString()
     return RenderedPdfResult(
       pdfBytes = bytes,
@@ -634,7 +754,8 @@ object PdfReportExporter {
     renderedTextSink: StringBuilder? = null,
     clippedContentTracker: BooleanArray? = null,
     pageCountTracker: IntArray? = null,
-    geometryRecorder: PdfLayoutGeometryRecorder? = null
+    geometryRecorder: PdfLayoutGeometryRecorder? = null,
+    outlineEntriesSink: MutableList<PdfOutlineEntry>? = null
   ) {
     val document = PdfDocument()
     try {
@@ -1543,12 +1664,26 @@ object PdfReportExporter {
       }
 
       geometryRecorder?.recordBodyBlock(pageNumber, "section_header", MARGIN_H, barTop, PAGE_WIDTH - MARGIN_H, barTop + barH)
+      outlineEntriesSink?.add(
+        PdfOutlineEntry(
+          title = "$sectionNum. $title",
+          pageIndex = (pageNumber - 1).coerceAtLeast(0),
+          yTop = barTop
+        )
+      )
       cursorY = barTop + barH + 9f
     }
 
     // =========================================================================
     // 1. EXECUTIVE MASTHEAD BANNER (Page 1)
     // =========================================================================
+    outlineEntriesSink?.add(
+      PdfOutlineEntry(
+        title = "Executive Summary & 6-Axis Rubric",
+        pageIndex = 0,
+        yTop = cursorY
+      )
+    )
     val bannerH = 84f
     val bannerRect = RectF(MARGIN_H, cursorY, PAGE_WIDTH - MARGIN_H, cursorY + bannerH)
     canvas.drawRoundRect(bannerRect, 9f, 9f, navyBgPaint)

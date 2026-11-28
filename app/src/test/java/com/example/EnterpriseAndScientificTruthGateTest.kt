@@ -3006,4 +3006,68 @@ class EnterpriseAndScientificTruthGateTest {
     assertTrue("Adjudication accuracy must be >= 90% (got $adjAcc, 95% Wilson CI ${adjCi.first}..${adjCi.second})", adjAcc >= 0.90)
     assertTrue("Wilson 95% CI lower bound for recall must be finite and valid", recallCi.first in 0.5..1.0)
   }
+
+  @Test
+  fun p2_14_pdfOutlineBookmarksAndAccessibilityMetadata_areEmbeddedInRealPdfBytes() {
+    com.tom_roush.pdfbox.android.PDFBoxResourceLoader.init(ApplicationProvider.getApplicationContext())
+    val review = PaperReview(
+      id = "rev_p2_14_outline",
+      title = "Randomized Trial of Biomarker-Guided Therapy in Heart Failure",
+      authors = "Smith J, Patel A",
+      venueOrCitation = "Journal of Clinical Trials 2026",
+      validationStatus = "VERIFIED",
+      verdict = "MAJOR_REVISION",
+      credibilityScore = 76,
+      abstractSummary = "Executive appraisal summary for clinical trial.",
+      keyMethodology = "Double-blind randomized controlled trial.",
+      redTeamCritique = "Primary endpoint analysis reviewed.",
+      blueTeamVerification = "Supporting sensitivity analyses verified."
+    )
+
+    // 1. Capture real outline entries produced by renderReviewToPdfStream
+    val recordedOutline = mutableListOf<com.example.util.PdfOutlineEntry>()
+    val shadowBaos = java.io.ByteArrayOutputStream()
+    PdfReportExporter.renderReviewToPdfStream(
+      review = review,
+      outputStream = shadowBaos,
+      scope = PdfExportScope.SCIENTIFIC_APPRAISAL_REPORT,
+      outlineEntriesSink = recordedOutline
+    )
+    assertTrue("Exporter must record at least 3 section outline bookmarks (got ${recordedOutline.size})", recordedOutline.size >= 3)
+    assertEquals("Executive Summary & 6-Axis Rubric", recordedOutline.first().title)
+
+    // 2. Build a real 2-page PDF via PDFBox, then enrich it with enrichPdfWithOutlineAndAccessibilityMetadata
+    val rawRealPdf = java.io.ByteArrayOutputStream().use { out ->
+      com.tom_roush.pdfbox.pdmodel.PDDocument().use { doc ->
+        repeat(2) { idx ->
+          val page = com.tom_roush.pdfbox.pdmodel.PDPage(com.tom_roush.pdfbox.pdmodel.common.PDRectangle.A4)
+          doc.addPage(page)
+          com.tom_roush.pdfbox.pdmodel.PDPageContentStream(doc, page).use { cs ->
+            cs.beginText()
+            cs.setFont(com.tom_roush.pdfbox.pdmodel.font.PDType1Font.HELVETICA, 11f)
+            cs.newLineAtOffset(48f, 760f)
+            cs.showText("Paper Critic Scientific Appraisal Page ${idx + 1}")
+            cs.endText()
+          }
+        }
+        doc.save(out)
+      }
+      out.toByteArray()
+    }
+
+    val enrichedPdf = PdfReportExporter.enrichPdfWithOutlineAndAccessibilityMetadata(
+      rawPdfBytes = rawRealPdf,
+      review = review,
+      outlineEntries = recordedOutline
+    )
+
+    // 3. Re-parse enriched PDF bytes via PDFBox and verify interactive outline + PDF/UA metadata
+    val diagnostics = PdfReportExporter.validateExportedPdfBytes(
+      pdfBytes = enrichedPdf,
+      requireByteExtraction = true
+    )
+    assertTrue("Enriched PDF must pass integrity verification: ${diagnostics.verificationFailureReason}", diagnostics.isClean)
+    assertTrue("Enriched PDF must embed interactive document outline bookmarks (got ${diagnostics.outlineEntryCount})", diagnostics.outlineEntryCount >= 3)
+    assertTrue("Enriched PDF must embed title, language, and DisplayDocTitle accessibility metadata", diagnostics.hasPdfAccessibilityMetadata)
+  }
 }

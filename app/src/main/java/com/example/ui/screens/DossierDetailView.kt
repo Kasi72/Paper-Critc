@@ -29,6 +29,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
@@ -2376,6 +2377,8 @@ private fun EvidenceLedgerCard(
   findings: List<ReviewFinding>,
   textScale: Float = 1.0f
 ) {
+  val context = LocalContext.current
+  var inspectedFinding by remember { mutableStateOf<ReviewFinding?>(null) }
   val verifiedCount = findings.count { it.status == FindingStatus.VERIFIED }
   val contradictedCount = findings.count { it.status == FindingStatus.CONTRADICTED }
   val unverifiedCount = findings.count { it.status == FindingStatus.UNVERIFIED }
@@ -2468,15 +2471,24 @@ private fun EvidenceLedgerCard(
               }
             }
             val pageNum = finding.supportingEvidence.firstOrNull()?.pageNumber ?: 0
-            if (pageNum > 0) {
-              Text(
-                text = "PAGE $pageNum",
-                style = MaterialTheme.typography.labelSmall,
-                fontFamily = JetBrainsMonoFamily,
-                fontSize = 9.5.sp,
-                fontWeight = FontWeight.Bold,
-                color = CupertinoBlue
-              )
+            if (pageNum > 0 || finding.supportingEvidence.isNotEmpty() || finding.counterEvidence.isNotEmpty()) {
+              Box(
+                modifier = Modifier
+                  .clip(SquircleShape(cornerRadius = 5.dp, smoothing = 0.88f))
+                  .background(CupertinoBlue.copy(alpha = 0.12f))
+                  .clickable { inspectedFinding = finding }
+                  .padding(horizontal = 7.dp, vertical = 3.dp)
+                  .testTag("inspect_evidence_page_${finding.id}")
+              ) {
+                Text(
+                  text = if (pageNum > 0) "PAGE $pageNum ↗" else "SOURCE ↗",
+                  style = MaterialTheme.typography.labelSmall,
+                  fontFamily = JetBrainsMonoFamily,
+                  fontSize = 9.5.sp,
+                  fontWeight = FontWeight.Bold,
+                  color = CupertinoBlue
+                )
+              }
             }
           }
 
@@ -2512,17 +2524,26 @@ private fun EvidenceLedgerCard(
           val primaryAnchor = finding.supportingEvidence.firstOrNull()
           val quote = primaryAnchor?.exactQuote?.trim().orEmpty()
           if (quote.isNotBlank()) {
-            Box(
+            Column(
               modifier = Modifier
                 .fillMaxWidth()
                 .clip(SquircleShape(cornerRadius = 6.dp, smoothing = 0.88f))
                 .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.65f))
+                .clickable { inspectedFinding = finding }
                 .padding(horizontal = 8.dp, vertical = 6.dp)
+                .testTag("inspect_evidence_quote_${finding.id}"),
+              verticalArrangement = Arrangement.spacedBy(2.dp)
             ) {
               Text(
                 text = "Evidence: \"$quote\"",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
+              )
+              Text(
+                text = "Tap to inspect anchor location, section & provenance",
+                style = MaterialTheme.typography.labelSmall,
+                fontSize = 10.sp,
+                color = CupertinoBlue
               )
             }
           }
@@ -2636,6 +2657,160 @@ private fun EvidenceLedgerCard(
         }
       }
     }
+  }
+
+  val activeFinding = inspectedFinding
+  if (activeFinding != null) {
+    AlertDialog(
+      onDismissRequest = { inspectedFinding = null },
+      modifier = Modifier.testTag("evidence_anchor_inspector_dialog"),
+      title = {
+        Text(
+          text = "${activeFinding.id} • Source Evidence Anchors",
+          style = MaterialTheme.typography.titleMedium,
+          fontWeight = FontWeight.Bold
+        )
+      },
+      text = {
+        Column(
+          modifier = Modifier
+            .fillMaxWidth()
+            .verticalScroll(rememberScrollState()),
+          verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+          Text(
+            text = activeFinding.title,
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.onSurface
+          )
+          Text(
+            text = "Status: ${activeFinding.status.displayBadge} • Severity: ${activeFinding.severity}",
+            style = MaterialTheme.typography.labelSmall,
+            fontFamily = JetBrainsMonoFamily,
+            color = CupertinoBlue
+          )
+
+          if (activeFinding.supportingEvidence.isNotEmpty()) {
+            Text(
+              text = "Supporting Source Passages (${activeFinding.supportingEvidence.size})",
+              style = MaterialTheme.typography.labelMedium,
+              fontWeight = FontWeight.Bold,
+              color = MaterialTheme.colorScheme.onSurface
+            )
+            activeFinding.supportingEvidence.forEachIndexed { idx, anchor ->
+              Column(
+                modifier = Modifier
+                  .fillMaxWidth()
+                  .clip(SquircleShape(cornerRadius = 8.dp, smoothing = 0.88f))
+                  .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f))
+                  .padding(10.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp)
+              ) {
+                val locParts = buildList {
+                  if (anchor.pageNumber > 0) add("Page ${anchor.pageNumber}")
+                  anchor.section?.takeIf { it.isNotBlank() }?.let { add(it) }
+                  if ((anchor.startOffset ?: 0) > 0 || (anchor.endOffset ?: 0) > 0) {
+                    add("Chars ${anchor.startOffset ?: 0}–${anchor.endOffset ?: 0}")
+                  }
+                  if (!anchor.documentId.isNullOrBlank()) add("Doc ${anchor.documentId}")
+                }
+                Text(
+                  text = locParts.ifEmpty { listOf("Anchor #${idx + 1}") }.joinToString(" • "),
+                  style = MaterialTheme.typography.labelSmall,
+                  fontFamily = JetBrainsMonoFamily,
+                  fontWeight = FontWeight.Bold,
+                  color = CupertinoBlue
+                )
+                if (!anchor.boundingBox.isNullOrEmpty() && anchor.boundingBox.size == 4) {
+                  val b = anchor.boundingBox
+                  Text(
+                    text = "Normalized bbox: [${"%.2f".format(b[0])}, ${"%.2f".format(b[1])}, ${"%.2f".format(b[2])}, ${"%.2f".format(b[3])}]",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontFamily = JetBrainsMonoFamily,
+                    fontSize = 10.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                  )
+                }
+                Text(
+                  text = "\"${anchor.exactQuote}\"",
+                  style = MaterialTheme.typography.bodySmall,
+                  color = MaterialTheme.colorScheme.onSurface
+                )
+              }
+            }
+          }
+
+          if (activeFinding.counterEvidence.isNotEmpty()) {
+            Text(
+              text = "Counterevidence Passages (${activeFinding.counterEvidence.size})",
+              style = MaterialTheme.typography.labelMedium,
+              fontWeight = FontWeight.Bold,
+              color = CupertinoGreen
+            )
+            activeFinding.counterEvidence.forEach { ce ->
+              Column(
+                modifier = Modifier
+                  .fillMaxWidth()
+                  .clip(SquircleShape(cornerRadius = 8.dp, smoothing = 0.88f))
+                  .background(CupertinoGreen.copy(alpha = 0.10f))
+                  .padding(10.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp)
+              ) {
+                Text(
+                  text = buildList {
+                    if (ce.pageNumber > 0) add("Page ${ce.pageNumber}")
+                    ce.section?.takeIf { it.isNotBlank() }?.let { add(it) }
+                  }.ifEmpty { listOf("Defense Passage") }.joinToString(" • "),
+                  style = MaterialTheme.typography.labelSmall,
+                  fontFamily = JetBrainsMonoFamily,
+                  fontWeight = FontWeight.Bold,
+                  color = CupertinoGreen
+                )
+                Text(
+                  text = "\"${ce.exactQuote}\"",
+                  style = MaterialTheme.typography.bodySmall,
+                  color = MaterialTheme.colorScheme.onSurface
+                )
+              }
+            }
+          }
+
+          if (activeFinding.provenanceSummary.isNotBlank()) {
+            Text(
+              text = "Provenance: ${activeFinding.provenanceSummary}",
+              style = MaterialTheme.typography.labelSmall,
+              fontFamily = JetBrainsMonoFamily,
+              fontSize = 10.sp,
+              color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+          }
+        }
+      },
+      confirmButton = {
+        val primaryQuote = activeFinding.supportingEvidence.firstOrNull()?.exactQuote.orEmpty()
+        if (primaryQuote.isNotBlank()) {
+          TextButton(
+            onClick = {
+              val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+              cm?.setPrimaryClip(ClipData.newPlainText("Evidence Quote", primaryQuote))
+              Toast.makeText(context, "Evidence quote copied", Toast.LENGTH_SHORT).show()
+            },
+            modifier = Modifier.testTag("copy_evidence_anchor_quote_button")
+          ) {
+            Text("Copy Quote")
+          }
+        }
+      },
+      dismissButton = {
+        TextButton(
+          onClick = { inspectedFinding = null },
+          modifier = Modifier.testTag("close_evidence_anchor_inspector_button")
+        ) {
+          Text("Close")
+        }
+      }
+    )
   }
 }
 

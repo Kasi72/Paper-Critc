@@ -1,0 +1,333 @@
+# **Paper Critic — Deep Re-Audit of the Latest GitHub Code**
+
+Repository: [Kasi72/Paper-Critc](https://github.com/Kasi72/Paper-Critc?utm_source=chatgpt.com) · Branch: `main` · Tree revision: `884234e252027d7bca722a1e8b0ee2fc6d18b786` · 24 November 2026
+
+The repository has changed substantially since my previous audit. It now contains dedicated modules for epistemic safeguards, semantic validity, statistical claim parsing, numerical reconstruction, domain-specific statistical assessment, and reviewer calibration.
+
+**The scientific-review architecture is considerably more sophisticated. However, I have found remaining issues that matter more than adding further analytical stages.**
+
+In particular, the code still has paths through which AI-generated criticism can appear in the final dossier without passing the same evidence-verification process as the structured findings.
+
+## **1. Confirmed high-priority findings**
+
+| Priority | Finding                                                                                             | Consequence                                                               |
+| -------- | --------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| P0       | Unadjudicated AI prose remains in the final report                                                  | Unsupported or contradicted allegations can survive verification          |
+| P0       | The report can be labeled `VERIFIED` without establishing that every substantive claim was verified | The validation label overstates assurance                                 |
+| P1       | Clinical evidence certainty is derived from a general weighted credibility score                    | Risks presenting a non-GRADE assessment as GRADE-like certainty           |
+| P1       | Document completeness remains constrained by extraction and prompt budgets                          | Some methods, tables, supplements or results can remain unseen            |
+| P1       | Several safeguards use keyword and regex signals as proxies for scientific meaning                  | Misclassification, false alarms and missed contradictions remain possible |
+
+These conclusions come from the updated source code, not from the previous version.
+
+### **Finding P0-01 — Verified findings are mixed with unverified prose**
+
+**Source:** [Reviewer2PipelineService.kt, lines 1198–1244](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/data/ai/Reviewer2PipelineService.kt?utm_source=chatgpt.com#L1198-L1244)
+
+The code constructs an adjudicated findings section using the structured findings ledger, but then appends the language model's original `stage02eTo03cVerifiedListV2` text.
+
+That original text does not necessarily reflect the final adjudicator's corrections, downgrades or rejections.
+
+The same broader problem exists when the quantitative report, editorial narrative, red-team critique and reviewer questions are assembled from raw AI-generated text.
+
+**Why this is serious:** Even if the structured ledger correctly dismisses an invented criticism, an earlier version of that criticism can still appear elsewhere in the exported document.
+
+**Required fix:** Treat the adjudicated evidence ledger as the single source of truth. Generate every final substantive section from that ledger after adjudication. Preserve original AI drafts only in a clearly labeled internal audit trail.
+
+### **Finding P0-02 —&#x20;**`VERIFIED`**&#x20;is not a sufficiently strict publication state**
+
+**Source:** [Reviewer2PipelineService.kt, lines 1114–1152](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/data/ai/Reviewer2PipelineService.kt?utm_source=chatgpt.com#L1114-L1152)
+
+The application sets `validationStatus = "VERIFIED"` when a small set of adverse conditions is absent: no JSON repair, no recorded prompt omissions, acceptable extraction confidence and no partially supported or contradicted structured findings.
+
+But the absence of those conditions does not demonstrate that all substantive claims were independently checked.
+
+For example, a model response containing no structured findings could potentially receive the `VERIFIED` state while still supplying nonempty editorial criticism in free-text fields.
+
+That is a **code-path risk**, not proof that the application has produced such a report during an actual run.
+
+**Required fix:** Verification must be based on coverage of the claims actually published, not merely the absence of detected problems. Require a claim inventory, a verified-or-qualified status for each substantive claim, and a successful final cross-section consistency check before assigning the strongest validation label.
+
+### **Finding P0-03 — The counterevidence engine can falsely dismiss a legitimate criticism**
+
+**Source:** [Reviewer2PipelineService.kt, lines 2592–2648](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/data/ai/Reviewer2PipelineService.kt?utm_source=chatgpt.com#L2592-L2648) and [BidirectionalAdjudicator.kt](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/data/ai/epistemic/BidirectionalAdjudicator.kt?utm_source=chatgpt.com#L35-L147)
+
+The application attempts to disprove absence allegations by searching for keywords anywhere in the manuscript.
+
+Consider this deliberately constructed example:
+
+**Reviewer allegation:** “No random-effects meta-analysis was performed.”
+
+**Manuscript sentence:** “We did not perform a random-effects meta-analysis because the estimates were not sufficiently comparable.”
+
+**What the code can do:** Detect the phrase `random-effects` in the manuscript and interpret it as counterevidence that the analysis was performed.
+
+Incorrect possible dismissal
+
+**Correct interpretation:** The manuscript explicitly confirms that the analysis was not performed. Whether that omission is a limitation requires separate methodological judgment.
+
+This happens because the code checks for the presence of method terms, without reliably determining their negation, grammatical context, or whether they appear in the article's own Methods and Results rather than its references.
+
+The same vulnerability affects several rule families: protocol registration, sensitivity analysis, intention-to-treat analysis, external validation and competing-risk methods.
+
+This is a particularly important flaw because the new verification layer is intended to prevent false positives. Under these conditions, it can create false negatives instead.
+
+**Required fix:** Replace keyword-triggered dismissal with an explicit method-status classifier:
+
+`PERFORMED`, `NOT_PERFORMED`, `PROPOSED_ONLY`, `CITED_AS_PRIOR_WORK`, `UNCLEAR`.
+
+Use section-aware retrieval and sentence-level negation handling. A method's mere mention should never be sufficient to overturn a criticism.
+
+### **Finding P0-04 — Matching a source quotation does not prove the allegation**
+
+**Source:** [Source quotation verification and adjudication](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/data/ai/Reviewer2PipelineService.kt?utm_source=chatgpt.com#L2437-L2706)
+
+The updated implementation is better than the previous one: it distinguishes exact quotation matches, localized fuzzy matches and missing quotations. It also detects page mismatches.
+
+But an exact quotation only proves that certain words occur in the document.
+
+For example, a reviewer could allege that the authors failed to adjust for confounding, and cite a genuine sentence describing the study population. The quote may be exact, but that does not establish the alleged methodological omission.
+
+The current code can preserve an incoming `VERIFIED` status when the quote matches exactly, without independently proving that the quote entails the allegation.
+
+**Required fix:** Separate two independent validation results:
+
+| Verification layer        | Question                                                         |
+| ------------------------- | ---------------------------------------------------------------- |
+| **Source authenticity**   | Does this quotation actually occur at the cited location?        |
+| **Scientific entailment** | Does the cited evidence logically support the precise criticism? |
+
+Both must pass before a substantive allegation receives `VERIFIED` status. Negative claims additionally require a complete search of the applicable source sections.
+
+## **2. A definite persistence bug affecting older reports**
+
+### **Finding P1-05 — Existing legacy reviews are automatically labeled verified**
+
+**Source:** [PaperCriticSqlDatabase.kt, migration 3→4](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/data/local/PaperCriticSqlDatabase.kt?utm_source=chatgpt.com#L303-L333)
+
+The migration contains:
+
+```
+ALTER TABLE sql_review_cache
+ADD COLUMN validationStatus TEXT NOT NULL DEFAULT 'VERIFIED'
+```
+
+The migration also initializes `structuredFindingsJson` to an empty string.
+
+That means a legacy report generated by the previous, less reliable engine can be migrated into the new database and appear to have a verified status despite having no evidence ledger.
+
+**Correction:** Existing reports should receive `LEGACY_UNVALIDATED` or `REQUIRES_REANALYSIS`, not `VERIFIED`.
+
+This is especially important because the old psychiatric-bed report contains factual criticisms that the original manuscript disproves.
+
+### **Finding P0-06 — Some automatically generated statistical findings bypass source verification**
+
+**Source:** [Reviewer2PipelineService.kt, lines 2802–2936](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/data/ai/Reviewer2PipelineService.kt?utm_source=chatgpt.com#L2802-L2936)
+
+This is another significant defect.
+
+The code automatically introduces findings from the statistical and epistemic engines into the final evidence ledger. For several categories, it assigns `FindingStatus.VERIFIED` when the overall extraction confidence is at least 3/5.
+
+This affects internal numerical contradictions, model mismatches and epistemic contradiction-map findings.
+
+The problem is that **a reasonably well-extracted document does not prove that a particular criticism is correct**.
+
+A parser could mistakenly compare different endpoints, different analysis populations or unadjusted versus adjusted estimates. An overall extraction-confidence score cannot establish that those comparisons are scientifically equivalent.
+
+**Correction:** Each injected finding should pass its own source-evidence verification. For a cross-table contradiction, require both source passages, matching outcomes, compatible denominators, analysis populations, time points and statistical scales.
+
+Do not automatically elevate a deterministic *screening signal* to a verified scientific error.
+
+### **Finding P0-07 — The statistical engine can falsely flag valid confidence intervals**
+
+**Source:** [NumericalReconstructionEngine.kt, lines 873–896](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/data/ai/stats/NumericalReconstructionEngine.kt?utm_source=chatgpt.com#L873-L896)
+
+The application checks whether confidence intervals excluding the null are consistent with reported p-values.
+
+However, its significance check effectively assumes a 95% confidence interval and a conventional two-sided significance threshold, even though the parser supports other confidence levels.
+
+Consider this legitimate example:
+
+**Reported finding**
+
+`OR = 1.50 (90% CI 1.01–2.22), p = 0.09`
+
+A 90% confidence interval can exclude 1 while the corresponding two-sided p-value is greater than 0.05.
+
+**Current code behavior:** The interval excludes 1 and `p > 0.06`, so the code can classify the result as a confirmed internal contradiction.
+
+**Correct behavior:** Interpret the interval against its actual 90% confidence level and the declared testing procedure.
+
+There is a related problem with multiplicity-adjusted p-values. An unadjusted 95% confidence interval can exclude the null while a corresponding multiplicity-adjusted p-value exceeds 0.05. The current contradiction rule does not adequately account for this distinction.
+
+Because the statistical results are subsequently used to generate critical findings and potentially influence the overall verdict, this bug deserves immediate attention.
+
+**Correction:** Implement an assumption-aware consistency check that respects the confidence level, null value, testing direction, adjustment method and estimand. Where those details are unknown, return *Requires verification*, not *Confirmed error*.
+
+## **3. Further methodological and numerical weaknesses**
+
+### **Finding P1-08 — Clinical certainty is not actually calculated using GRADE**
+
+**Source:** [Clinical verdict resolver](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/data/ai/Reviewer2PipelineService.kt?utm_source=chatgpt.com#L3056-L3075)
+
+In clinical appraisal mode, the code converts the six-axis weighted credibility score into `HIGH_CERTAINTY`, `MODERATE_CERTAINTY`, `LOW_CERTAINTY` or `VERY_LOW_CERTAINTY`, with additional downgrades for critical errors.
+
+That is not a valid substitute for a GRADE assessment.
+
+GRADE certainty is assessed for individual outcomes and considers risk of bias, inconsistency, indirectness, imprecision and publication bias, with appropriate upgrading considerations in non-randomized evidence.
+
+Scientific originality and writing clarity do not directly translate into certainty of evidence for a clinical outcome.
+
+**Recommendation:** Keep the six-axis score as an internal appraisal summary, but do not call its transformed value GRADE certainty. Build a separate, outcome-specific GRADE module with transparent domain judgments and an explicit *Not assessable* state.
+
+### **Finding P1-09 — Several statistical calculations are technically correct in narrow circumstances but are overgeneralized**
+
+I found three examples in [NumericalReconstructionEngine.kt](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/data/ai/stats/NumericalReconstructionEngine.kt?utm_source=chatgpt.com).
+
+| Code location   | Remaining weakness                                                                                                                                     | Recommended correction                                                                           |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------ |
+| Lines 237–299   | NNT is derived as `1 / abs(ARR)` without preserving benefit-versus-harm direction                                                                      | Distinguish NNT for benefit from number needed to harm; handle intervals crossing no effect      |
+| Lines 305–319   | The function named `exactFisherTwoSidedP` switches to a chi-square approximation for large feasible ranges                                             | Explicitly label approximation and its limitations; never represent it as an exact Fisher result |
+| Lines 1009–1027 | Leave-one-out meta-analysis retains the original between-study variance estimate and compares significance using different confidence-interval methods | Re-estimate heterogeneity for every omitted study and use a consistent inference method          |
+
+These issues do not invalidate the entire quantitative engine. They do mean that the current claim of fully verified numerical reconstruction is too strong.
+
+There is also a naming inconsistency: the meta-analysis function uses Paule–Mandel variance estimation but stores its resulting random-effects estimate in fields named `randomEffectDL` and `randomSeDL`. That can mislead downstream interpretation or future maintenance.
+
+### **Finding P1-10 — Full-document review is still not guaranteed**
+
+**Source:** [ManuscriptExtractor.kt, PDF ingestion](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/util/ManuscriptExtractor.kt?utm_source=chatgpt.com#L498-L749) and [Prompt preparation](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/data/ai/Reviewer2PipelineService.kt?utm_source=chatgpt.com#L2136-L2277)
+
+Replacing the original raw-byte PDF parser with PDFBox was an important improvement.
+
+But the current implementation still has bounded extraction, page prioritization, prompt-budget selection and limited multimodal page attachments.
+
+For scanned PDFs, there is no complete document OCR pathway. The application may rely on a few rendered pages and a short filename-derived description.
+
+The new completeness safeguards recognize some of these limitations, which is good. However, the principal AI passes execute before the final stop-and-ask decision is determined.
+
+A 30-page scanned manuscript should not consume the complete review pipeline before the application concludes that it lacks sufficient evidence.
+
+**Correction:** Add a mandatory pre-inference document-readiness gate. If essential Methods, Results, tables or figures are inaccessible, request a searchable PDF or supporting material before running the full appraisal. For exceptionally long manuscripts, use section-aware retrieval rather than dropping entire pages.
+
+## **4. Provenance and PDF-generation flaws**
+
+### **Finding P1-11 — The report's model and image provenance can be inaccurate**
+
+**Source:** [Inference fallback handling](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/data/ai/Reviewer2PipelineService.kt?utm_source=chatgpt.com#L607-L703) and [Provenance construction](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/data/ai/Reviewer2PipelineService.kt?utm_source=chatgpt.com#L1106-L1152)
+
+The pipeline may select six visual pages for review, but the inference function limits the native primary request to four images, secondary requests to two and the final compatibility fallback to text only.
+
+External bring-your-own-key model calls also use the text-completion pathway rather than attaching those PDF page images.
+
+Nevertheless, the provenance disclosure is constructed from the selected vision pages rather than the images that the successful model request actually processed.
+
+Likewise, if an external model fails and the request falls back to Firebase, the recorded model provenance can still reflect the originally selected provider.
+
+**Required correction:** Record the actual successful model, model version, inference route, number and identity of image pages received, prompt coverage and fallback history for each pass.
+
+This should become part of the report's reproducibility appendix.
+
+### **Finding P1-12 — Different reports can overwrite one another during PDF export**
+
+**Source:** [PdfReportExporter.kt, export filename generation](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/util/PdfReportExporter.kt?utm_source=chatgpt.com#L77-L99)
+
+The export filename is generated from a shortened article-title slug and the selected report scope.
+
+Two reviews of the same manuscript therefore use the same cached PDF filename.
+
+Exporting a revised review can overwrite an earlier report, even while the earlier file URI is still being shared.
+
+**Correction:** Use a unique review identifier and export revision or UUID in the filename, write atomically, and define cache-retention and cleanup rules.
+
+### **Finding P1-13 — The PDF layout is improved, but long rubric text can still overflow**
+
+**Source:** [PDF rubric rendering](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/util/PdfReportExporter.kt?utm_source=chatgpt.com#L1040-L1106)
+
+The old 106-character justification truncation has been removed.
+
+The updated code now measures multiline rubric explanations, which is a clear improvement.
+
+However, a single extremely long rubric explanation is still rendered using `justLayout.draw(canvas)` as one unpaginated block.
+
+The implementation can start a new page before that row, but it does not split an individual oversized rationale across multiple pages.
+
+This creates a remaining clipping risk.
+
+**Correction:** Reuse the paragraph-pagination system for individual rubric explanations rather than drawing every explanation as one complete `StaticLayout`.
+
+The section-header logic is also substantially better, but still needs visual regression testing across long titles, long verdict labels and unusual font scaling.
+
+### **Finding P2-14 — PDF accessibility and source navigation remain incomplete**
+
+The exporter continues to use native Android `PdfDocument`.
+
+I did not find implementation of a PDF document outline, link annotations, tagged reading order or embedded source-document navigation.
+
+The `EvidenceAnchor` model defines `documentId` and `boundingBox`, but the inspected generation and presentation paths largely use page numbers, sections and extracted quotes. The coordinate fields are not yet functioning as a complete original-PDF highlighting system.
+
+For a professional academic report, the next step is navigable evidence: selecting a finding should open the relevant manuscript at its actual page and location.
+
+## **5. Privacy and security: meaningful progress, two remaining distinctions**
+
+The good changes are real.
+
+The current implementation encrypts newly stored provider keys using Android Keystore AES-GCM, prevents plaintext fallback when encryption is unavailable, uses an explicit database migration and disables automatic cross-provider fallback by default.
+
+There are still two qualifications worth addressing.
+
+First, [ApiKeyVault.kt](https://github.com/Kasi72/Paper-Critc/blob/main/app/src/main/java/com/example/data/local/ApiKeyVault.kt?utm_source=chatgpt.com#L148-L169) describes the vault as hardware-backed, but the code does not verify that the key is physically hardware-protected. Android Keystore availability does not itself prove hardware backing.
+
+Second, **Confidential Local-Only Mode prevents cloud archival synchronization, not remote AI processing**. Inference continues through Firebase or the selected external provider. The interface should communicate that clearly to anyone uploading an unpublished manuscript.
+
+For research confidentiality, I would label the setting **Local-Only Report Storage**, with a separate explicit statement about where manuscript content is processed.
+
+## **6. The test suite is broader, but does not yet establish scientific reliability**
+
+The current repository contains at least 84 test methods across five principal JVM/Robolectric test files.
+
+That is a major expansion from the earlier implementation. However, the tests primarily establish that the code behaves as expected against constructed examples.
+
+Current test-suite composition, from static source inspection
+
+07142128Core JVMStatisticalEpistemicSemanticRobolectric
+
+Counts are based on `@Test` methods in five inspected files. They are not independently confirmed passing results.
+
+There are three important coverage gaps.
+
+**The original 14-page manuscript is not the actual regression fixture.** The psychiatric-bed tests use a shortened textual reconstruction, while the PDF extraction tests generate small synthetic PDFs.
+
+**The calibration claims are limited.** The built-in benchmark calculates precision and recall on five synthetic cases, supplying fixed starting scores and an empty raw AI findings list. It does not execute the complete language-model review workflow. Therefore, even 100% benchmark accuracy would not demonstrate 100% accuracy on genuine journal articles.
+
+**The PDF structure test does not test the real exporter end to end.** The oversized-table test exercises a pagination plan and generates a separate test PDF using PDFBox. It does not prove that `PdfReportExporter.renderReviewToPdfStream()` produces an unclipped document for every difficult layout.
+
+The next validation effort should use a blinded set of real journal publications spanning systematic reviews, RCTs, observational studies, diagnostic research and qualitative papers, with expert-annotated findings. Include the full psychiatric-bed PDF, not merely excerpts of its content.
+
+## **7. Prioritized repair specification**
+
+This is the order in which I would fix the remaining issues.
+
+| Order | Work package                                        | Acceptance criterion                                                                                              |
+| ----- | --------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| 1     | **Single-source-of-truth reporting**                | No dismissed or unverified allegation can reappear as a confirmed criticism in another report section             |
+| 2     | **Evidence-aware counterargument engine**           | Negated method statements and prior-work references cannot falsely dismiss valid criticism                        |
+| 3     | **Per-finding scientific verification**             | Every `VERIFIED` finding has source authenticity and scientific entailment checks                                 |
+| 4     | **Numerical inference correctness**                 | 90% CI, adjusted-p, one-sided testing, NNT/NNH and meta-analysis sensitivity examples produce appropriate results |
+| 5     | **Migration and validation labels**                 | Legacy reports are unvalidated until reprocessed; empty evidence ledgers cannot imply full verification           |
+| 6     | **Actual provenance tracking**                      | Report shows the models, images and manuscript sections actually processed                                        |
+| 7     | **Clinical certainty redesign**                     | GRADE terminology is used only for valid outcome-specific GRADE assessments                                       |
+| 8     | **Document-readiness and PDF quality gates**        | Incomplete scanned documents are blocked before full review; long content exports without clipping                |
+| 9     | **Real-world benchmark and continuous integration** | Full manuscripts are tested against independent expert judgments and actual exported PDFs                         |
+
+## **Final assessment**
+
+The latest Paper Critic is **substantially stronger than the version I first reviewed**. The code now contains serious efforts to address numerical reconstruction, epistemic uncertainty, contradictory evidence, source provenance and scientific calibration.
+
+But it still has a critical architectural weakness: **the verification rules are not yet authoritative over every claim that reaches the final report.**
+
+That means the application can possess a good evidence ledger while still publishing unsupported reasoning in its prose sections. It can also make the opposite mistake—dismissing a valid criticism because a methodological term appears somewhere in the paper, even when the authors explicitly say they did not perform that analysis.
+
+My strongest recommendation is to make the next development effort a **Scientific Truth-Preservation Gate**, rather than another analytical expansion. No finding should become a confirmed criticism, alter the score, or appear in the final editorial synthesis unless its evidence, context and interpretation have passed validation.
+
+**Audit limitation:** This was a fresh static inspection of the latest accessible GitHub source at the stated revision. I have not independently run Gradle, the JVM/Robolectric suites, or a complete live-model manuscript review in this session. The defects above are code-supported findings or explicitly identified failure paths, not claims that I reproduced every failure in a running Android application.

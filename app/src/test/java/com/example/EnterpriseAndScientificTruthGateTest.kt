@@ -4,9 +4,12 @@ import android.content.Context
 import android.graphics.Bitmap
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
+import com.example.data.ai.ForensicPreFlightReport
 import com.example.data.ai.ManuscriptForensicEngine
 import com.example.data.ai.QuantFindingStatus
+import com.example.data.ai.QuantitativeForensicReport
 import com.example.data.ai.Reviewer2PipelineService
+import com.example.data.ai.StatcheckResult
 import com.example.data.ai.StudyDesignArchetype
 import com.example.data.ai.epistemic.BidirectionalAdjudicator
 import com.example.data.ai.epistemic.EpistemicSafeguardEngine
@@ -3036,7 +3039,7 @@ class EnterpriseAndScientificTruthGateTest {
     assertTrue("Exporter must record at least 3 section outline bookmarks (got ${recordedOutline.size})", recordedOutline.size >= 3)
     assertEquals("Executive Summary & 6-Axis Rubric", recordedOutline.first().title)
 
-    // 2. Build a real 2-page PDF via PDFBox, then enrich it with enrichPdfWithOutlineAndAccessibilityMetadata
+    // 2. Build a real 2-page PDF via PDFBox, then enrich it with enrichPdfWithOutlineAndCatalogMetadata
     val rawRealPdf = java.io.ByteArrayOutputStream().use { out ->
       com.tom_roush.pdfbox.pdmodel.PDDocument().use { doc ->
         repeat(2) { idx ->
@@ -3055,19 +3058,572 @@ class EnterpriseAndScientificTruthGateTest {
       out.toByteArray()
     }
 
-    val enrichedPdf = PdfReportExporter.enrichPdfWithOutlineAndAccessibilityMetadata(
+    val enrichedPdf = PdfReportExporter.enrichPdfWithOutlineAndCatalogMetadata(
       rawPdfBytes = rawRealPdf,
       review = review,
       outlineEntries = recordedOutline
     )
 
-    // 3. Re-parse enriched PDF bytes via PDFBox and verify interactive outline + PDF/UA metadata
+    // 3. Re-parse enriched PDF bytes via PDFBox and verify interactive outline + catalog metadata
     val diagnostics = PdfReportExporter.validateExportedPdfBytes(
       pdfBytes = enrichedPdf,
       requireByteExtraction = true
     )
     assertTrue("Enriched PDF must pass integrity verification: ${diagnostics.verificationFailureReason}", diagnostics.isClean)
     assertTrue("Enriched PDF must embed interactive document outline bookmarks (got ${diagnostics.outlineEntryCount})", diagnostics.outlineEntryCount >= 3)
-    assertTrue("Enriched PDF must embed title, language, and DisplayDocTitle accessibility metadata", diagnostics.hasPdfAccessibilityMetadata)
+    assertTrue("Enriched PDF must embed title, language, and DisplayDocTitle catalog metadata", diagnostics.hasPdfCatalogMetadata)
+  }
+
+  // =========================================================================
+  // 28 NOV 2026 DEEP AUDIT REGRESSION SUITE (auditV3_01 .. auditV3_05)
+  // =========================================================================
+
+  @Test
+  fun auditV3_01_pdfVisionContentDigest_invalidatesConsentOnSameCountBitmapSwapOrVisionToggle() = kotlinx.coroutines.runBlocking {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val db = Room.inMemoryDatabaseBuilder(context, PaperCriticSqlDatabase::class.java)
+      .allowMainThreadQueries()
+      .build()
+    try {
+      val vm = buildTestViewModel(context, db, initialUserId = "uid_vision_consent")
+      val sharedText = "Confidential trial manuscript text unchanged across PDF bitmap swap (N = 400, HR = 0.82)."
+
+      // Enable confidential mode + PDF vision pages
+      vm.updateSettings { it.copy(confidentialLocalOnly = true, enablePdfVisionPages = true) }
+      vm.updateManuscriptText(sharedText)
+
+      // PDF A: 2 pages with distinct blue/green pixel payloads
+      val pdfAPage1 = Bitmap.createBitmap(8, 8, Bitmap.Config.ARGB_8888).apply { eraseColor(android.graphics.Color.BLUE) }
+      val pdfAPage2 = Bitmap.createBitmap(8, 8, Bitmap.Config.ARGB_8888).apply { eraseColor(android.graphics.Color.GREEN) }
+      vm.updatePdfPageBitmapsForTest(listOf(pdfAPage1, pdfAPage2), visionPageNumbers = listOf(1, 2))
+
+      // Confirm consent for PDF A
+      vm.confirmRemoteInferenceForCurrentDraft()
+      assertTrue("Consent must be valid immediately after confirmation for PDF A", vm.isRemoteInferenceConsentValidNow())
+      val recordA = vm.currentRemoteConsentRecordForTest
+      assertNotNull("Consent record must be populated", recordA)
+      assertTrue("Consent record must store a 64-char SHA-256 PDF vision digest (never raw pixel bytes)", recordA!!.pdfVisionDigestSha256.length == 64)
+      assertTrue("Consent record must capture visionEnabled=true", recordA.visionEnabled)
+      assertEquals(listOf(1, 2), recordA.selectedVisionPages)
+
+      // Identical bitmap pixels with same text and same selected pages -> consent remains valid
+      val pdfACopy1 = Bitmap.createBitmap(8, 8, Bitmap.Config.ARGB_8888).apply { eraseColor(android.graphics.Color.BLUE) }
+      val pdfACopy2 = Bitmap.createBitmap(8, 8, Bitmap.Config.ARGB_8888).apply { eraseColor(android.graphics.Color.GREEN) }
+      vm.updatePdfPageBitmapsForTest(listOf(pdfACopy1, pdfACopy2), visionPageNumbers = listOf(1, 2))
+      assertTrue("Identical bitmap pixels and unchanged text must keep consent valid", vm.isRemoteInferenceConsentValidNow())
+
+      // PDF B: SAME page count (2), SAME dimensions (8x8), SAME manuscript text, DIFFERENT pixel contents!
+      val pdfBPage1 = Bitmap.createBitmap(8, 8, Bitmap.Config.ARGB_8888).apply { eraseColor(android.graphics.Color.RED) }
+      val pdfBPage2 = Bitmap.createBitmap(8, 8, Bitmap.Config.ARGB_8888).apply { eraseColor(android.graphics.Color.YELLOW) }
+      vm.updatePdfPageBitmapsForTest(listOf(pdfBPage1, pdfBPage2), visionPageNumbers = listOf(1, 2))
+      assertFalse(
+        "Replacing PDF page bitmaps with different pixels (same page count & text) MUST immediately invalidate remote consent",
+        vm.isRemoteInferenceConsentValidNow()
+      )
+      kotlinx.coroutines.yield()
+      org.robolectric.shadows.ShadowLooper.idleMainLooper()
+      assertFalse(
+        "hasValidRemoteInferenceConsent StateFlow must reflect invalidation after same-count bitmap swap",
+        vm.hasValidRemoteInferenceConsent.value
+      )
+
+      // Blocked at execution gate without fresh consent
+      vm.runAdversarialReviewAndSave()
+      val blockedState = vm.pipelineState.value as? com.example.ui.viewmodel.PipelineExecutionState.Error
+      assertTrue(
+        "Execution must be blocked after same-count PDF bitmap swap until re-confirmed",
+        blockedState != null && blockedState.message.contains("remote ai inference", ignoreCase = true)
+      )
+
+      // Confirm consent for PDF B -> valid again
+      vm.confirmRemoteInferenceForCurrentDraft()
+      assertTrue("Re-confirming consent for PDF B must validate consent", vm.isRemoteInferenceConsentValidNow())
+      assertNotEquals(
+        "PDF B vision digest must differ from PDF A vision digest",
+        recordA.pdfVisionDigestSha256,
+        vm.currentRemoteConsentRecordForTest!!.pdfVisionDigestSha256
+      )
+
+      // Changing selected vision page indices with same bitmaps MUST invalidate consent
+      vm.updatePdfPageBitmapsForTest(listOf(pdfBPage1, pdfBPage2), visionPageNumbers = listOf(1, 5))
+      assertFalse(
+        "Changing selected vision page indices must invalidate prior consent",
+        vm.isRemoteInferenceConsentValidNow()
+      )
+
+      // Re-confirm, then toggle vision-enabled setting OFF -> MUST invalidate consent
+      vm.confirmRemoteInferenceForCurrentDraft()
+      assertTrue(vm.isRemoteInferenceConsentValidNow())
+      vm.updateSettings { it.copy(enablePdfVisionPages = false) }
+      assertFalse(
+        "Toggling enablePdfVisionPages must invalidate prior consent",
+        vm.isRemoteInferenceConsentValidNow()
+      )
+    } finally {
+      db.close()
+    }
+  }
+
+  @Test
+  fun auditV3_02_typedPropositionEntailment_rejectsPopulationMagnitudeTimepointAdjustmentAndComparatorMismatches() {
+    // 1. Exact reproduction from 28 Nov 2026 P0 audit:
+    //    Finding: "Drug A reduced adult mortality by 5% at 12 months"
+    //    Quote/Prose: "Drug A reduced child mortality by 50% at 6 months"
+    val finding = ReviewFinding(
+      id = "R-01",
+      title = "Drug A reduced adult mortality by 5% at 12 months",
+      allegation = "Drug A reduced adult mortality by 5% at 12 months compared with placebo in the adjusted analysis.",
+      severity = "MAJOR",
+      status = FindingStatus.VERIFIED,
+      supportingEvidence = listOf(
+        EvidenceAnchor(
+          pageNumber = 2,
+          section = "Results",
+          exactQuote = "Drug A reduced child mortality by 50% at 6 months compared with placebo in the adjusted analysis."
+        )
+      )
+    )
+
+    val mismatchedQuote = "Drug A reduced child mortality by 50% at 6 months compared with placebo in the adjusted analysis."
+    val entailment = Reviewer2PipelineService.evaluateQuoteEntailment(
+      finding = finding,
+      matchedQuote = mismatchedQuote,
+      surroundingWindow = mismatchedQuote
+    )
+    assertNotEquals(
+      "Population/magnitude/time-point mismatch MUST NEVER return ENTAILED",
+      Reviewer2PipelineService.Companion.EntailmentStatus.ENTAILED,
+      entailment
+    )
+
+    // Prose citing [R-01] with child/50%/6-month mismatch must be quarantined out of verifiedStatements
+    val proseSection = Reviewer2PipelineService.buildEvidenceGovernedReportSection(
+      title = "Clinical Efficacy",
+      rawProse = "Drug A reduced child mortality by 50% at 6 months compared with placebo in the adjusted analysis [R-01].",
+      adjudicatedFindings = listOf(finding)
+    )
+    assertTrue(
+      "Mismatched population/magnitude/time-point prose MUST NOT enter verifiedStatements",
+      proseSection.verifiedStatements.isEmpty()
+    )
+    assertTrue(
+      "Mismatched prose must be quarantined under openQuestionsForInvestigation",
+      proseSection.openQuestionsForInvestigation.any { it.contains("50%") || it.contains("child") }
+    )
+
+    // 2. Single-dimension mismatches MUST EACH fail entailment AND prose consistency:
+    val baseFinding = ReviewFinding(
+      id = "R-02",
+      title = "Adjusted adult mortality reduction",
+      allegation = "Drug A vs placebo reduced adult mortality by 5% at 12 months in an adjusted analysis.",
+      severity = "MAJOR",
+      status = FindingStatus.VERIFIED
+    )
+    val singleAxisMismatches = listOf(
+      "magnitude 5% vs 50%" to "Drug A vs placebo reduced adult mortality by 50% at 12 months in an adjusted analysis.",
+      "population adults vs children" to "Drug A vs placebo reduced child mortality by 5% at 12 months in an adjusted analysis.",
+      "time point 12 months vs 6 months" to "Drug A vs placebo reduced adult mortality by 5% at 6 months in an adjusted analysis.",
+      "adjustment adjusted vs unadjusted" to "Drug A vs placebo reduced adult mortality by 5% at 12 months in an unadjusted analysis.",
+      "opposite comparator Drug A vs Drug B" to "Drug A vs Drug B reduced adult mortality by 5% at 12 months in an adjusted analysis.",
+      "reversed arm order Placebo vs Drug A" to "Placebo vs Drug A reduced adult mortality by 5% at 12 months in an adjusted analysis."
+    )
+    singleAxisMismatches.forEach { (label, mismatchedText) ->
+      val status = Reviewer2PipelineService.evaluateQuoteEntailment(baseFinding, mismatchedText, mismatchedText)
+      assertNotEquals(
+        "Single-axis mismatch ($label) MUST NOT be ENTAILED (got $status)",
+        Reviewer2PipelineService.Companion.EntailmentStatus.ENTAILED,
+        status
+      )
+      assertFalse(
+        "Single-axis mismatch ($label) MUST fail isProseSemanticallyConsistentWithFinding",
+        Reviewer2PipelineService.isProseSemanticallyConsistentWithFinding(mismatchedText, baseFinding)
+      )
+    }
+
+    // 3. Missing critical fields in quote must return UNRESOLVED (not ENTAILED)
+    val incompleteQuote = "Drug A reduced mortality in the study cohort."
+    val unresolvedStatus = Reviewer2PipelineService.evaluateQuoteEntailment(baseFinding, incompleteQuote, incompleteQuote)
+    assertEquals(
+      "Quote missing critical claim fields (population, magnitude, time point, comparator, adjustment) must return UNRESOLVED",
+      Reviewer2PipelineService.Companion.EntailmentStatus.UNRESOLVED,
+      unresolvedStatus
+    )
+
+    // 4. Exact-matching compatible typed proposition MUST pass both entailment and prose consistency
+    val compatibleText = "Drug A vs placebo reduced adult mortality by 5% at 12 months in an adjusted analysis."
+    assertEquals(
+      "Compatible typed proposition must be ENTAILED",
+      Reviewer2PipelineService.Companion.EntailmentStatus.ENTAILED,
+      Reviewer2PipelineService.evaluateQuoteEntailment(baseFinding, compatibleText, compatibleText)
+    )
+    assertTrue(
+      "Compatible typed proposition must pass prose consistency",
+      Reviewer2PipelineService.isProseSemanticallyConsistentWithFinding(compatibleText, baseFinding)
+    )
+  }
+
+  @Test
+  fun auditV3_03_deterministicPromotion_blocksVerifiedOnAssumptionsSubgroupAdjustedTransformedBootstrapAnd90CiMismatches() {
+    fun stubForensic(audit: com.example.data.ai.stats.StatisticalAuditReport): ForensicPreFlightReport =
+      ForensicPreFlightReport(
+        wordCount = 100,
+        estimatedPages = 2,
+        detectedDiscipline = "Clinical Medicine",
+        studyDesign = StudyDesignArchetype.CLINICAL_EPIDEMIOLOGICAL,
+        empiricalSignalsCount = 4,
+        theoreticalSignalsCount = 0,
+        extractedEquations = emptyList(),
+        symbolAndNotationAlerts = emptyList(),
+        extractedSampleSizes = emptyList(),
+        statisticalClaims = emptyList(),
+        grimAndNumericAlerts = emptyList(),
+        proceduralLeakageAlerts = emptyList(),
+        citationAlerts = emptyList(),
+        replicationCodeAlerts = emptyList(),
+        citationCountEstimate = 0,
+        quantForensics = QuantitativeForensicReport(
+          statcheckResults = emptyList(),
+          confidenceIntervalChecks = emptyList(),
+          medianIqrChecks = emptyList(),
+          heterogeneitySignals = emptyList(),
+          powerAndMultiplicityAlerts = emptyList(),
+          algebraicAndMetricAlerts = emptyList(),
+          diagnosticTable = emptyList(),
+          extractedPrecisionMetrics = emptyList(),
+          statisticalAudit = audit
+        )
+      )
+
+    // 1. Cross-section contradictions with incompatible typed contexts (subgroup vs overall, adjusted vs unadjusted,
+    //    log-transformed vs raw, bootstrap vs Wald, 90% CI vs 95% CI) MUST NEVER auto-promote to VERIFIED.
+    val incompatibleCases = listOf(
+      Triple(
+        "subgroup vs overall",
+        "[PAGE 1]\nOverall cohort analysis yielded HR = 0.80 (95% CI 0.70 to 0.91).\n[PAGE 2]\nSubgroup analysis yielded HR = 1.25 (95% CI 0.95 to 1.65).",
+        listOf("Overall cohort analysis yielded HR = 0.80 (95% CI 0.70 to 0.91).", "Subgroup analysis yielded HR = 1.25 (95% CI 0.95 to 1.65).")
+      ),
+      Triple(
+        "adjusted vs unadjusted",
+        "[PAGE 1]\nUnadjusted analysis showed OR = 1.85 (95% CI 1.20 to 2.85).\n[PAGE 2]\nMultivariable adjusted analysis showed OR = 1.12 (95% CI 0.88 to 1.42).",
+        listOf("Unadjusted analysis showed OR = 1.85 (95% CI 1.20 to 2.85).", "Multivariable adjusted analysis showed OR = 1.12 (95% CI 0.88 to 1.42).")
+      ),
+      Triple(
+        "log-transformed vs raw scale",
+        "[PAGE 1]\nOn the raw scale the mean difference was 4.2 (95% CI 1.1 to 7.3).\n[PAGE 2]\nOn the log-transformed scale the mean difference was 0.35 (95% CI 0.10 to 0.60).",
+        listOf("On the raw scale the mean difference was 4.2 (95% CI 1.1 to 7.3).", "On the log-transformed scale the mean difference was 0.35 (95% CI 0.10 to 0.60).")
+      ),
+      Triple(
+        "bootstrap vs Wald SE",
+        "[PAGE 1]\nUsing Wald standard errors, estimate was 2.10 (95% CI 1.50 to 2.70).\n[PAGE 2]\nUsing bootstrap resampling, estimate was 2.10 (95% CI 1.10 to 3.10).",
+        listOf("Using Wald standard errors, estimate was 2.10 (95% CI 1.50 to 2.70).", "Using bootstrap resampling, estimate was 2.10 (95% CI 1.10 to 3.10).")
+      ),
+      Triple(
+        "90% CI vs 95% CI",
+        "[PAGE 1]\nPrimary estimate was 1.40 (90% CI 1.10 to 1.70).\n[PAGE 2]\nPrimary estimate was 1.40 (95% CI 1.02 to 1.78).",
+        listOf("Primary estimate was 1.40 (90% CI 1.10 to 1.70).", "Primary estimate was 1.40 (95% CI 1.02 to 1.78).")
+      )
+    )
+
+    incompatibleCases.forEach { (label, docText, quotes) ->
+      val link = com.example.data.ai.stats.EvidenceCrossLink(
+        linkId = "XL-TEST-${label.hashCode()}",
+        linkType = "CROSS_SECTION_CONTRADICTION",
+        findingType = StatisticalFindingType.INTERNAL_CONTRADICTION,
+        status = QuantFindingStatus.FAIL,
+        pageNumbers = listOf(1, 2),
+        sectionsInvolved = listOf("Page 1", "Page 2"),
+        description = "Discrepant estimate across sections ($label)",
+        sourceQuotes = quotes
+      )
+      val statAudit = com.example.data.ai.stats.StatisticalAuditReport(
+        subDesign = com.example.data.ai.stats.AuditSubDesign.RCT,
+        claims = emptyList(),
+        twoByTwoTables = emptyList(),
+        metaStudyEffects = emptyList(),
+        sampleFlowRecords = emptyList(),
+        reconstructions = emptyList(),
+        crossLinks = listOf(link),
+        domainFindings = emptyList(),
+        unsupportedDisclosures = emptyList()
+      )
+      val result = Reviewer2PipelineService.adjudicateFindingsAndScores(
+        rawFindings = emptyList(),
+        manuscriptText = docText,
+        forensicReport = stubForensic(statAudit),
+        methodologyScore = 7,
+        significanceScore = 7,
+        clarityScore = 7,
+        originalityScore = 7,
+        mathRigorScore = 7,
+        reproducibilityScore = 7,
+        rawVerdict = "MINOR_REVISION",
+        reviewMode = ReviewMode.JOURNAL_REFEREE,
+        extractionConfidence = 5,
+        applyStatisticalScoreGate = true
+      )
+      val injected = result.adjudicatedFindings.firstOrNull { it.id.startsWith("S-") }
+      assertNotNull("Cross-link finding must be injected for $label", injected)
+      assertEquals(
+        "Cross-link with incompatible $label MUST NOT auto-promote to VERIFIED",
+        FindingStatus.PARTIALLY_SUPPORTED,
+        injected!!.status
+      )
+      assertEquals(
+        "Downgraded cross-link ($label) MUST carry REQUIRES_MANUAL_RECONCILIATION reportingStatus",
+        com.example.data.ai.epistemic.ReportingStatus.REQUIRES_MANUAL_RECONCILIATION.name,
+        injected.reportingStatus
+      )
+    }
+
+    // 2. Single-passage reconstruction in a bootstrap / 90% CI / log-transformed context must also stay PARTIALLY_SUPPORTED
+    val bootstrapDoc = "[PAGE 1]\nResults: Bootstrap resampling yielded OR = 2.40 (90% CI 1.15 to 3.80, p = 0.03) from the log-transformed model."
+    val rec = com.example.data.ai.stats.NumericalReconstructionResult(
+      checkId = "REC-BOOT-1",
+      calculatorName = "CI-to-SE Wald Reconstruction",
+      reportedValue = "OR = 2.40 (90% CI 1.15 to 3.80)",
+      recomputedValue = "Wald 95% CI mismatch",
+      tolerance = "0.05",
+      sourceEvidence = "Bootstrap resampling yielded OR = 2.40 (90% CI 1.15 to 3.80, p = 0.03)",
+      pageNumber = 1,
+      section = "Results",
+      assumptions = listOf("Asymptotic Wald 95% CI"),
+      status = QuantFindingStatus.FAIL,
+      findingType = StatisticalFindingType.ARITHMETIC_ERROR,
+      isScreeningSignal = false,
+      scientificConsequence = "Interval width differs from Wald normal approximation.",
+      detail = "Reported bounds differ from standard 95% Wald interval."
+    )
+    val recAudit = com.example.data.ai.stats.StatisticalAuditReport(
+      subDesign = com.example.data.ai.stats.AuditSubDesign.OBSERVATIONAL_COHORT,
+      claims = emptyList(),
+      twoByTwoTables = emptyList(),
+      metaStudyEffects = emptyList(),
+      sampleFlowRecords = emptyList(),
+      reconstructions = listOf(rec),
+      crossLinks = emptyList(),
+      domainFindings = emptyList(),
+      unsupportedDisclosures = emptyList()
+    )
+    val recResult = Reviewer2PipelineService.adjudicateFindingsAndScores(
+      rawFindings = emptyList(),
+      manuscriptText = bootstrapDoc,
+      forensicReport = stubForensic(recAudit),
+      methodologyScore = 7,
+      significanceScore = 7,
+      clarityScore = 7,
+      originalityScore = 7,
+      mathRigorScore = 7,
+      reproducibilityScore = 7,
+      rawVerdict = "MINOR_REVISION",
+      reviewMode = ReviewMode.JOURNAL_REFEREE,
+      extractionConfidence = 5,
+      applyStatisticalScoreGate = true
+    )
+    val injectedRec = recResult.adjudicatedFindings.first { it.id.startsWith("S-") }
+    assertEquals(
+      "Single-passage reconstruction under bootstrap/90% CI/log-transformed qualifiers MUST NOT auto-promote to VERIFIED",
+      FindingStatus.PARTIALLY_SUPPORTED,
+      injectedRec.status
+    )
+    assertEquals(
+      com.example.data.ai.epistemic.ReportingStatus.REQUIRES_MANUAL_RECONCILIATION.name,
+      injectedRec.reportingStatus
+    )
+  }
+
+  @Test
+  fun auditV3_04_pdfCatalogMetadata_renamedHonestlyWithoutClaimingTaggedPdfUa() {
+    com.tom_roush.pdfbox.android.PDFBoxResourceLoader.init(ApplicationProvider.getApplicationContext())
+    val rawMinimalPdf = java.io.ByteArrayOutputStream().use { out ->
+      com.tom_roush.pdfbox.pdmodel.PDDocument().use { doc ->
+        val page = com.tom_roush.pdfbox.pdmodel.PDPage(com.tom_roush.pdfbox.pdmodel.common.PDRectangle.A4)
+        doc.addPage(page)
+        com.tom_roush.pdfbox.pdmodel.PDPageContentStream(doc, page).use { cs ->
+          cs.beginText()
+          cs.setFont(com.tom_roush.pdfbox.pdmodel.font.PDType1Font.HELVETICA, 11f)
+          cs.newLineAtOffset(48f, 760f)
+          cs.showText("Minimal raw PDF without catalog language or DisplayDocTitle metadata.")
+          cs.endText()
+        }
+        doc.save(out)
+      }
+      out.toByteArray()
+    }
+    val rawDiag = PdfReportExporter.validateExportedPdfBytes(rawMinimalPdf, requireByteExtraction = true)
+    assertFalse("Raw unenriched PDF must report hasPdfCatalogMetadata=false", rawDiag.hasPdfCatalogMetadata)
+
+    val review = PaperReview(
+      id = "rev_catalog_honest",
+      title = "Catalog Metadata Honesty Verification",
+      validationStatus = "VERIFIED",
+      verdict = "MINOR_REVISION",
+      credibilityScore = 80
+    )
+    val enriched = PdfReportExporter.enrichPdfWithOutlineAndCatalogMetadata(
+      rawPdfBytes = rawMinimalPdf,
+      review = review,
+      outlineEntries = listOf(com.example.util.PdfOutlineEntry("Executive Summary", 0, 760f))
+    )
+    val enrichedDiag = PdfReportExporter.validateExportedPdfBytes(enriched, requireByteExtraction = true)
+    assertTrue("Enriched PDF must set hasPdfCatalogMetadata=true", enrichedDiag.hasPdfCatalogMetadata)
+    assertEquals("Enriched PDF must have 1 outline bookmark", 1, enrichedDiag.outlineEntryCount)
+  }
+
+  @Test
+  fun auditV3_05_partialCoverageAndLedgerCaps_surfaceOmissionCountsInDisclosurePdfAndBlockVerifiedStatus() {
+    // 1. Create a statistical audit with explicit discoverySkipped, reconstructionSkipped, unsupported, AND >2 statcheck ledger caps
+    val metrics = com.example.data.ai.stats.StatisticalCoverageMetrics(
+      discoveredTotal = 140,
+      parsedRetained = 100,
+      discoverySkipped = 40,
+      reconstructionEligible = 45,
+      reconstructedCompleted = 30,
+      reconstructionSkipped = 15,
+      unsupportedCount = 4,
+      truncatedPages = listOf(6, 7),
+      skippedCategories = listOf("ci_discovery_cap", "reconstruction_cap")
+    )
+    val statAudit = com.example.data.ai.stats.StatisticalAuditReport(
+      subDesign = com.example.data.ai.stats.AuditSubDesign.RCT,
+      claims = emptyList(),
+      twoByTwoTables = emptyList(),
+      metaStudyEffects = emptyList(),
+      sampleFlowRecords = emptyList(),
+      reconstructions = emptyList(),
+      crossLinks = emptyList(),
+      domainFindings = emptyList(),
+      unsupportedDisclosures = listOf("Missing raw Table S2", "Missing covariance matrix", "Missing subgroup counts", "Missing imputation code"),
+      totalDiscoveredClaims = 140,
+      truncatedClaimCount = 40,
+      truncatedPages = listOf(6, 7),
+      coverageMetrics = metrics
+    )
+
+    // Ledger cap: 4 failing statcheck results -> take(2) omits 2!
+    val fourStatchecks = (1..4).map { idx ->
+      StatcheckResult(
+        rawClaim = "t(40) = ${3.1 + idx * 0.1}, p = 0.08",
+        testType = "t",
+        reportedP = "p = 0.08",
+        recomputedP = 0.002,
+        status = QuantFindingStatus.FAIL,
+        note = "Statcheck mismatch #$idx",
+        pageNumber = idx
+      )
+    }
+    val forensic = ForensicPreFlightReport(
+      wordCount = 200,
+      estimatedPages = 4,
+      detectedDiscipline = "Clinical Medicine",
+      studyDesign = StudyDesignArchetype.CLINICAL_EPIDEMIOLOGICAL,
+      empiricalSignalsCount = 5,
+      theoreticalSignalsCount = 0,
+      extractedEquations = emptyList(),
+      symbolAndNotationAlerts = emptyList(),
+      extractedSampleSizes = emptyList(),
+      statisticalClaims = emptyList(),
+      grimAndNumericAlerts = emptyList(),
+      proceduralLeakageAlerts = emptyList(),
+      citationAlerts = emptyList(),
+      replicationCodeAlerts = emptyList(),
+      citationCountEstimate = 0,
+      quantForensics = QuantitativeForensicReport(
+        statcheckResults = fourStatchecks,
+        confidenceIntervalChecks = emptyList(),
+        medianIqrChecks = emptyList(),
+        heterogeneitySignals = emptyList(),
+        powerAndMultiplicityAlerts = emptyList(),
+        algebraicAndMetricAlerts = emptyList(),
+        diagnosticTable = emptyList(),
+        extractedPrecisionMetrics = emptyList(),
+        statisticalAudit = statAudit
+      )
+    )
+    val adjudicated = Reviewer2PipelineService.adjudicateFindingsAndScores(
+      rawFindings = emptyList(),
+      manuscriptText = fourStatchecks.joinToString("\n") { "[PAGE ${it.pageNumber}]\n${it.rawClaim}" },
+      forensicReport = forensic,
+      methodologyScore = 7,
+      significanceScore = 7,
+      clarityScore = 7,
+      originalityScore = 7,
+      mathRigorScore = 7,
+      reproducibilityScore = 7,
+      rawVerdict = "MINOR_REVISION",
+      reviewMode = ReviewMode.JOURNAL_REFEREE,
+      extractionConfidence = 5,
+      applyStatisticalScoreGate = true
+    )
+
+    assertEquals("4 statcheck FAILs capped at 2 must record ledgerCapOmittedCount=2", 2, adjudicated.ledgerCapOmittedCount)
+    assertTrue(
+      "ledgerCapCategories must disclose statcheck ledger cap",
+      adjudicated.ledgerCapCategories.any { it.contains("statcheck_ledger_cap") }
+    )
+
+    val summaryLine = statAudit.formatCoverageLedgerSummary(
+      ledgerCapOmittedCount = adjudicated.ledgerCapOmittedCount,
+      ledgerCapCategories = adjudicated.ledgerCapCategories
+    )
+    assertTrue("Summary must explicitly flag Quantitative Coverage Partial", summaryLine.contains("Quantitative Coverage Partial"))
+    assertTrue("Summary must report discoverySkipped=40", summaryLine.contains("discoverySkipped=40"))
+    assertTrue("Summary must report reconstructionSkipped=15", summaryLine.contains("reconstructionSkipped=15"))
+    assertTrue("Summary must report unsupported=4", summaryLine.contains("unsupported=4"))
+    assertTrue("Summary must report ledgerCapOmitted=2", summaryLine.contains("ledgerCapOmitted=2"))
+    assertFalse("Summary must never claim complete quantitative audit", summaryLine.contains("complete quantitative audit", ignoreCase = true))
+
+    // 2. Capped ledger MUST block VERIFIED validation status even if all visible findings were VERIFIED
+    val verifiedFinding = ReviewFinding(
+      id = "F-1",
+      title = "Verified Finding",
+      allegation = "Verified allegation",
+      severity = "MAJOR",
+      status = FindingStatus.VERIFIED
+    )
+    val validationStatus = Reviewer2PipelineService.computeValidationStatus(
+      resolvedVerdict = "MINOR_REVISION",
+      adjudicatedFindings = listOf(verifiedFinding),
+      anyJsonRepaired = false,
+      omittedOrPartialPromptPagesCount = 0,
+      wasPromptTrimmed = false,
+      extractionConfidence = 5,
+      hasSubstantiveEditorialProse = true,
+      truncatedStatisticalClaimCount = adjudicated.ledgerCapOmittedCount
+    )
+    assertEquals(
+      "Ledger-cap omissions must downgrade validationStatus from VERIFIED to PARTIALLY_VALIDATED",
+      "PARTIALLY_VALIDATED",
+      validationStatus
+    )
+
+    // 3. PDF export must surface partial quantitative coverage & caps prominently without claiming complete coverage
+    val review = PaperReview(
+      id = "rev_partial_cov_pdf",
+      title = "Partial Coverage & Ledger Cap Disclosure Test",
+      validationStatus = validationStatus,
+      verdict = "MAJOR_REVISION",
+      credibilityScore = 71,
+      coverageDisclosure = "Full text extracted • $summaryLine",
+      abstractSummary = "Executive appraisal summary."
+    )
+    val rendered = PdfReportExporter.renderAndInspectPdf(
+      review = review,
+      scope = PdfExportScope.SCIENTIFIC_APPRAISAL_REPORT
+    )
+    assertTrue("PDF render must be clean: ${rendered.diagnostics.verificationFailureReason}", rendered.diagnostics.isClean)
+    assertTrue(
+      "Rendered PDF text must contain QUANTITATIVE COVERAGE PARTIAL banner",
+      rendered.renderedText.contains("QUANTITATIVE COVERAGE PARTIAL")
+    )
+    assertTrue(
+      "Rendered PDF text must report discoverySkipped=40 and ledgerCapOmitted=2",
+      rendered.renderedText.contains("discoverySkipped=40") &&
+        rendered.renderedText.contains("ledgerCapOmitted=2")
+    )
+    assertFalse(
+      "Rendered PDF text must never claim complete quantitative audit when caps are nonzero",
+      rendered.renderedText.contains("complete quantitative audit", ignoreCase = true)
+    )
   }
 }
+

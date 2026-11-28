@@ -15,7 +15,8 @@ enum class ReportingStatus(val displayLabel: String) {
   REPORTED_AND_ADEQUATE("Reported and adequate"),
   REPORTED_BUT_INADEQUATE("Reported but inadequate"),
   NOT_REPORTED("Not reported"),
-  NOT_ASSESSABLE_FROM_SUPPLIED_MATERIAL("Not assessable from supplied material");
+  NOT_ASSESSABLE_FROM_SUPPLIED_MATERIAL("Not assessable from supplied material"),
+  REQUIRES_MANUAL_RECONCILIATION("Requires manual reconciliation");
 
   companion object {
     fun fromNameOrDefault(raw: String?): ReportingStatus =

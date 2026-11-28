@@ -52,7 +52,9 @@ data class ConfidenceIntervalCheck(
   val status: QuantFindingStatus,
   val note: String,
   val pageNumber: Int = 0,
-  val crossReferenceNote: String = ""
+  val crossReferenceNote: String = "",
+  val crossReferenceQuote: String = "",
+  val crossReferencePage: Int = 0
 )
 
 data class MedianIqrCheck(
@@ -741,7 +743,9 @@ object QuantitativeForensicAnalyzer {
             status = QuantFindingStatus.FAIL,
             note = "Impossible CI geometry: reported point estimate ($pt) falls OUTSIDE its own interval [$low, $high].",
             pageNumber = cand.pageNumber,
-            crossReferenceNote = xrefNote
+            crossReferenceNote = xrefNote,
+            crossReferenceQuote = matchingAlternate?.raw.orEmpty(),
+            crossReferencePage = matchingAlternate?.pageNumber ?: 0
           )
         )
         continue

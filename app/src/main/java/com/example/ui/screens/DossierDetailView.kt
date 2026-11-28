@@ -595,6 +595,38 @@ fun DossierDetailView(
           }
         }
 
+        if (review.coverageDisclosure.contains("Quantitative Coverage Partial", ignoreCase = true) ||
+          review.coverageDisclosure.contains("omitted by cap", ignoreCase = true)
+        ) {
+          Spacer(modifier = Modifier.height(6.dp))
+          val partialShape = SquircleShape(cornerRadius = 8.dp, smoothing = 0.88f)
+          Column(
+            modifier = Modifier
+              .fillMaxWidth()
+              .clip(partialShape)
+              .background(CupertinoAmber.copy(alpha = 0.12f))
+              .border(0.75.dp, CupertinoAmber.copy(alpha = 0.45f), partialShape)
+              .padding(horizontal = 10.dp, vertical = 7.dp)
+              .testTag("dossier_partial_coverage_banner"),
+            verticalArrangement = Arrangement.spacedBy(3.dp)
+          ) {
+            Text(
+              text = "QUANTITATIVE COVERAGE PARTIAL — CAPS APPLIED",
+              style = MaterialTheme.typography.labelSmall,
+              fontFamily = JetBrainsMonoFamily,
+              fontSize = 9.5.sp,
+              fontWeight = FontWeight.Bold,
+              color = CupertinoAmber
+            )
+            Text(
+              text = "Discovery, reconstruction, unsupported-domain, or ledger-injection caps were reached. Scores and verdicts reflect partial deterministic screening, not a complete quantitative audit.",
+              style = MaterialTheme.typography.labelSmall,
+              fontSize = 10.sp,
+              color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+          }
+        }
+
         if (review.ledgerLoadState != LedgerLoadState.COMPLETE) {
           Spacer(modifier = Modifier.height(6.dp))
           val degradedShape = SquircleShape(cornerRadius = 8.dp, smoothing = 0.88f)

@@ -83,10 +83,25 @@ sealed interface AiProviderRoute {
   data class UnavailableCustomProvider(val providerId: String, val reason: String) : AiProviderRoute
 }
 
+/**
+ * Canonical digest of PDF page images actually eligible for remote vision inference.
+ * Streams page index, dimensions, bitmap config, and deterministic pixel bytes into SHA-256
+ * without ever persisting raw image bytes.
+ */
+data class PdfVisionContentDigest(
+  val visionEnabled: Boolean,
+  val bitmapCount: Int,
+  val selectedPageIndices: List<Int>,
+  val sha256Hex: String
+)
+
 data class RemoteInferenceConsentRecord(
   val manuscriptContentSha256: String,
   val replicationCodeSha256: String,
   val pdfBitmapCount: Int,
+  val visionEnabled: Boolean = true,
+  val selectedVisionPages: List<Int> = emptyList(),
+  val pdfVisionDigestSha256: String = "",
   val providerFingerprint: String,
   val ownerScope: String,
   val sessionGeneration: Long
@@ -476,6 +491,8 @@ class PaperCriticViewModel(
   val formState: StateFlow<WorkbenchFormState> = _formState.asStateFlow()
 
   private val _remoteInferenceConsent = MutableStateFlow<RemoteInferenceConsentRecord?>(null)
+  internal val currentRemoteConsentRecordForTest: RemoteInferenceConsentRecord?
+    get() = _remoteInferenceConsent.value
 
   val hasValidRemoteInferenceConsent: StateFlow<Boolean> = combine(
     _remoteInferenceConsent,
@@ -492,7 +509,8 @@ class PaperCriticViewModel(
         form = form,
         providerRoute = route,
         ownerScope = scope,
-        sessionGen = sessionGeneration.get()
+        sessionGen = sessionGeneration.get(),
+        enablePdfVisionPages = settings.enablePdfVisionPages
       )
       consent != null && consent == expected
     }
@@ -506,19 +524,38 @@ class PaperCriticViewModel(
       form = _formState.value,
       providerRoute = route,
       ownerScope = currentOwnerScope(),
-      sessionGen = sessionGeneration.get()
+      sessionGen = sessionGeneration.get(),
+      enablePdfVisionPages = settings.enablePdfVisionPages
     )
     return _remoteInferenceConsent.value != null && _remoteInferenceConsent.value == expected
   }
 
   fun confirmRemoteInferenceForCurrentDraft() {
-    val route = resolveAiProviderRoute(_settingsState.value, apiProviders.value)
+    val settings = _settingsState.value
+    val route = resolveAiProviderRoute(settings, apiProviders.value)
     _remoteInferenceConsent.value = computeRemoteConsentKey(
       form = _formState.value,
       providerRoute = route,
       ownerScope = currentOwnerScope(),
-      sessionGen = sessionGeneration.get()
+      sessionGen = sessionGeneration.get(),
+      enablePdfVisionPages = settings.enablePdfVisionPages
     )
+  }
+
+  internal fun updatePdfPageBitmapsForTest(
+    bitmaps: List<Bitmap>,
+    visionPageNumbers: List<Int> = (1..bitmaps.size).toList()
+  ) {
+    _formState.update { current ->
+      val updatedCov = (current.coverageReport ?: DocumentCoverageReport.forCompleteText(current.manuscriptText)).copy(
+        visionPagesAttached = bitmaps.size,
+        visionPageNumbers = visionPageNumbers
+      )
+      current.copy(
+        pdfPageBitmaps = bitmaps,
+        coverageReport = updatedCov
+      )
+    }
   }
 
   // Off-main-thread debounced deterministic pre-flight forensic & quantitative audit
@@ -1360,16 +1397,17 @@ class PaperCriticViewModel(
     val initiatingOwnerScope = normalizeOwnerScope(initiatingUid)
     val initiatingSessionGen = sessionGeneration.get()
 
-    // Finding 8: Enforce content-bound remote inference consent AT THE ANALYSIS BOUNDARY
+    // Finding 8 + P1 Vision Consent: Enforce content-bound remote inference consent AT THE ANALYSIS BOUNDARY
     if (settings.confidentialLocalOnly) {
       val requiredConsent = computeRemoteConsentKey(
         form = form,
         providerRoute = providerRoute,
         ownerScope = initiatingOwnerScope,
-        sessionGen = initiatingSessionGen
+        sessionGen = initiatingSessionGen,
+        enablePdfVisionPages = settings.enablePdfVisionPages
       )
       if (_remoteInferenceConsent.value != requiredConsent) {
-        val msg = "Remote AI inference consent is required for this exact manuscript content, code attachment, and provider under Local-Only Report Storage."
+        val msg = "Remote AI inference consent is required for this exact manuscript content, PDF page images, code attachment, and provider under Local-Only Report Storage."
         _pipelineState.value = PipelineExecutionState.Error(msg)
         _statusBanner.value = msg
         return
@@ -2209,11 +2247,64 @@ class PaperCriticViewModel(
       return digest.digest(text.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
     }
 
+    internal fun computePdfVisionContentDigest(
+      bitmaps: List<Bitmap>,
+      visionEnabled: Boolean,
+      selectedPageIndices: List<Int> = (1..bitmaps.size).toList()
+    ): PdfVisionContentDigest {
+      val normalizedPages = if (!visionEnabled || bitmaps.isEmpty()) {
+        emptyList()
+      } else if (selectedPageIndices.size == bitmaps.size) {
+        selectedPageIndices
+      } else {
+        (0 until bitmaps.size).map { idx -> selectedPageIndices.getOrElse(idx) { idx + 1 } }
+      }
+      val digest = java.security.MessageDigest.getInstance("SHA-256")
+      val header = "pdf_vision_v1|enabled=$visionEnabled|count=${if (visionEnabled) bitmaps.size else 0}|pages=${normalizedPages.joinToString(",")}|"
+      digest.update(header.toByteArray(Charsets.UTF_8))
+
+      if (visionEnabled && bitmaps.isNotEmpty()) {
+        bitmaps.forEachIndexed { idx, bmp ->
+          val pageNum = normalizedPages.getOrElse(idx) { idx + 1 }
+          val w = if (bmp.isRecycled) 0 else bmp.width
+          val h = if (bmp.isRecycled) 0 else bmp.height
+          val cfg = if (bmp.isRecycled) "RECYCLED" else (bmp.config?.name ?: "UNKNOWN")
+          val meta = "page=$pageNum;idx=$idx;w=$w;h=$h;cfg=$cfg;recycled=${bmp.isRecycled}|"
+          digest.update(meta.toByteArray(Charsets.UTF_8))
+          if (!bmp.isRecycled && w > 0 && h > 0) {
+            val rowPixels = IntArray(w)
+            val rowBytes = ByteArray(w * 4)
+            for (y in 0 until h) {
+              bmp.getPixels(rowPixels, 0, w, 0, y, w, 1)
+              var outIdx = 0
+              for (x in 0 until w) {
+                val px = rowPixels[x]
+                rowBytes[outIdx++] = ((px ushr 24) and 0xFF).toByte()
+                rowBytes[outIdx++] = ((px ushr 16) and 0xFF).toByte()
+                rowBytes[outIdx++] = ((px ushr 8) and 0xFF).toByte()
+                rowBytes[outIdx++] = (px and 0xFF).toByte()
+              }
+              digest.update(rowBytes)
+            }
+          }
+        }
+      }
+
+      val hex = digest.digest().joinToString("") { "%02x".format(it) }
+      return PdfVisionContentDigest(
+        visionEnabled = visionEnabled,
+        bitmapCount = if (visionEnabled) bitmaps.size else 0,
+        selectedPageIndices = normalizedPages,
+        sha256Hex = hex
+      )
+    }
+
     internal fun computeRemoteConsentKey(
       form: WorkbenchFormState,
       providerRoute: AiProviderRoute,
       ownerScope: String,
-      sessionGen: Long
+      sessionGen: Long,
+      enablePdfVisionPages: Boolean = true
     ): RemoteInferenceConsentRecord {
       val providerFingerprint = when (providerRoute) {
         is AiProviderRoute.BuiltInKeyless -> "firebase_ai_logic_keyless"
@@ -2221,10 +2312,24 @@ class PaperCriticViewModel(
           "custom:${providerRoute.provider.id}:${providerRoute.provider.baseUrl.trim()}:${providerRoute.provider.modelId.trim()}"
         is AiProviderRoute.UnavailableCustomProvider -> "unavailable:${providerRoute.providerId}"
       }
+      val effectiveVisionPages = if (enablePdfVisionPages) {
+        val rawPages = form.coverageReport?.visionPageNumbers.orEmpty()
+        if (rawPages.size == form.pdfPageBitmaps.size) rawPages else (1..form.pdfPageBitmaps.size).toList()
+      } else {
+        emptyList()
+      }
+      val visionDigest = computePdfVisionContentDigest(
+        bitmaps = form.pdfPageBitmaps,
+        visionEnabled = enablePdfVisionPages,
+        selectedPageIndices = effectiveVisionPages
+      )
       return RemoteInferenceConsentRecord(
         manuscriptContentSha256 = sha256Hex(form.manuscriptText),
         replicationCodeSha256 = sha256Hex(resolveBoundReplicationCode(form)),
-        pdfBitmapCount = form.pdfPageBitmaps.size,
+        pdfBitmapCount = visionDigest.bitmapCount,
+        visionEnabled = visionDigest.visionEnabled,
+        selectedVisionPages = visionDigest.selectedPageIndices,
+        pdfVisionDigestSha256 = visionDigest.sha256Hex,
         providerFingerprint = providerFingerprint,
         ownerScope = normalizeOwnerScope(ownerScope),
         sessionGeneration = sessionGen

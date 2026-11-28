@@ -586,6 +586,8 @@ object BidirectionalAdjudicator {
     val lower = combinedClaim.lowercase(Locale.US)
     return when {
       status == FindingStatus.CONTRADICTED -> ReportingStatus.REPORTED_AND_ADEQUATE
+      !stopTriggered && finding.reportingStatus == ReportingStatus.REQUIRES_MANUAL_RECONCILIATION.name ->
+        ReportingStatus.REQUIRES_MANUAL_RECONCILIATION
       defenseOutcome == DefenseOutcome.DOWNGRADED || stopTriggered || lower.contains("supplementary") || lower.contains("not assessable") || lower.contains("unsupported") ->
         ReportingStatus.NOT_ASSESSABLE_FROM_SUPPLIED_MATERIAL
       lower.contains("not reported") || lower.contains("omitted") || lower.contains("missing") || lower.contains("no mention") ->

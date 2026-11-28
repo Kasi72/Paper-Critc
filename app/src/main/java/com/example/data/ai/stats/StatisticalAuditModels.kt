@@ -385,6 +385,30 @@ data class StatisticalAuditReport(
       domainFindings.count { it.findingType == StatisticalFindingType.UNSUPPORTED_TO_ASSESS } +
       unsupportedDisclosures.size
 
+  fun formatCoverageLedgerSummary(
+    ledgerCapOmittedCount: Int = 0,
+    ledgerCapCategories: List<String> = emptyList()
+  ): String {
+    val allCaps = (coverageMetrics.skippedCategories + ledgerCapCategories).distinct()
+    val anyOmission = coverageMetrics.discoverySkipped > 0 ||
+      coverageMetrics.reconstructionSkipped > 0 ||
+      coverageMetrics.unsupportedCount > 0 ||
+      ledgerCapOmittedCount > 0 ||
+      truncatedClaimCount > 0
+    val capDesc = if (allCaps.isNotEmpty()) " [caps: ${allCaps.joinToString(", ")}]" else ""
+    val pageDesc = if (coverageMetrics.truncatedPages.isNotEmpty()) {
+      " on page(s) ${coverageMetrics.truncatedPages.joinToString(",")}"
+    } else ""
+    return if (anyOmission) {
+      "Quantitative Coverage Partial: discoverySkipped=${coverageMetrics.discoverySkipped}, " +
+        "reconstructionSkipped=${coverageMetrics.reconstructionSkipped}, " +
+        "unsupported=${coverageMetrics.unsupportedCount}, " +
+        "ledgerCapOmitted=$ledgerCapOmittedCount$pageDesc$capDesc"
+    } else {
+      "Quantitative Coverage (Parser Scope): discoverySkipped=0, reconstructionSkipped=0, unsupported=0, ledgerCapOmitted=0 (human statistical review still advised)"
+    }
+  }
+
   fun toPromptBlock(): String = buildString {
     appendLine("[DESIGN-AWARE STATISTICAL AUDIT SUBSYSTEM — ${subDesign.displayName}]")
     appendLine(
@@ -401,20 +425,8 @@ data class StatisticalAuditReport(
         "Skipped=${coverageMetrics.totalSkippedCoverage} " +
         "(DiscoverySkipped=${coverageMetrics.discoverySkipped}, ReconstructionSkipped=${coverageMetrics.reconstructionSkipped})."
     )
-    if (coverageMetrics.hasIncompleteCoverage || truncatedClaimCount > 0) {
-      val pagesDesc = if (coverageMetrics.truncatedPages.isNotEmpty()) {
-        " on page(s) ${coverageMetrics.truncatedPages.joinToString(", ")}"
-      } else {
-        ""
-      }
-      val catDesc = if (coverageMetrics.skippedCategories.isNotEmpty()) {
-        " [categories: ${coverageMetrics.skippedCategories.joinToString(", ")}]"
-      } else {
-        ""
-      }
-      appendLine(
-        "QUANTITATIVE COVERAGE PARTIAL (TRUNCATION NOTICE): ${coverageMetrics.totalSkippedCoverage} statistical item(s)$pagesDesc were skipped by discovery/reconstruction caps$catDesc (total discovered: ${coverageMetrics.discoveredTotal}). Do NOT claim complete quantitative coverage."
-      )
+    if (coverageMetrics.hasIncompleteCoverage || truncatedClaimCount > 0 || coverageMetrics.unsupportedCount > 0) {
+      appendLine("QUANTITATIVE COVERAGE PARTIAL (TRUNCATION NOTICE): ${formatCoverageLedgerSummary()}. Do NOT claim complete quantitative coverage.")
     }
     appendLine(
       "Deterministic Audit Counts: $verifiedArithmeticErrorCount ARITHMETIC_ERROR, " +

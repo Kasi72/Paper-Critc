@@ -1292,8 +1292,10 @@ class Reviewer2PipelineService {
       reviewMode = options.reviewMode
     )
     val anyJsonRepaired = pass1Result.wasRepaired || pass2Result.wasRepaired || (quantResultOrNull?.wasRepaired == true)
-    val statTruncatedCount = forensicReport.quantForensics?.statisticalAudit?.truncatedClaimCount ?: 0
-    val statTruncatedPages = forensicReport.quantForensics?.statisticalAudit?.truncatedPages.orEmpty()
+    val statAuditForCoverage = forensicReport.quantForensics?.statisticalAudit
+    val statTruncatedCount = statAuditForCoverage?.truncatedClaimCount ?: 0
+    val statReconstructionSkipped = statAuditForCoverage?.coverageMetrics?.reconstructionSkipped ?: 0
+    val totalQuantitativeCapOmissions = statTruncatedCount + statReconstructionSkipped + adjudicated.ledgerCapOmittedCount
     val validationStatus = computeValidationStatus(
       resolvedVerdict = verdict,
       adjudicatedFindings = adjudicated.adjudicatedFindings,
@@ -1303,7 +1305,7 @@ class Reviewer2PipelineService {
       extractionConfidence = extractionConfidence,
       hasSubstantiveEditorialProse = pass2Json.optString("stage08aTo08bAlchemistEditorNote", "").isNotBlank() ||
         pass2Json.optString("stage04aIsItCredibleEssay", "").isNotBlank(),
-      truncatedStatisticalClaimCount = statTruncatedCount
+      truncatedStatisticalClaimCount = totalQuantitativeCapOmissions
     )
     // P1-11: Record ACTUAL executed models, routes, image pages processed, and fallback history
     val actualFallbackNotes = (pass1Result.fallbackHistory + pass2Result.fallbackHistory + quantResultOrNull?.fallbackHistory.orEmpty()).distinct()
@@ -1335,9 +1337,23 @@ class Reviewer2PipelineService {
       if (actualFallbackNotes.isNotEmpty()) {
         append(" • Fallbacks: ${actualFallbackNotes.joinToString(" | ")}")
       }
-      if (statTruncatedCount > 0) {
-        val pageDesc = if (statTruncatedPages.isNotEmpty()) " (pages ${statTruncatedPages.joinToString(",")})" else ""
-        append(" • Quantitative Coverage Partial: $statTruncatedCount statistical claim(s) omitted by cap$pageDesc")
+      if (statAuditForCoverage != null) {
+        append(
+          " • ${
+            statAuditForCoverage.formatCoverageLedgerSummary(
+              ledgerCapOmittedCount = adjudicated.ledgerCapOmittedCount,
+              ledgerCapCategories = adjudicated.ledgerCapCategories
+            )
+          }"
+        )
+      } else if (adjudicated.ledgerCapOmittedCount > 0) {
+        val capDesc = if (adjudicated.ledgerCapCategories.isNotEmpty()) {
+          " [caps: ${adjudicated.ledgerCapCategories.distinct().joinToString(", ")}]"
+        } else ""
+        append(
+          " • Quantitative Coverage Partial: discoverySkipped=0, reconstructionSkipped=0, unsupported=0, " +
+            "ledgerCapOmitted=${adjudicated.ledgerCapOmittedCount}$capDesc"
+        )
       }
       if (primaryPrepared.wasTrimmed && primaryPrepared.trimmedNote.isNotBlank()) {
         append(" • ${primaryPrepared.trimmedNote}")
@@ -2308,7 +2324,9 @@ class Reviewer2PipelineService {
     val reproducibilityScore: Int,
     val weightedCredibilityScore: Int,
     val resolvedVerdict: String,
-    val scoreBreakdown: ScoreCalculationBreakdown? = null
+    val scoreBreakdown: ScoreCalculationBreakdown? = null,
+    val ledgerCapOmittedCount: Int = 0,
+    val ledgerCapCategories: List<String> = emptyList()
   )
 
   companion object {
@@ -2999,7 +3017,11 @@ class Reviewer2PipelineService {
         )
       }.toMutableList()
 
-      // 3. Auto-inject deterministic QuantitativeForensicAnalyzer FAIL findings with careful epistemic status
+      // 3. Auto-inject deterministic QuantitativeForensicAnalyzer FAIL findings with strict
+      // source-authenticity vs. semantic-compatibility separation & explicit ledger-cap accounting.
+      var ledgerCapOmittedCount = 0
+      val ledgerCapCategories = mutableListOf<String>()
+
       if (forensicReport != null) {
         var nextQuantIdx = 1
         forensicReport.quantForensics.confidenceIntervalChecks
@@ -3011,23 +3033,83 @@ class Reviewer2PipelineService {
                   existing.supportingEvidence.any { it.pageNumber == ci.pageNumber && ci.pageNumber > 0 })
             }
             if (!alreadyCovered) {
-              val hasCrossRefCorroboration = ci.crossReferenceNote.isNotBlank()
+              val hasCrossRefCorroboration = ci.crossReferenceNote.isNotBlank() && ci.crossReferenceQuote.isNotBlank()
               val quoteCheck = verifyQuoteInManuscript(ci.rawClaim, manuscriptText, ci.pageNumber)
+              val xrefCheck = if (hasCrossRefCorroboration) {
+                verifyQuoteInManuscript(ci.crossReferenceQuote, manuscriptText, ci.crossReferencePage)
+              } else {
+                QuoteVerificationResult(QuoteMatchKind.NONE, resolvedPage = 0)
+              }
+              val primaryWindow = extractQuoteContextWindow(manuscriptText, quoteCheck, ci.rawClaim)
+              val xrefWindow = if (xrefCheck.matchKind == QuoteMatchKind.EXACT) {
+                extractQuoteContextWindow(manuscriptText, xrefCheck, ci.crossReferenceQuote)
+              } else ""
+              val primaryQualifier = hasConflictingReconstructionQualifiers(primaryWindow)
+              val xrefQualifier = if (xrefWindow.isNotBlank()) hasConflictingReconstructionQualifiers(xrefWindow) else null
+              val dualCompatibility = if (xrefCheck.matchKind == QuoteMatchKind.EXACT) {
+                evaluateDualPassageTypedCompatibility(primaryWindow, xrefWindow)
+              } else {
+                PropositionComparison(PropositionCompatibility.UNRESOLVED_INSUFFICIENT_FIELDS, "missing independent second passage")
+              }
               val isCorroboratedVerified = hasCrossRefCorroboration &&
                 quoteCheck.matchKind == QuoteMatchKind.EXACT &&
-                extractionConfidence >= 4
+                xrefCheck.matchKind == QuoteMatchKind.EXACT &&
+                extractionConfidence >= 4 &&
+                primaryQualifier == null &&
+                xrefQualifier == null &&
+                dualCompatibility.status == PropositionCompatibility.COMPATIBLE
               val deterministicStatus = if (isCorroboratedVerified) {
                 FindingStatus.VERIFIED
               } else {
                 FindingStatus.PARTIALLY_SUPPORTED
               }
+              val deterministicReportingStatus = if (isCorroboratedVerified) {
+                ReportingStatus.REPORTED_BUT_INADEQUATE.name
+              } else {
+                ReportingStatus.REQUIRES_MANUAL_RECONCILIATION.name
+              }
               val detail = buildString {
                 append(ci.note)
-                if (hasCrossRefCorroboration) {
+                if (ci.crossReferenceNote.isNotBlank()) {
                   append(" Internal cross-reference discrepancy: ${ci.crossReferenceNote}")
                 } else {
                   append(" Deterministic discrepancy requiring source reconciliation against primary tables, figures, units/transformations, and supplementary files.")
                 }
+              }
+              val anchors = buildList {
+                add(
+                  EvidenceAnchor(
+                    pageNumber = if (quoteCheck.resolvedPage > 0) quoteCheck.resolvedPage else ci.pageNumber,
+                    section = if (ci.pageNumber > 0) "Page ${ci.pageNumber}" else "Results",
+                    exactQuote = ci.rawClaim,
+                    startOffset = quoteCheck.startOffset,
+                    endOffset = quoteCheck.endOffset
+                  )
+                )
+                if (xrefCheck.matchKind == QuoteMatchKind.EXACT) {
+                  add(
+                    EvidenceAnchor(
+                      pageNumber = if (xrefCheck.resolvedPage > 0) xrefCheck.resolvedPage else ci.crossReferencePage,
+                      section = if (ci.crossReferencePage > 0) "Page ${ci.crossReferencePage}" else "Cross-Reference",
+                      exactQuote = ci.crossReferenceQuote,
+                      startOffset = xrefCheck.startOffset,
+                      endOffset = xrefCheck.endOffset
+                    )
+                  )
+                }
+              }
+              val holdReason = when {
+                !hasCrossRefCorroboration || xrefCheck.matchKind != QuoteMatchKind.EXACT ->
+                  "uncorroborated by an independently source-matched second passage"
+                extractionConfidence < 4 ->
+                  "extraction confidence below 4/5 ($extractionConfidence/5)"
+                primaryQualifier != null ->
+                  "conflicting statistical qualifier in primary context ($primaryQualifier)"
+                xrefQualifier != null ->
+                  "conflicting statistical qualifier in cross-referenced context ($xrefQualifier)"
+                dualCompatibility.status != PropositionCompatibility.COMPATIBLE ->
+                  "cross-referenced passages fail typed estimand/context compatibility (${dualCompatibility.reason})"
+                else -> "manual reconciliation required"
               }
               verifiedFindings.add(
                 0,
@@ -3037,30 +3119,29 @@ class Reviewer2PipelineService {
                   allegation = detail,
                   severity = "CRITICAL",
                   status = deterministicStatus,
-                  supportingEvidence = listOf(
-                    EvidenceAnchor(
-                      pageNumber = ci.pageNumber,
-                      section = if (ci.pageNumber > 0) "Page ${ci.pageNumber}" else "Results",
-                      exactQuote = ci.rawClaim,
-                      startOffset = quoteCheck.startOffset,
-                      endOffset = quoteCheck.endOffset
-                    )
-                  ),
-                  methodologicalJustification = "A point estimate must lie within its 95% confidence interval [lower, upper]. Potential causes include a narrative transcription typo, unit/scale transformation mismatch, duplicate outcome mapping, or PDF extraction/OCR artifact.",
+                  supportingEvidence = anchors,
+                  methodologicalJustification = "A point estimate must lie within its confidence interval [lower, upper] on the same scale, population, adjustment model, and confidence level. Potential causes include a transcription typo, unit/scale transformation mismatch, subgroup-vs-overall shift, or PDF extraction/OCR artifact.",
                   recommendedCorrection = "Reconcile the reported narrative estimate and CI directly against primary tables, forest plots/figures, and supplementary spreadsheets; issue a numerical erratum if confirmed in the published source.",
                   verificationNotes = if (isCorroboratedVerified) {
-                    "Deterministic CI check confirmed via exact text match and corroborated by conflicting Figure/Table bounds."
+                    "Deterministic CI check confirmed via dual-passage exact source match with compatible typed context and no conflicting scale/method qualifiers."
                   } else {
-                    "Deterministic discrepancy requiring manual reconciliation against original tables, figures, and supplements (uncorroborated by cross-reference or degraded extraction confidence)."
-                  }
+                    "Deterministic discrepancy held at PARTIALLY SUPPORTED (${ReportingStatus.REQUIRES_MANUAL_RECONCILIATION.displayLabel}): $holdReason."
+                  },
+                  reportingStatus = deterministicReportingStatus
                 )
               )
               nextQuantIdx++
             }
           }
 
-        forensicReport.quantForensics.statcheckResults
+        val statcheckFails = forensicReport.quantForensics.statcheckResults
           .filter { it.status == QuantFindingStatus.FAIL }
+        if (statcheckFails.size > 2) {
+          val omitted = statcheckFails.size - 2
+          ledgerCapOmittedCount += omitted
+          ledgerCapCategories.add("statcheck_ledger_cap($omitted omitted)")
+        }
+        statcheckFails
           .take(2)
           .forEach { st ->
             val alreadyCovered = verifiedFindings.any { it.allegation.contains(st.rawClaim.take(16), ignoreCase = true) }
@@ -3085,7 +3166,8 @@ class Reviewer2PipelineService {
                   ),
                   methodologicalJustification = "Exact two-tailed test-statistic recomputation disagrees with the reported p-value threshold; alternative explanations include one-tailed testing, multiple-comparison adjustment, rounding, or transcription/extraction errors.",
                   recommendedCorrection = "Reconcile test statistic, degrees of freedom, tail direction, and exact p-value against primary tables and statistical output.",
-                  verificationNotes = "Deterministic discrepancy requiring source reconciliation against tables, supplements, and test specification."
+                  verificationNotes = "Deterministic discrepancy requiring source reconciliation against tables, supplements, and test specification (${ReportingStatus.REQUIRES_MANUAL_RECONCILIATION.displayLabel}).",
+                  reportingStatus = ReportingStatus.REQUIRES_MANUAL_RECONCILIATION.name
                 )
               )
               nextQuantIdx++
@@ -3097,8 +3179,14 @@ class Reviewer2PipelineService {
       val statAudit = forensicReport?.quantForensics?.statisticalAudit
       if (applyStatisticalScoreGate && statAudit != null) {
         var nextStatIdx = 1
-        statAudit.reconstructions
+        val eligibleReconstructions = statAudit.reconstructions
           .filter { it.status == QuantFindingStatus.FAIL && it.findingType.isConfirmedError && !it.isScreeningSignal }
+        if (eligibleReconstructions.size > 3) {
+          val omitted = eligibleReconstructions.size - 3
+          ledgerCapOmittedCount += omitted
+          ledgerCapCategories.add("reconstructions_ledger_cap($omitted omitted)")
+        }
+        eligibleReconstructions
           .take(3)
           .forEach { rec ->
             val alreadyCovered = verifiedFindings.any {
@@ -3107,10 +3195,31 @@ class Reviewer2PipelineService {
             }
             if (!alreadyCovered) {
               val quoteCheck = verifyQuoteInManuscript(rec.sourceEvidence, manuscriptText, rec.pageNumber)
-              val verifiedStatus = if (quoteCheck.matchKind == QuoteMatchKind.EXACT && extractionConfidence >= 3) {
+              val recWindow = extractQuoteContextWindow(manuscriptText, quoteCheck, rec.sourceEvidence)
+              val conflictingQualifier = hasConflictingReconstructionQualifiers(recWindow)
+              val canPromoteVerified = quoteCheck.matchKind == QuoteMatchKind.EXACT &&
+                extractionConfidence >= 4 &&
+                conflictingQualifier == null
+              val verifiedStatus = if (canPromoteVerified) {
                 FindingStatus.VERIFIED
               } else {
                 FindingStatus.PARTIALLY_SUPPORTED
+              }
+              val recReportingStatus = if (canPromoteVerified) {
+                ReportingStatus.REPORTED_BUT_INADEQUATE.name
+              } else {
+                ReportingStatus.REQUIRES_MANUAL_RECONCILIATION.name
+              }
+              val recNote = if (canPromoteVerified) {
+                "Executable numerical reconstruction (${rec.checkId}) passed exact source match (extConf=$extractionConfidence/5) with no conflicting scale, adjustment, or inference-method qualifiers."
+              } else {
+                val reason = when {
+                  quoteCheck.matchKind != QuoteMatchKind.EXACT -> "quote match=${quoteCheck.matchKind.name}"
+                  extractionConfidence < 4 -> "extConf=$extractionConfidence/5 < 4"
+                  conflictingQualifier != null -> "conflicting qualifier in context: $conflictingQualifier"
+                  else -> "manual reconciliation required"
+                }
+                "Executable numerical reconstruction (${rec.checkId}) held at PARTIALLY SUPPORTED (${ReportingStatus.REQUIRES_MANUAL_RECONCILIATION.displayLabel}): $reason."
               }
               verifiedFindings.add(
                 0,
@@ -3130,18 +3239,27 @@ class Reviewer2PipelineService {
                     )
                   ),
                   methodologicalJustification = "${rec.scientificConsequence} Assumptions: ${rec.assumptions.joinToString("; ")}.",
-                  recommendedCorrection = "Verify raw input counts/SEs against primary tables and statistical output and correct reported values.",
-                  verificationNotes = "Executable numerical reconstruction (${rec.checkId}) flagged ${rec.findingType.name}."
+                  recommendedCorrection = "Verify raw input counts/SEs, scale transformations, adjustment terms, and inference method against primary tables and statistical output and correct reported values.",
+                  verificationNotes = recNote,
+                  reportingStatus = recReportingStatus
                 )
               )
             }
           }
 
-        // P0-06: Per-finding source verification for cross-section contradictions.
-        // Require BOTH conflicting passages to be present and EXACT-verified in manuscriptText
-        // under high extraction confidence (>= 4) before elevating to VERIFIED.
-        statAudit.crossLinks
+        // P0-06 & P1 Strict Dual-Passage Typed Compatibility Gate for cross-section contradictions:
+        // Exact quote match proves source presence ONLY; promotion to VERIFIED additionally requires
+        // >= 2 independently exact-matched passages, extConf >= 4, no conflicting scale/method/CI-level
+        // qualifiers, AND compatible typed propositions (population, outcome, subgroup/overall,
+        // adjusted/unadjusted, scale/transformation, inference method, CI level).
+        val eligibleCrossLinks = statAudit.crossLinks
           .filter { it.status == QuantFindingStatus.FAIL && it.findingType == StatisticalFindingType.INTERNAL_CONTRADICTION }
+        if (eligibleCrossLinks.size > 2) {
+          val omitted = eligibleCrossLinks.size - 2
+          ledgerCapOmittedCount += omitted
+          ledgerCapCategories.add("cross_links_ledger_cap($omitted omitted)")
+        }
+        eligibleCrossLinks
           .take(2)
           .forEach { link ->
             val verifiedAnchors = link.sourceQuotes
@@ -3149,10 +3267,40 @@ class Reviewer2PipelineService {
               .map { q -> q to verifyQuoteInManuscript(q, manuscriptText, link.pageNumbers.firstOrNull() ?: 0) }
             val allQuotesExact = verifiedAnchors.size >= 2 &&
               verifiedAnchors.all { it.second.matchKind == QuoteMatchKind.EXACT }
-            val resolvedStatus = if (allQuotesExact && extractionConfidence >= 4) {
+            val w1 = verifiedAnchors.getOrNull(0)?.let { (q, chk) ->
+              extractQuoteContextWindow(manuscriptText, chk, q, excludeRange = verifiedAnchors.getOrNull(1)?.second?.let { s -> if (s.startOffset != null && s.endOffset != null) s.startOffset until s.endOffset else null })
+            }.orEmpty()
+            val w2 = verifiedAnchors.getOrNull(1)?.let { (q, chk) ->
+              extractQuoteContextWindow(manuscriptText, chk, q, excludeRange = verifiedAnchors.getOrNull(0)?.second?.let { s -> if (s.startOffset != null && s.endOffset != null) s.startOffset until s.endOffset else null })
+            }.orEmpty()
+            val q1Text = verifiedAnchors.getOrNull(0)?.first.orEmpty()
+            val q2Text = verifiedAnchors.getOrNull(1)?.first.orEmpty()
+            val qualifier1 = if (w1.isNotBlank()) hasConflictingReconstructionQualifiers(w1) else null
+            val qualifier2 = if (w2.isNotBlank()) hasConflictingReconstructionQualifiers(w2) else null
+            val dualCompat = if (allQuotesExact) {
+              evaluateDualPassageTypedCompatibility(
+                passage1Window = w1,
+                passage2Window = w2,
+                passage1Exact = q1Text,
+                passage2Exact = q2Text
+              )
+            } else {
+              PropositionComparison(PropositionCompatibility.UNRESOLVED_INSUFFICIENT_FIELDS, "fewer than 2 exact source-matched passages")
+            }
+            val canPromoteVerified = allQuotesExact &&
+              extractionConfidence >= 4 &&
+              qualifier1 == null &&
+              qualifier2 == null &&
+              dualCompat.status == PropositionCompatibility.COMPATIBLE
+            val resolvedStatus = if (canPromoteVerified) {
               FindingStatus.VERIFIED
             } else {
               FindingStatus.PARTIALLY_SUPPORTED
+            }
+            val linkReportingStatus = if (canPromoteVerified) {
+              ReportingStatus.REPORTED_BUT_INADEQUATE.name
+            } else {
+              ReportingStatus.REQUIRES_MANUAL_RECONCILIATION.name
             }
             val anchors = verifiedAnchors.mapIndexed { idx, (q, check) ->
               EvidenceAnchor(
@@ -3171,6 +3319,14 @@ class Reviewer2PipelineService {
                 )
               )
             }
+            val holdDetail = when {
+              !allQuotesExact -> "exactMatches=${verifiedAnchors.count { it.second.matchKind == QuoteMatchKind.EXACT }}/${link.sourceQuotes.size}"
+              extractionConfidence < 4 -> "extConf=$extractionConfidence/5 < 4"
+              qualifier1 != null -> "conflicting qualifier in passage 1 ($qualifier1)"
+              qualifier2 != null -> "conflicting qualifier in passage 2 ($qualifier2)"
+              dualCompat.status != PropositionCompatibility.COMPATIBLE -> "typed proposition mismatch (${dualCompat.reason})"
+              else -> "manual reconciliation required"
+            }
             verifiedFindings.add(
               0,
               ReviewFinding(
@@ -3180,20 +3336,30 @@ class Reviewer2PipelineService {
                 severity = "CRITICAL",
                 status = resolvedStatus,
                 supportingEvidence = anchors,
-                methodologicalJustification = "Sample denominators, subgroup sums, and cross-section estimates must reconcile arithmetically across matching outcomes and populations.",
-                recommendedCorrection = "Reconcile participant flow, exclusions, and denominators across Abstract, Methods, Results, and Tables.",
-                verificationNotes = if (allQuotesExact && extractionConfidence >= 4) {
-                  "Cross-section evidence link (${link.linkId}) passed dual-passage exact source verification."
+                methodologicalJustification = "Sample denominators, subgroup sums, and cross-section estimates must reconcile arithmetically across matching outcomes, populations, adjustment models, scales, and confidence levels.",
+                recommendedCorrection = "Reconcile participant flow, exclusions, subgroups, adjustment status, and denominators across Abstract, Methods, Results, and Tables.",
+                verificationNotes = if (canPromoteVerified) {
+                  "Cross-section evidence link (${link.linkId}) passed dual-passage exact source match AND typed context compatibility."
                 } else {
-                  "Deterministic cross-section screening signal (${link.linkId}) downgraded to PARTIALLY SUPPORTED pending dual-passage source verification (exactMatches=${verifiedAnchors.count { it.second.matchKind == QuoteMatchKind.EXACT }}/${link.sourceQuotes.size}, extConf=$extractionConfidence/5)."
-                }
+                  "Deterministic cross-section screening signal (${link.linkId}) held at PARTIALLY SUPPORTED (${ReportingStatus.REQUIRES_MANUAL_RECONCILIATION.displayLabel}): $holdDetail."
+                },
+                reportingStatus = linkReportingStatus
               )
             )
           }
 
-        // P0-06: Per-finding source verification for domain model-mismatch findings.
-        statAudit.domainFindings
+        // P1 Domain Model-Mismatch Verification Gate:
+        // Exact quote matching is source authenticity ONLY; promotion to VERIFIED requires
+        // high extraction confidence (>= 4) AND independent scientific entailment (ENTAILED)
+        // confirming the cited Methods/Results passage actually entails the alleged model mismatch.
+        val eligibleDomainFindings = statAudit.domainFindings
           .filter { it.status == QuantFindingStatus.FAIL && it.findingType == StatisticalFindingType.MODEL_MISMATCH }
+        if (eligibleDomainFindings.size > 2) {
+          val omitted = eligibleDomainFindings.size - 2
+          ledgerCapOmittedCount += omitted
+          ledgerCapCategories.add("domain_findings_ledger_cap($omitted omitted)")
+        }
+        eligibleDomainFindings
           .take(2)
           .forEach { df ->
             val quoteText = df.evidenceQuote.trim()
@@ -3202,43 +3368,67 @@ class Reviewer2PipelineService {
             } else {
               QuoteVerificationResult(QuoteMatchKind.NONE, resolvedPage = 0)
             }
-            val isExactAnchored = quoteCheck.matchKind == QuoteMatchKind.EXACT && extractionConfidence >= 4
-            val resolvedStatus = if (isExactAnchored) FindingStatus.VERIFIED else FindingStatus.PARTIALLY_SUPPORTED
+            val candidateDomainFinding = ReviewFinding(
+              id = "S-0$nextStatIdx",
+              title = "[${df.findingType.label}] ${df.criterion}",
+              allegation = df.detail,
+              severity = "CRITICAL",
+              status = FindingStatus.VERIFIED,
+              supportingEvidence = listOf(
+                EvidenceAnchor(
+                  pageNumber = if (quoteCheck.resolvedPage > 0) quoteCheck.resolvedPage else df.pageNumber,
+                  section = df.domainModule,
+                  exactQuote = quoteText.ifBlank { df.criterion },
+                  startOffset = quoteCheck.startOffset,
+                  endOffset = quoteCheck.endOffset
+                )
+              ),
+              methodologicalJustification = df.consequence,
+              recommendedCorrection = df.recommendedAction
+            )
+            val domainWindow = extractQuoteContextWindow(manuscriptText, quoteCheck, quoteText)
+            val entailment = if (quoteCheck.matchKind == QuoteMatchKind.EXACT) {
+              evaluateQuoteEntailment(candidateDomainFinding, quoteText, domainWindow)
+            } else {
+              EntailmentStatus.NOT_ENTAILED
+            }
+            val isVerifiedDomain = quoteCheck.matchKind == QuoteMatchKind.EXACT &&
+              extractionConfidence >= 4 &&
+              entailment == EntailmentStatus.ENTAILED
+            val resolvedStatus = if (isVerifiedDomain) FindingStatus.VERIFIED else FindingStatus.PARTIALLY_SUPPORTED
+            val domainReportingStatus = if (isVerifiedDomain) {
+              ReportingStatus.REPORTED_BUT_INADEQUATE.name
+            } else {
+              ReportingStatus.REQUIRES_MANUAL_RECONCILIATION.name
+            }
             verifiedFindings.add(
               0,
-              ReviewFinding(
+              candidateDomainFinding.copy(
                 id = "S-0${nextStatIdx++}",
-                title = "[${df.findingType.label}] ${df.criterion}",
-                allegation = df.detail,
-                severity = "CRITICAL",
                 status = resolvedStatus,
-                supportingEvidence = listOf(
-                  EvidenceAnchor(
-                    pageNumber = if (quoteCheck.resolvedPage > 0) quoteCheck.resolvedPage else df.pageNumber,
-                    section = df.domainModule,
-                    exactQuote = quoteText.ifBlank { df.criterion },
-                    startOffset = quoteCheck.startOffset,
-                    endOffset = quoteCheck.endOffset
-                  )
-                ),
-                methodologicalJustification = df.consequence,
-                recommendedCorrection = df.recommendedAction,
-                verificationNotes = if (isExactAnchored) {
-                  "Domain statistical audit (${df.findingId}, ${statAudit.subDesign.displayName}) passed exact source-quote verification."
+                verificationNotes = if (isVerifiedDomain) {
+                  "Domain statistical audit (${df.findingId}, ${statAudit.subDesign.displayName}) passed exact source match AND scientific entailment verification."
                 } else {
-                  "Domain statistical screening signal (${df.findingId}, ${statAudit.subDesign.displayName}) held at PARTIALLY SUPPORTED pending verbatim source confirmation (quoteMatch=${quoteCheck.matchKind.name}, extConf=$extractionConfidence/5)."
-                }
+                  "Domain statistical screening signal (${df.findingId}, ${statAudit.subDesign.displayName}) held at PARTIALLY SUPPORTED (${ReportingStatus.REQUIRES_MANUAL_RECONCILIATION.displayLabel}): quoteMatch=${quoteCheck.matchKind.name}, entailment=${entailment.name}, extConf=$extractionConfidence/5."
+                },
+                reportingStatus = domainReportingStatus
               )
             )
           }
       }
 
-      // 3c. Inject fatal/major epistemic contradictions & claim-overreach findings with per-finding source verification (P0-06)
+      // 3c. Inject fatal/major epistemic contradictions & claim-overreach findings with per-finding source & typed compatibility verification
       val effectiveEpistemic = epistemicReport ?: forensicReport?.quantForensics?.epistemicSafeguards
       if (applyStatisticalScoreGate && effectiveEpistemic != null && !effectiveEpistemic.stopAndAsk.shouldStopAndAsk) {
         var nextEpiIdx = 1
-        effectiveEpistemic.contradictionMap.edges
+        val eligibleEpistemicEdges = effectiveEpistemic.contradictionMap.edges
           .filter { it.severityTier == FlawSeverityTier.FATAL_TO_PRIMARY_CONCLUSION || it.severityTier == FlawSeverityTier.MATERIALLY_WEAKENS_CONFIDENCE }
+        if (eligibleEpistemicEdges.size > 2) {
+          val omitted = eligibleEpistemicEdges.size - 2
+          ledgerCapOmittedCount += omitted
+          ledgerCapCategories.add("epistemic_contradictions_ledger_cap($omitted omitted)")
+        }
+        eligibleEpistemicEdges
           .take(2)
           .forEach { edge ->
             val alreadyCovered = verifiedFindings.any {
@@ -3249,10 +3439,25 @@ class Reviewer2PipelineService {
               val isFatal = edge.severityTier == FlawSeverityTier.FATAL_TO_PRIMARY_CONCLUSION
               val edgeQuotes = edge.quotes.filter { it.isNotBlank() }
               val checkedQuotes = edgeQuotes.map { q -> q to verifyQuoteInManuscript(q, manuscriptText, edge.pages.firstOrNull() ?: 0) }
-              val requiredExactCount = if (edge.fromSection != edge.toSection && edgeQuotes.size >= 2) 2 else 1
+              val isCrossSectionEdge = edge.fromSection != edge.toSection
+              val requiredExactCount = if (isCrossSectionEdge) 2 else 1
               val exactCount = checkedQuotes.count { it.second.matchKind == QuoteMatchKind.EXACT }
-              val isSourceVerified = exactCount >= requiredExactCount && extractionConfidence >= 4
+              val dualCompat = if (checkedQuotes.size >= 2 && exactCount >= 2) {
+                val ew1 = extractQuoteContextWindow(manuscriptText, checkedQuotes[0].second, checkedQuotes[0].first)
+                val ew2 = extractQuoteContextWindow(manuscriptText, checkedQuotes[1].second, checkedQuotes[1].first)
+                evaluateDualPassageTypedCompatibility(ew1, ew2)
+              } else {
+                PropositionComparison(PropositionCompatibility.COMPATIBLE, "")
+              }
+              val isSourceVerified = exactCount >= requiredExactCount &&
+                extractionConfidence >= 4 &&
+                (!isCrossSectionEdge || (checkedQuotes.size >= 2 && dualCompat.status == PropositionCompatibility.COMPATIBLE))
               val resolvedStatus = if (isSourceVerified) FindingStatus.VERIFIED else FindingStatus.PARTIALLY_SUPPORTED
+              val edgeReportingStatus = if (isSourceVerified) {
+                ReportingStatus.REPORTED_BUT_INADEQUATE.name
+              } else {
+                ReportingStatus.REQUIRES_MANUAL_RECONCILIATION.name
+              }
               val edgeAnchors = checkedQuotes.mapIndexed { idx, (q, check) ->
                 EvidenceAnchor(
                   pageNumber = if (check.resolvedPage > 0) check.resolvedPage else edge.pages.getOrNull(idx) ?: 0,
@@ -3282,11 +3487,12 @@ class Reviewer2PipelineService {
                   methodologicalJustification = "Cross-section contradiction or claim-vs-design overreach detected by epistemic safeguard graph.",
                   recommendedCorrection = edge.overturnEvidence,
                   verificationNotes = if (isSourceVerified) {
-                    "Epistemic contradiction edge (${edge.edgeId}) passed per-finding exact source verification."
+                    "Epistemic contradiction edge (${edge.edgeId}) passed per-finding exact source match and typed compatibility verification."
                   } else {
-                    "Epistemic contradiction screening signal (${edge.edgeId}) held at PARTIALLY SUPPORTED pending exact passage confirmation ($exactCount/$requiredExactCount exact quotes, extConf=$extractionConfidence/5)."
+                    "Epistemic contradiction screening signal (${edge.edgeId}) held at PARTIALLY SUPPORTED (${ReportingStatus.REQUIRES_MANUAL_RECONCILIATION.displayLabel}): $exactCount/$requiredExactCount exact quotes, extConf=$extractionConfidence/5, compat=${dualCompat.status.name}${if (dualCompat.reason.isNotBlank()) " (${dualCompat.reason})" else ""}."
                   },
-                  overturnEvidence = edge.overturnEvidence
+                  overturnEvidence = edge.overturnEvidence,
+                  reportingStatus = edgeReportingStatus
                 )
               )
             }
@@ -3419,7 +3625,9 @@ class Reviewer2PipelineService {
         reproducibilityScore = r,
         weightedCredibilityScore = exactComposite,
         resolvedVerdict = resolvedVerdict,
-        scoreBreakdown = breakdown
+        scoreBreakdown = breakdown,
+        ledgerCapOmittedCount = ledgerCapOmittedCount,
+        ledgerCapCategories = ledgerCapCategories.distinct()
       )
     }
 
@@ -3505,6 +3713,7 @@ class Reviewer2PipelineService {
     enum class EntailmentStatus {
       ENTAILED,
       PARTIAL_OR_AMBIGUOUS,
+      UNRESOLVED,
       NOT_ENTAILED,
       CONTRADICTED_BY_POLARITY
     }
@@ -3591,8 +3800,17 @@ class Reviewer2PipelineService {
       val significance: Boolean?, // true=significant, false=non-significant, null=unspecified
       val direction: Int, // +1=increase/harm/overestimate, -1=decrease/benefit/underestimate, 0=neutral
       val populations: Set<String>,
+      val interventions: Set<String> = emptySet(),
       val adjustmentStatus: String?, // "ADJUSTED", "UNADJUSTED", or null
       val comparators: Set<String>,
+      val namedComparators: Set<String> = emptySet(),
+      val comparatorPairs: Set<Pair<String, String>> = emptySet(),
+      val outcomes: Set<String> = emptySet(),
+      val subgroupScope: String? = null, // "SUBGROUP", "OVERALL", or null
+      val scaleTransform: String? = null, // "LOG_TRANSFORMED", "STANDARDIZED", "RAW", or null
+      val ciLevelPct: Double? = null, // e.g., 90.0, 95.0, 99.0
+      val inferenceMethod: String? = null, // "BOOTSTRAP", "WALD", "BAYESIAN", "PERMUTATION", "ROBUST_SANDWICH"
+      val certaintyLevel: String? = null, // "HIGH", "MODERATE", "LOW", "VERY_LOW"
       val timePointDays: Set<Double>,
       val effectMeasures: Set<String>,
       val percentages: List<Double>,
@@ -3601,6 +3819,116 @@ class Reviewer2PipelineService {
       val intervals: List<Pair<Double, Double>>,
       val sampleSizes: List<Int>
     )
+
+    internal enum class PropositionCompatibility {
+      COMPATIBLE,
+      MISMATCH_CONTRADICTED,
+      UNRESOLVED_INSUFFICIENT_FIELDS
+    }
+
+    internal data class PropositionComparison(
+      val status: PropositionCompatibility,
+      val reason: String = ""
+    )
+
+    internal fun extractQuoteContextWindow(
+      manuscriptText: String,
+      check: QuoteVerificationResult,
+      fallbackQuote: String,
+      radiusChars: Int = 180,
+      excludeRange: IntRange? = null
+    ): String {
+      val start = check.startOffset
+      val end = check.endOffset
+      if (start == null || end == null || start < 0 || end <= start || end > manuscriptText.length) {
+        return fallbackQuote
+      }
+      var windowStart = (start - radiusChars).coerceAtLeast(0)
+      var windowEnd = (end + radiusChars).coerceAtMost(manuscriptText.length)
+      // Never bleed across [PAGE N] section boundaries into another page's opposing framing
+      val pageHeaderRegex = Regex("""\[PAGE\s+\d+]""")
+      val lastHeaderBefore = pageHeaderRegex.findAll(manuscriptText.substring(windowStart, start))
+        .lastOrNull()?.range?.last?.let { windowStart + it + 1 }
+      if (lastHeaderBefore != null && lastHeaderBefore > windowStart) {
+        windowStart = lastHeaderBefore
+      }
+      val firstHeaderAfter = pageHeaderRegex.find(manuscriptText.substring(end, windowEnd))
+        ?.range?.first?.let { end + it }
+      if (firstHeaderAfter != null && firstHeaderAfter < windowEnd) {
+        windowEnd = firstHeaderAfter
+      }
+      // Never swallow a sibling passage being compared against this quote
+      if (excludeRange != null && !excludeRange.isEmpty()) {
+        if (excludeRange.last < start && excludeRange.last + 1 > windowStart) {
+          windowStart = (excludeRange.last + 1).coerceAtMost(start)
+        }
+        if (excludeRange.first > end && excludeRange.first < windowEnd) {
+          windowEnd = excludeRange.first.coerceAtLeast(end)
+        }
+      }
+      return manuscriptText.substring(windowStart, windowEnd).trim()
+    }
+
+    /**
+     * Detects contextual statistical qualifiers (non-standard CI levels, resampling/robust SEs,
+     * scale transformations, imputation/weighting/propensity adjustments, one-tailed/multiplicity
+     * adjustments) that prevent single-passage naive formula reconstruction from auto-promoting to VERIFIED.
+     */
+    internal fun hasConflictingReconstructionQualifiers(window: String): String? {
+      if (window.isBlank()) return null
+      val rules: List<Pair<String, Regex>> = listOf(
+        "bootstrap/resampling inference" to Regex("""(?i)\b(?:bootstrap\w*|jackknife|resampl\w*|permutation\s+(?:test|ci|p[\s-]?value))\b"""),
+        "robust/sandwich/cluster SE" to Regex("""(?i)\b(?:robust\s+(?:se|standard\s+errors?)|sandwich\s+(?:estimator|variance|se)|huber[\s-]?white|hc[0-3]\b|cluster[\s-]?robust)\b"""),
+        "Bayesian credible interval" to Regex("""(?i)\b(?:bayesian|credible\s+interval|\bcri\b|posterior\s+(?:interval|distribution)|mcmc)\b"""),
+        "log/standardized scale transformation" to Regex("""(?i)\b(?:log[\s-]?transformed|log10|log2|natural\s+log|\bln\s*\(|log[\s-]?scale|standardized|standardised|z[\s-]?score|per\s+(?:1\s+)?sd\b)\b"""),
+        "non-95% confidence level" to Regex("""(?i)\b(?:80|90|99)(?:\.\d+)?%\s*(?:ci|confidence\s+interval|credible\s+interval|cri)\b"""),
+        "weighted/imputed/propensity model" to Regex("""(?i)\b(?:multiple\s+imputation|imputed\s+data|inverse\s+probability\s+weight\w*|ipw\b|propensity[\s-]?(?:score|matched|weighted)|survey[\s-]?weighted|multivariable[\s-]?adjusted)\b"""),
+        "one-sided or multiplicity-adjusted p-value" to Regex("""(?i)\b(?:one[\s-]?(?:sided|tailed)|bonferroni|holm[\s-]?bonferroni|sidak|benjamini[\s-]?hochberg|\bfdr\b|false\s+discovery\s+rate|adjusted\s+p[\s-]?value)\b""")
+      )
+      return rules.firstOrNull { (_, regex) -> regex.containsMatchIn(window) }?.first
+    }
+
+    /**
+     * Checks whether two independently source-matched passages describe a compatible typed scientific
+     * framing (population, intervention, comparator, outcome, adjustment status, subgroup/overall scope,
+     * scale transformation, CI level, inference method, time point, effect measure) so cross-passage
+     * numerical discrepancies are only promoted to VERIFIED when comparing apples to apples.
+     */
+    internal fun evaluateDualPassageTypedCompatibility(
+      passage1Window: String,
+      passage2Window: String,
+      passage1Exact: String = passage1Window,
+      passage2Exact: String = passage2Window
+    ): PropositionComparison {
+      if (passage1Exact.isNotBlank() && passage2Exact.isNotBlank()) {
+        val exactComp = compareScientificPropositions(
+          claimProp = extractScientificProposition(passage1Exact),
+          evidenceProp = extractScientificProposition(passage2Exact),
+          requireClaimCriticalFieldsInEvidence = false,
+          compareNumericMagnitudes = false
+        )
+        if (exactComp.status != PropositionCompatibility.COMPATIBLE) {
+          return exactComp
+        }
+      }
+      val p1 = extractScientificProposition(passage1Window)
+      val p2 = extractScientificProposition(passage2Window)
+      return compareScientificPropositions(
+        claimProp = p1,
+        evidenceProp = p2,
+        requireClaimCriticalFieldsInEvidence = false,
+        compareNumericMagnitudes = false
+      )
+    }
+
+    private fun normalizeArmLabel(raw: String): String {
+      val leadStrip = Regex("""(?i)^(?:the|a|an|of|with|for|by|in|on|at|to|and|or|reduced|increased|improved|lowered|raised|showed|yielded|had|was|were|compared|comparing|receiving|given|assigned|treated)\s+""")
+      val trailStrip = Regex("""(?i)\s+(?:in|at|on|for|with|among|by|was|were|had|has|have|reduced|increased|improved|mortality|death|survival|risk|rate|patients?|adults?|children|after|over|during)$""")
+      var s = raw.trim().lowercase(Locale.US).replace(Regex("""\s+"""), " ")
+      repeat(4) { s = s.replace(leadStrip, "").trim() }
+      repeat(4) { s = s.replace(trailStrip, "").trim() }
+      return s
+    }
 
     internal fun extractScientificProposition(text: String): ScientificProposition {
       val clean = text.replace(Regex("""\[[A-Z]-\d{1,3}\]"""), " ").trim()
@@ -3650,6 +3978,90 @@ class Reviewer2PipelineService {
         if (Regex("""(?i)\b(?:historical\s+control|external\s+control|single[\s-]?arm)\b""").containsMatchIn(clean)) add("HISTORICAL_CONTROL")
       }
 
+      val interventions = mutableSetOf<String>()
+      val namedComparators = mutableSetOf<String>()
+      val comparatorPairs = mutableSetOf<Pair<String, String>>()
+
+      val vsRegex = Regex(
+        """(?i)\b([A-Za-z][A-Za-z0-9-]*(?:\s+[A-Za-z0-9-]+){0,2})\s+(?:vs\.?|versus|compared\s+(?:with|to))\s+([A-Za-z][A-Za-z0-9-]*(?:\s+[A-Za-z0-9-]+){0,2})\b"""
+      )
+      vsRegex.findAll(clean).forEach { m ->
+        val left = normalizeArmLabel(m.groupValues[1])
+        val right = normalizeArmLabel(m.groupValues[2])
+        if (left.length >= 2 && right.length >= 2 && left != right) {
+          comparatorPairs.add(left to right)
+          namedComparators.add(right)
+          if (left !in setOf("mortality", "risk", "rate", "effect", "outcome", "reduction", "increase")) {
+            interventions.add(left)
+          }
+        }
+      }
+      val namedAgentRegex = Regex("""(?i)\b(?:drug|agent|compound|vaccine|regimen|therapy|treatment|arm)\s+([A-Z0-9]{1,4})\b""")
+      namedAgentRegex.findAll(clean).forEach { m ->
+        val full = m.value.lowercase(Locale.US).replace(Regex("""\s+"""), " ").trim()
+        if (full !in namedComparators) {
+          interventions.add(full)
+        }
+      }
+
+      val outcomes = buildSet {
+        if (Regex("""(?i)\b(?:mortality|deaths?|fatal\w*|survival)\b""").containsMatchIn(clean)) add("MORTALITY")
+        if (Regex("""(?i)\b(?:hospitaliz\w*|readmissions?|inpatient\s+admissions?)\b""").containsMatchIn(clean)) add("HOSPITALIZATION")
+        if (Regex("""(?i)\b(?:stroke|cerebrovascular)\b""").containsMatchIn(clean)) add("STROKE")
+        if (Regex("""(?i)\b(?:myocardial\s+infarction|\bmi\b|heart\s+attack)\b""").containsMatchIn(clean)) add("MYOCARDIAL_INFARCTION")
+        if (Regex("""(?i)\b(?:heart\s+failure)\b""").containsMatchIn(clean)) add("HEART_FAILURE")
+        if (Regex("""(?i)\b(?:infections?|sepsis|pneumonia|bacteremia)\b""").containsMatchIn(clean)) add("INFECTION")
+        if (Regex("""(?i)\b(?:bleeding|hemorrhag\w*|haemorrhag\w*)\b""").containsMatchIn(clean)) add("BLEEDING")
+        if (Regex("""(?i)\b(?:relapse|recurrence|disease\s+progression)\b""").containsMatchIn(clean)) add("RELAPSE_RECURRENCE")
+        if (Regex("""(?i)\b(?:adverse\s+events?|side\s+effects?|toxicity)\b""").containsMatchIn(clean)) add("ADVERSE_EVENT")
+        if (Regex("""(?i)\b(?:length\s+of\s+stay|long[\s-]?stay|bed\s+days?|bed\s+estimate)\b""").containsMatchIn(clean)) add("LENGTH_OF_STAY")
+        if (Regex("""(?i)\b(?:quality\s+of\s+life|\bqol\b|symptom\s+score)\b""").containsMatchIn(clean)) add("QUALITY_OF_LIFE")
+        if (Regex("""(?i)\b(?:biomarker|hba1c|ldl|cholesterol|blood\s+pressure|viral\s+load)\b""").containsMatchIn(clean)) add("BIOMARKER_SURROGATE")
+      }
+
+      val hasSubgroup = Regex("""(?i)\b(?:subgroup|sub[\s-]?analysis|stratif\w*|post[\s-]?hoc|sensitivity\s+subset|per[\s-]?protocol|completers?\s+only)\b""").containsMatchIn(clean)
+      val hasOverall = Regex("""(?i)\b(?:overall\s+(?:cohort|population|sample|analysis|effect|estimate|result)|entire\s+(?:cohort|population|sample)|full\s+(?:cohort|population|sample)|intention[\s-]?to[\s-]?treat|\bitt\b|all\s+randomized\s+patients?)\b""").containsMatchIn(clean)
+      val subgroupScope = when {
+        hasSubgroup && !hasOverall -> "SUBGROUP"
+        hasOverall && !hasSubgroup -> "OVERALL"
+        else -> null
+      }
+
+      val hasLogScale = Regex("""(?i)\b(?:log[\s-]?transformed|log10|log2|natural\s+log|\bln\s*\(|log[\s-]?scale|logarithmic)\b""").containsMatchIn(clean)
+      val hasStdScale = Regex("""(?i)\b(?:standardized|standardised|z[\s-]?score|per\s+(?:1\s+)?sd\b|sd\s+unit)\b""").containsMatchIn(clean)
+      val hasRawScale = Regex("""(?i)\b(?:untransformed|raw\s+scale|original\s+scale|natural\s+scale|unstandardized|unstandardised)\b""").containsMatchIn(clean)
+      val scaleTransform = when {
+        hasLogScale && !hasRawScale && !hasStdScale -> "LOG_TRANSFORMED"
+        hasStdScale && !hasRawScale && !hasLogScale -> "STANDARDIZED"
+        hasRawScale && !hasLogScale && !hasStdScale -> "RAW"
+        else -> null
+      }
+
+      val ciLevelPct = Regex("""(?i)\b(80|90|95|99)(?:\.\d+)?%\s*(?:ci|confidence\s+interval|credible\s+interval|cri)\b""")
+        .find(clean)?.groupValues?.get(1)?.toDoubleOrNull()
+
+      val hasBootstrap = Regex("""(?i)\b(?:bootstrap\w*|resampl\w*|jackknife)\b""").containsMatchIn(clean)
+      val hasWald = Regex("""(?i)\b(?:wald\b|asymptotic\s+normal|normal\s+approximat\w*)\b""").containsMatchIn(clean)
+      val hasBayesian = Regex("""(?i)\b(?:bayesian|credible\s+interval|\bcri\b|posterior\s+interval|mcmc)\b""").containsMatchIn(clean)
+      val hasPermutation = Regex("""(?i)\b(?:permutation|exact\s+test|fisher'?s?\s+exact)\b""").containsMatchIn(clean)
+      val hasRobustSe = Regex("""(?i)\b(?:robust\s+(?:se|standard\s+errors?)|sandwich|huber[\s-]?white|hc[0-3]\b|cluster[\s-]?robust)\b""").containsMatchIn(clean)
+      val activeMethods = buildList {
+        if (hasBootstrap) add("BOOTSTRAP")
+        if (hasWald) add("WALD")
+        if (hasBayesian) add("BAYESIAN")
+        if (hasPermutation) add("PERMUTATION")
+        if (hasRobustSe) add("ROBUST_SANDWICH")
+      }
+      val inferenceMethod = if (activeMethods.size == 1) activeMethods.first() else null
+
+      val certaintyLevel = when {
+        Regex("""(?i)\bvery\s+low\s+(?:certainty|quality|confidence)\b""").containsMatchIn(clean) -> "VERY_LOW"
+        Regex("""(?i)(?<!very\s)\blow\s+(?:certainty|quality|confidence)\b""").containsMatchIn(clean) -> "LOW"
+        Regex("""(?i)\bmoderate\s+(?:certainty|quality|confidence)\b""").containsMatchIn(clean) -> "MODERATE"
+        Regex("""(?i)\bhigh\s+(?:certainty|quality|confidence)\b""").containsMatchIn(clean) -> "HIGH"
+        else -> null
+      }
+
       val timePointDays = buildSet {
         val timeRegex = Regex("""(?i)\b(\d+(?:\.\d+)?)\s*[-]?\s*(hours?|hrs?|days?|weeks?|wks?|months?|mos?|years?|yrs?)\b""")
         timeRegex.findAll(clean).forEach { m ->
@@ -3675,7 +4087,7 @@ class Reviewer2PipelineService {
         if (Regex("""(?i)\b(?:auroc|auc|c[\s-]?statistic)\b""").containsMatchIn(clean)) add("AUC")
       }
 
-      val percentages = Regex("""(?<![\d.])(\d+(?:\.\d+)?)\s*%""")
+      val percentages = Regex("""(?<![\d.])(\d+(?:\.\d+)?)\s*%(?!\s*(?:ci\b|cri\b|confidence\b|credible\b))""", RegexOption.IGNORE_CASE)
         .findAll(clean)
         .mapNotNull { it.groupValues[1].toDoubleOrNull() }
         .toList()
@@ -3685,7 +4097,7 @@ class Reviewer2PipelineService {
         .mapNotNull { it.groupValues[1].toDoubleOrNull() }
         .toList()
 
-      val intervals = Regex("""(?i)(?:95%\s*ci|ci)\s*[:=]?\s*\(?\s*([-+]?\d+(?:\.\d+)?)\s*(?:to|–|—|-|,)\s*([-+]?\d+(?:\.\d+)?)\s*\)?""")
+      val intervals = Regex("""(?i)(?:(?:80|90|95|99)(?:\.\d+)?%\s*(?:ci|cri)|ci|confidence\s+interval)\s*[:=]?\s*[\(\[]?\s*([-+]?\d+(?:\.\d+)?)\s*(?:to|–|—|-|,)\s*([-+]?\d+(?:\.\d+)?)\s*[\)\]]?""")
         .findAll(clean)
         .mapNotNull { m ->
           val lo = m.groupValues[1].toDoubleOrNull() ?: return@mapNotNull null
@@ -3709,8 +4121,17 @@ class Reviewer2PipelineService {
         significance = significance,
         direction = direction,
         populations = populations,
+        interventions = interventions,
         adjustmentStatus = adjustmentStatus,
         comparators = comparators,
+        namedComparators = namedComparators,
+        comparatorPairs = comparatorPairs,
+        outcomes = outcomes,
+        subgroupScope = subgroupScope,
+        scaleTransform = scaleTransform,
+        ciLevelPct = ciLevelPct,
+        inferenceMethod = inferenceMethod,
+        certaintyLevel = certaintyLevel,
         timePointDays = timePointDays,
         effectMeasures = effectMeasures,
         percentages = percentages,
@@ -3722,11 +4143,261 @@ class Reviewer2PipelineService {
     }
 
     /**
+     * Typed Scientific Proposition Comparison Engine (P0):
+     * Evaluates compatibility across polarity, significance, direction, population, intervention,
+     * comparator/ordered-arm pair, outcome, adjustment status, subgroup/overall scope, scale transform,
+     * CI level, inference method, certainty level, follow-up time point, effect measure, and numeric magnitudes.
+     */
+    internal fun compareScientificPropositions(
+      claimProp: ScientificProposition,
+      evidenceProp: ScientificProposition,
+      requireClaimCriticalFieldsInEvidence: Boolean,
+      compareNumericMagnitudes: Boolean = true,
+      requireAllClaimNumerics: Boolean = true
+    ): PropositionComparison {
+      // 1. Polarity / Method-Status opposition
+      if ((claimProp.polarity == ClaimPolarity.PRESENT_OR_ADEQUATE && evidenceProp.polarity == ClaimPolarity.ABSENT_OR_DEFICIENT) ||
+        (claimProp.polarity == ClaimPolarity.ABSENT_OR_DEFICIENT && evidenceProp.polarity == ClaimPolarity.PRESENT_OR_ADEQUATE)
+      ) {
+        return PropositionComparison(PropositionCompatibility.MISMATCH_CONTRADICTED, "polarity mismatch (${claimProp.polarity} vs ${evidenceProp.polarity})")
+      }
+
+      // 2. Significance & directional opposition
+      if (claimProp.significance != null && evidenceProp.significance != null && claimProp.significance != evidenceProp.significance) {
+        return PropositionComparison(PropositionCompatibility.MISMATCH_CONTRADICTED, "statistical significance mismatch")
+      }
+      if (claimProp.direction != 0 && evidenceProp.direction != 0 && claimProp.direction != evidenceProp.direction) {
+        return PropositionComparison(PropositionCompatibility.MISMATCH_CONTRADICTED, "effect direction mismatch")
+      }
+
+      // 3. Typed Population consistency (adults vs children, pregnant, animal, etc.)
+      if (claimProp.populations.isNotEmpty() && evidenceProp.populations.isNotEmpty() &&
+        claimProp.populations.intersect(evidenceProp.populations).isEmpty()
+      ) {
+        return PropositionComparison(PropositionCompatibility.MISMATCH_CONTRADICTED, "population mismatch (${claimProp.populations} vs ${evidenceProp.populations})")
+      }
+      val restrictiveSubpops = setOf("PEDIATRIC", "PREGNANT", "ANIMAL_PRECLINICAL")
+      if (claimProp.populations.any { it in restrictiveSubpops } &&
+        evidenceProp.populations.intersect(claimProp.populations).isEmpty()
+      ) {
+        return PropositionComparison(PropositionCompatibility.UNRESOLVED_INSUFFICIENT_FIELDS, "restrictive population ${claimProp.populations} not confirmed in evidence")
+      }
+      if (requireClaimCriticalFieldsInEvidence && claimProp.populations.isNotEmpty() && evidenceProp.populations.isEmpty()) {
+        return PropositionComparison(PropositionCompatibility.UNRESOLVED_INSUFFICIENT_FIELDS, "population ${claimProp.populations} missing from evidence")
+      }
+
+      // 4. Intervention & ordered comparator-arm consistency (catches Drug A vs placebo vs Drug A vs Drug B / Placebo vs Drug A)
+      if (claimProp.comparatorPairs.isNotEmpty() && evidenceProp.comparatorPairs.isNotEmpty()) {
+        val anyExactPair = claimProp.comparatorPairs.any { (cL, cR) ->
+          evidenceProp.comparatorPairs.any { (eL, eR) ->
+            (cL == eL || cL.contains(eL) || eL.contains(cL)) &&
+              (cR == eR || cR.contains(eR) || eR.contains(cR))
+          }
+        }
+        if (!anyExactPair) {
+          return PropositionComparison(PropositionCompatibility.MISMATCH_CONTRADICTED, "comparator arm pair mismatch (${claimProp.comparatorPairs} vs ${evidenceProp.comparatorPairs})")
+        }
+      }
+      if (claimProp.interventions.isNotEmpty() && evidenceProp.interventions.isNotEmpty()) {
+        val anySharedIntervention = claimProp.interventions.any { ci ->
+          evidenceProp.interventions.any { ei -> ci == ei || ci.contains(ei) || ei.contains(ci) }
+        }
+        if (!anySharedIntervention) {
+          return PropositionComparison(PropositionCompatibility.MISMATCH_CONTRADICTED, "intervention mismatch (${claimProp.interventions} vs ${evidenceProp.interventions})")
+        }
+      }
+      if (claimProp.comparators.isNotEmpty() && evidenceProp.comparators.isNotEmpty() &&
+        claimProp.comparators.intersect(evidenceProp.comparators).isEmpty()
+      ) {
+        return PropositionComparison(PropositionCompatibility.MISMATCH_CONTRADICTED, "comparator class mismatch (${claimProp.comparators} vs ${evidenceProp.comparators})")
+      }
+      if (claimProp.namedComparators.isNotEmpty() && evidenceProp.namedComparators.isNotEmpty()) {
+        val anySharedNamed = claimProp.namedComparators.any { cc ->
+          evidenceProp.namedComparators.any { ec -> cc == ec || cc.contains(ec) || ec.contains(cc) }
+        }
+        if (!anySharedNamed) {
+          return PropositionComparison(PropositionCompatibility.MISMATCH_CONTRADICTED, "named comparator mismatch (${claimProp.namedComparators} vs ${evidenceProp.namedComparators})")
+        }
+      }
+      if (requireClaimCriticalFieldsInEvidence &&
+        (claimProp.comparators.isNotEmpty() || claimProp.namedComparators.isNotEmpty()) &&
+        evidenceProp.comparators.isEmpty() && evidenceProp.namedComparators.isEmpty()
+      ) {
+        return PropositionComparison(PropositionCompatibility.UNRESOLVED_INSUFFICIENT_FIELDS, "comparator arm missing from evidence")
+      }
+
+      // 5. Outcome consistency
+      if (claimProp.outcomes.isNotEmpty() && evidenceProp.outcomes.isNotEmpty() &&
+        claimProp.outcomes.intersect(evidenceProp.outcomes).isEmpty()
+      ) {
+        return PropositionComparison(PropositionCompatibility.MISMATCH_CONTRADICTED, "outcome mismatch (${claimProp.outcomes} vs ${evidenceProp.outcomes})")
+      }
+
+      // 6. Adjusted vs Unadjusted consistency
+      if (claimProp.adjustmentStatus != null && evidenceProp.adjustmentStatus != null &&
+        claimProp.adjustmentStatus != evidenceProp.adjustmentStatus
+      ) {
+        return PropositionComparison(PropositionCompatibility.MISMATCH_CONTRADICTED, "adjustment mismatch (${claimProp.adjustmentStatus} vs ${evidenceProp.adjustmentStatus})")
+      }
+      if (requireClaimCriticalFieldsInEvidence && claimProp.adjustmentStatus != null && evidenceProp.adjustmentStatus == null) {
+        return PropositionComparison(PropositionCompatibility.UNRESOLVED_INSUFFICIENT_FIELDS, "adjustment status (${claimProp.adjustmentStatus}) missing from evidence")
+      }
+
+      // 7. Subgroup vs Overall scope consistency
+      if (claimProp.subgroupScope != null && evidenceProp.subgroupScope != null &&
+        claimProp.subgroupScope != evidenceProp.subgroupScope
+      ) {
+        return PropositionComparison(PropositionCompatibility.MISMATCH_CONTRADICTED, "subgroup vs overall scope mismatch (${claimProp.subgroupScope} vs ${evidenceProp.subgroupScope})")
+      }
+
+      // 8. Scale / transformation consistency (log-transformed / standardized / raw)
+      if (claimProp.scaleTransform != null && evidenceProp.scaleTransform != null &&
+        claimProp.scaleTransform != evidenceProp.scaleTransform
+      ) {
+        return PropositionComparison(PropositionCompatibility.MISMATCH_CONTRADICTED, "scale/transformation mismatch (${claimProp.scaleTransform} vs ${evidenceProp.scaleTransform})")
+      }
+
+      // 9. Confidence interval level consistency (90% vs 95% vs 99%)
+      if (claimProp.ciLevelPct != null && evidenceProp.ciLevelPct != null &&
+        kotlin.math.abs(claimProp.ciLevelPct - evidenceProp.ciLevelPct) > 0.1
+      ) {
+        return PropositionComparison(PropositionCompatibility.MISMATCH_CONTRADICTED, "CI level mismatch (${claimProp.ciLevelPct}% vs ${evidenceProp.ciLevelPct}%)")
+      }
+
+      // 10. Inference method consistency (bootstrap vs Wald vs Bayesian vs robust SE)
+      if (claimProp.inferenceMethod != null && evidenceProp.inferenceMethod != null &&
+        claimProp.inferenceMethod != evidenceProp.inferenceMethod
+      ) {
+        return PropositionComparison(PropositionCompatibility.MISMATCH_CONTRADICTED, "inference method mismatch (${claimProp.inferenceMethod} vs ${evidenceProp.inferenceMethod})")
+      }
+
+      // 11. GRADE certainty level consistency
+      if (claimProp.certaintyLevel != null && evidenceProp.certaintyLevel != null &&
+        claimProp.certaintyLevel != evidenceProp.certaintyLevel
+      ) {
+        return PropositionComparison(PropositionCompatibility.MISMATCH_CONTRADICTED, "certainty level mismatch (${claimProp.certaintyLevel} vs ${evidenceProp.certaintyLevel})")
+      }
+
+      // 12. Follow-up / time-point consistency (e.g., 6 months vs 12 months)
+      if (claimProp.timePointDays.isNotEmpty() && evidenceProp.timePointDays.isNotEmpty()) {
+        val matchesTime = { cDays: Double ->
+          evidenceProp.timePointDays.any { eDays ->
+            val tol = maxOf(2.0, 0.15 * maxOf(cDays, eDays))
+            kotlin.math.abs(cDays - eDays) <= tol
+          }
+        }
+        val ok = if (requireAllClaimNumerics) claimProp.timePointDays.all(matchesTime) else claimProp.timePointDays.any(matchesTime)
+        if (!ok) {
+          return PropositionComparison(PropositionCompatibility.MISMATCH_CONTRADICTED, "time-point mismatch (${claimProp.timePointDays} vs ${evidenceProp.timePointDays} days)")
+        }
+      } else if (requireClaimCriticalFieldsInEvidence && claimProp.timePointDays.isNotEmpty() && evidenceProp.timePointDays.isEmpty()) {
+        return PropositionComparison(PropositionCompatibility.UNRESOLVED_INSUFFICIENT_FIELDS, "time-point missing from evidence")
+      }
+
+      // 13. Effect measure consistency (HR vs OR vs RR vs MD vs AUC)
+      if (claimProp.effectMeasures.isNotEmpty() && evidenceProp.effectMeasures.isNotEmpty() &&
+        claimProp.effectMeasures.intersect(evidenceProp.effectMeasures).isEmpty()
+      ) {
+        return PropositionComparison(PropositionCompatibility.MISMATCH_CONTRADICTED, "effect measure mismatch (${claimProp.effectMeasures} vs ${evidenceProp.effectMeasures})")
+      }
+
+      if (!compareNumericMagnitudes) {
+        return PropositionComparison(PropositionCompatibility.COMPATIBLE)
+      }
+
+      // 14. Typed numerical magnitude consistency (rejects 5% vs 50%, mismatched OR/HR/CI/p-value/N)
+      if (claimProp.percentages.isNotEmpty()) {
+        if (evidenceProp.percentages.isEmpty()) {
+          if (requireClaimCriticalFieldsInEvidence) {
+            return PropositionComparison(PropositionCompatibility.UNRESOLVED_INSUFFICIENT_FIELDS, "percentage magnitude missing from evidence")
+          }
+        } else {
+          val matchPct = { cPct: Double ->
+            evidenceProp.percentages.any { ePct ->
+              val tol = maxOf(0.25, 0.05 * kotlin.math.abs(ePct))
+              kotlin.math.abs(cPct - ePct) <= tol
+            }
+          }
+          val ok = if (requireAllClaimNumerics) claimProp.percentages.all(matchPct) else claimProp.percentages.any(matchPct)
+          if (!ok) {
+            return PropositionComparison(PropositionCompatibility.MISMATCH_CONTRADICTED, "percentage magnitude mismatch (${claimProp.percentages} vs ${evidenceProp.percentages})")
+          }
+        }
+      }
+      if (claimProp.effectEstimates.isNotEmpty()) {
+        if (evidenceProp.effectEstimates.isEmpty()) {
+          if (requireClaimCriticalFieldsInEvidence) {
+            return PropositionComparison(PropositionCompatibility.UNRESOLVED_INSUFFICIENT_FIELDS, "effect estimate missing from evidence")
+          }
+        } else {
+          val matchEst = { cEst: Double ->
+            evidenceProp.effectEstimates.any { eEst ->
+              val tol = maxOf(0.03, 0.05 * kotlin.math.abs(eEst))
+              kotlin.math.abs(cEst - eEst) <= tol
+            }
+          }
+          val ok = if (requireAllClaimNumerics) claimProp.effectEstimates.all(matchEst) else claimProp.effectEstimates.any(matchEst)
+          if (!ok) {
+            return PropositionComparison(PropositionCompatibility.MISMATCH_CONTRADICTED, "effect estimate mismatch (${claimProp.effectEstimates} vs ${evidenceProp.effectEstimates})")
+          }
+        }
+      }
+      if (claimProp.intervals.isNotEmpty()) {
+        if (evidenceProp.intervals.isEmpty()) {
+          if (requireClaimCriticalFieldsInEvidence) {
+            return PropositionComparison(PropositionCompatibility.UNRESOLVED_INSUFFICIENT_FIELDS, "confidence interval missing from evidence")
+          }
+        } else {
+          val matchCi = { pair: Pair<Double, Double> ->
+            val (cLo, cHi) = pair
+            evidenceProp.intervals.any { (eLo, eHi) ->
+              val tolLo = maxOf(0.03, 0.05 * kotlin.math.abs(eLo))
+              val tolHi = maxOf(0.03, 0.05 * kotlin.math.abs(eHi))
+              kotlin.math.abs(cLo - eLo) <= tolLo && kotlin.math.abs(cHi - eHi) <= tolHi
+            }
+          }
+          val ok = if (requireAllClaimNumerics) claimProp.intervals.all(matchCi) else claimProp.intervals.any(matchCi)
+          if (!ok) {
+            return PropositionComparison(PropositionCompatibility.MISMATCH_CONTRADICTED, "confidence interval mismatch")
+          }
+        }
+      }
+      if (claimProp.pValues.isNotEmpty() && evidenceProp.pValues.isNotEmpty()) {
+        val matchP = { cP: Double ->
+          evidenceProp.pValues.any { eP ->
+            val sameSideOfAlpha = (cP < 0.05) == (eP < 0.05)
+            val tol = maxOf(0.002, 0.25 * maxOf(cP, eP))
+            sameSideOfAlpha && kotlin.math.abs(cP - eP) <= tol
+          }
+        }
+        val ok = if (requireAllClaimNumerics) claimProp.pValues.all(matchP) else claimProp.pValues.any(matchP)
+        if (!ok) {
+          return PropositionComparison(PropositionCompatibility.MISMATCH_CONTRADICTED, "p-value mismatch")
+        }
+      }
+      if (claimProp.sampleSizes.isNotEmpty() && evidenceProp.sampleSizes.isNotEmpty()) {
+        val matchN = { cN: Int ->
+          evidenceProp.sampleSizes.any { eN ->
+            val tol = maxOf(1.0, 0.02 * eN.toDouble())
+            kotlin.math.abs(cN - eN) <= tol
+          }
+        }
+        val ok = if (requireAllClaimNumerics) claimProp.sampleSizes.all(matchN) else claimProp.sampleSizes.any(matchN)
+        if (!ok) {
+          return PropositionComparison(PropositionCompatibility.MISMATCH_CONTRADICTED, "sample size mismatch (${claimProp.sampleSizes} vs ${evidenceProp.sampleSizes})")
+        }
+      }
+
+      return PropositionComparison(PropositionCompatibility.COMPATIBLE)
+    }
+
+    /**
      * Finding 3 (P0) Typed Scientific Proposition Consistency Gate:
      * Treats finding IDs as pointers, NOT proof. Extracts typed scientific propositions
-     * (polarity, direction, significance, population, adjustment status, comparator arm,
+     * (polarity, direction, significance, population, intervention, comparator, outcome,
+     * adjustment status, subgroup/overall scope, scale transform, CI level, inference method,
      * follow-up time point, effect measure, percentages, intervals, p-values, sample sizes)
-     * and rejects any contradiction in a specified critical field before promoting prose as verified.
+     * and rejects any mismatch or missing critical field before promoting prose as verified.
      */
     internal fun isProseSemanticallyConsistentWithFinding(
       sentence: String,
@@ -3738,120 +4409,18 @@ class Reviewer2PipelineService {
 
       val sentProp = extractScientificProposition(cleanSentence)
       val findProp = extractScientificProposition(findingText)
-
-      // 1. Polarity / Method-Status opposition check (e.g., "absent" vs "was performed" / "is present in Table 3")
-      if ((sentProp.polarity == ClaimPolarity.PRESENT_OR_ADEQUATE && findProp.polarity == ClaimPolarity.ABSENT_OR_DEFICIENT) ||
-        (sentProp.polarity == ClaimPolarity.ABSENT_OR_DEFICIENT && findProp.polarity == ClaimPolarity.PRESENT_OR_ADEQUATE)
-      ) {
+      val comparison = compareScientificPropositions(
+        claimProp = sentProp,
+        evidenceProp = findProp,
+        requireClaimCriticalFieldsInEvidence = true,
+        compareNumericMagnitudes = true,
+        requireAllClaimNumerics = true
+      )
+      if (comparison.status != PropositionCompatibility.COMPATIBLE) {
         return false
       }
 
-      // 2. Significance & directional opposition check (including clinical benefit vs harm)
-      if (sentProp.significance != null && findProp.significance != null && sentProp.significance != findProp.significance) {
-        return false
-      }
-      if (sentProp.direction != 0 && findProp.direction != 0 && sentProp.direction != findProp.direction) {
-        return false
-      }
-
-      // 3. Typed Population consistency (e.g. "adults" vs "children" MUST fail)
-      if (sentProp.populations.isNotEmpty() && findProp.populations.isNotEmpty() &&
-        sentProp.populations.intersect(findProp.populations).isEmpty()
-      ) {
-        return false
-      }
-      val restrictiveSubpops = setOf("PEDIATRIC", "PREGNANT", "ANIMAL_PRECLINICAL")
-      if (sentProp.populations.any { it in restrictiveSubpops } &&
-        findProp.populations.intersect(sentProp.populations).isEmpty()
-      ) {
-        return false
-      }
-
-      // 4. Adjusted vs Unadjusted consistency
-      if (sentProp.adjustmentStatus != null && findProp.adjustmentStatus != null &&
-        sentProp.adjustmentStatus != findProp.adjustmentStatus
-      ) {
-        return false
-      }
-
-      // 5. Comparator arm consistency (e.g. placebo vs surgery/active control)
-      if (sentProp.comparators.isNotEmpty() && findProp.comparators.isNotEmpty() &&
-        sentProp.comparators.intersect(findProp.comparators).isEmpty()
-      ) {
-        return false
-      }
-
-      // 6. Follow-up / time-point consistency (e.g. 30-day vs 5-year)
-      if (sentProp.timePointDays.isNotEmpty() && findProp.timePointDays.isNotEmpty()) {
-        val allTimePointsSupported = sentProp.timePointDays.all { sDays ->
-          findProp.timePointDays.any { fDays ->
-            val tol = maxOf(2.0, 0.15 * maxOf(sDays, fDays))
-            kotlin.math.abs(sDays - fDays) <= tol
-          }
-        }
-        if (!allTimePointsSupported) return false
-      }
-
-      // 7. Effect measure consistency (e.g. HR vs OR)
-      if (sentProp.effectMeasures.isNotEmpty() && findProp.effectMeasures.isNotEmpty() &&
-        sentProp.effectMeasures.intersect(findProp.effectMeasures).isEmpty()
-      ) {
-        return false
-      }
-
-      // 8. Typed numerical consistency (rejects 5% vs 50%, contradictory OR/HR/CI/p-value/N)
-      if (sentProp.percentages.isNotEmpty()) {
-        if (findProp.percentages.isEmpty()) return false
-        val allPctConsistent = sentProp.percentages.all { sPct ->
-          findProp.percentages.any { fPct ->
-            val tol = maxOf(0.25, 0.05 * kotlin.math.abs(fPct))
-            kotlin.math.abs(sPct - fPct) <= tol
-          }
-        }
-        if (!allPctConsistent) return false
-      }
-      if (sentProp.effectEstimates.isNotEmpty()) {
-        if (findProp.effectEstimates.isEmpty()) return false
-        val allEstConsistent = sentProp.effectEstimates.all { sEst ->
-          findProp.effectEstimates.any { fEst ->
-            val tol = maxOf(0.03, 0.05 * kotlin.math.abs(fEst))
-            kotlin.math.abs(sEst - fEst) <= tol
-          }
-        }
-        if (!allEstConsistent) return false
-      }
-      if (sentProp.intervals.isNotEmpty()) {
-        if (findProp.intervals.isEmpty()) return false
-        val allCiConsistent = sentProp.intervals.all { (sLo, sHi) ->
-          findProp.intervals.any { (fLo, fHi) ->
-            val tolLo = maxOf(0.03, 0.05 * kotlin.math.abs(fLo))
-            val tolHi = maxOf(0.03, 0.05 * kotlin.math.abs(fHi))
-            kotlin.math.abs(sLo - fLo) <= tolLo && kotlin.math.abs(sHi - fHi) <= tolHi
-          }
-        }
-        if (!allCiConsistent) return false
-      }
-      if (sentProp.pValues.isNotEmpty() && findProp.pValues.isNotEmpty()) {
-        val allPConsistent = sentProp.pValues.all { sP ->
-          findProp.pValues.any { fP ->
-            val sameSideOfAlpha = (sP < 0.05) == (fP < 0.05)
-            val tol = maxOf(0.002, 0.25 * maxOf(sP, fP))
-            sameSideOfAlpha && kotlin.math.abs(sP - fP) <= tol
-          }
-        }
-        if (!allPConsistent) return false
-      }
-      if (sentProp.sampleSizes.isNotEmpty() && findProp.sampleSizes.isNotEmpty()) {
-        val allNConsistent = sentProp.sampleSizes.all { sN ->
-          findProp.sampleSizes.any { fN ->
-            val tol = maxOf(1.0, 0.02 * fN.toDouble())
-            kotlin.math.abs(sN - fN) <= tol
-          }
-        }
-        if (!allNConsistent) return false
-      }
-
-      // 9. Domain / Subject scope overlap: prevent unrelated prose from borrowing a verified ID
+      // Domain / Subject scope overlap: prevent unrelated prose from borrowing a verified ID
       val stopWords = setOf(
         "the", "and", "for", "with", "that", "this", "from", "were", "was", "are", "not", "but",
         "have", "has", "had", "into", "their", "they", "study", "paper", "authors", "reported",
@@ -4169,18 +4738,25 @@ class Reviewer2PipelineService {
     }
 
     /**
-     * P0-06 Scientific Entailment & Polarity Gate:
-     * Independently checks whether a verbatim-verified source quote logically entails OR directly
-     * contradicts (via negation or directional inversion) the substantive claim in [finding].
+     * P0-06 Typed Scientific Entailment & Polarity Gate:
+     * Keeps source authenticity (exact quote presence) and scientific entailment strictly separate.
+     * Parses both [finding] and the matched passage into typed [ScientificProposition] records
+     * (population, intervention, comparator, outcome, estimand/effect measure, adjustment status,
+     * subgroup/overall scope, scale/transformation, CI level, inference method, time point, and
+     * quantitative magnitudes). Rejects any critical-field mismatch, returns [EntailmentStatus.UNRESOLVED]
+     * when critical fields specified in the claim cannot be extracted from evidence, and returns
+     * [EntailmentStatus.CONTRADICTED_BY_POLARITY] when polarity, negation, significance, or direction oppose.
      */
     internal fun evaluateQuoteEntailment(
       finding: ReviewFinding,
       matchedQuote: String,
       surroundingWindow: String
     ): EntailmentStatus {
-      val claimText = "${finding.title} ${finding.allegation}".lowercase(Locale.US)
+      val rawClaimText = "${finding.title}. ${finding.allegation}"
+      val claimText = rawClaimText.lowercase(Locale.US)
       val quoteLower = matchedQuote.lowercase(Locale.US)
-      val evidenceText = "$matchedQuote $surroundingWindow".lowercase(Locale.US)
+      val rawEvidenceText = "$matchedQuote $surroundingWindow"
+      val evidenceText = rawEvidenceText.lowercase(Locale.US)
       if (matchedQuote.trim().length < 12) return EntailmentStatus.NOT_ENTAILED
 
       val stopWords = setOf(
@@ -4243,7 +4819,40 @@ class Reviewer2PipelineService {
         }
       }
 
-      // 3. Absence/omission claims ("did not adjust for confounding", "no sensitivity analysis")
+      // 3. Typed Scientific Proposition Entailment Gate (P0):
+      // Rejects population, intervention, comparator, outcome, adjustment, subgroup/overall,
+      // scale, CI-level, inference-method, time-point, and magnitude mismatches even when
+      // lexical overlap is high (e.g., "5% in adults at 12 months" vs "50% in children at 6 months").
+      val claimProp = extractScientificProposition(rawClaimText)
+      val evidenceProp = extractScientificProposition(rawEvidenceText)
+      val isDiscrepancyClaim = Regex(
+        """(?i)\b(?:discrepancy|contradict\w*|mismatch|inconsisten\w*|recomputed|does\s+not\s+match|differs?\s+from|impossible\s+ci|arithmetic\s+error)\b"""
+      ).containsMatchIn(rawClaimText)
+      val propositionComparison = compareScientificPropositions(
+        claimProp = claimProp,
+        evidenceProp = evidenceProp,
+        requireClaimCriticalFieldsInEvidence = !isDiscrepancyClaim,
+        compareNumericMagnitudes = true,
+        requireAllClaimNumerics = !isDiscrepancyClaim
+      )
+      when (propositionComparison.status) {
+        PropositionCompatibility.MISMATCH_CONTRADICTED -> {
+          val isPolarityOpposition = propositionComparison.reason.contains("polarity") ||
+            propositionComparison.reason.contains("direction") ||
+            propositionComparison.reason.contains("significance")
+          return if (isPolarityOpposition) {
+            EntailmentStatus.CONTRADICTED_BY_POLARITY
+          } else {
+            EntailmentStatus.NOT_ENTAILED
+          }
+        }
+        PropositionCompatibility.UNRESOLVED_INSUFFICIENT_FIELDS -> {
+          return EntailmentStatus.UNRESOLVED
+        }
+        PropositionCompatibility.COMPATIBLE -> Unit
+      }
+
+      // 4. Absence/omission claims ("did not adjust for confounding", "no sensitivity analysis")
       // cannot be entailed solely by quoting an unrelated descriptive sentence!
       val isAbsenceClaim = Regex(
         """\b(?:no|lack(?:s|ed|ing)?|missing|omitted|did\s+not|failed\s+to|without|unadjusted|not\s+reported|absent)\b"""

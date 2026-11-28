@@ -253,7 +253,7 @@ data class PdfRenderDiagnostics(
   val geometryIssues: List<String> = emptyList(),
   val geometryBlocksChecked: Int = 0,
   val outlineEntryCount: Int = 0,
-  val hasPdfAccessibilityMetadata: Boolean = false
+  val hasPdfCatalogMetadata: Boolean = false
 ) {
   val geometryClean: Boolean
     get() = !overlapDetected &&
@@ -286,7 +286,7 @@ object PdfReportExporter {
   private val rawHeaderScanRegex = Regex("""(?m)^\s*\[[A-Z][A-Z0-9 _&?—-]{4,}\]\s*$""")
   private val rawMarkdownRowScanRegex = Regex("""(?m)^\s*\|.*\|.*\|""")
   private val internalEnumScanRegex = Regex(
-    """\b(REPORTED_BUT_INADEQUATE|UNSUPPORTED_TO_ASSESS|NOT_ASSESSABLE_FROM_SUPPLIED_MATERIAL|NOT_ASSESSABLE|REPORTED_AND_ADEQUATE|FATAL_TO_PRIMARY_CONCLUSION|MATERIALLY_WEAKENS_CONFIDENCE|REQUIRES_REPORTING_CORRECTION|WORTHWHILE_ENHANCEMENT|COSMETIC_OR_EDITORIAL|IMPRECISION_OR_HIGH_VARIANCE|ARITHMETIC_ERROR|INTERNAL_CONTRADICTION|MODEL_MISMATCH|ASSUMPTION_UNCHECKED|REPORTING_OMISSION)\b"""
+    """\b(REPORTED_BUT_INADEQUATE|UNSUPPORTED_TO_ASSESS|NOT_ASSESSABLE_FROM_SUPPLIED_MATERIAL|NOT_ASSESSABLE|REPORTED_AND_ADEQUATE|REQUIRES_MANUAL_RECONCILIATION|FATAL_TO_PRIMARY_CONCLUSION|MATERIALLY_WEAKENS_CONFIDENCE|REQUIRES_REPORTING_CORRECTION|WORTHWHILE_ENHANCEMENT|COSMETIC_OR_EDITORIAL|IMPRECISION_OR_HIGH_VARIANCE|ARITHMETIC_ERROR|INTERNAL_CONTRADICTION|MODEL_MISMATCH|ASSUMPTION_UNCHECKED|REPORTING_OMISSION)\b"""
   )
   private val disclosureExtConfRegex = Regex("""Extraction\s+Confidence:\s*\d+/5""", RegexOption.IGNORE_CASE)
 
@@ -317,7 +317,7 @@ object PdfReportExporter {
     val extractedText: String,
     val pageCount: Int,
     val outlineEntryCount: Int,
-    val hasAccessibilityMetadata: Boolean
+    val hasCatalogMetadata: Boolean
   )
 
   internal fun inspectPdfBytesWithMetadata(pdfBytes: ByteArray): PdfByteInspection? {
@@ -349,7 +349,7 @@ object PdfReportExporter {
           extractedText = text,
           pageCount = pages,
           outlineEntryCount = outlineCount,
-          hasAccessibilityMetadata = hasTitle && hasLang && displayTitle
+          hasCatalogMetadata = hasTitle && hasLang && displayTitle
         )
       }
     }.getOrNull()
@@ -366,12 +366,14 @@ object PdfReportExporter {
   }
 
   /**
-   * P2-14: Post-processes native Android [PdfDocument] bytes with PDFBox to embed:
+   * Post-processes native Android [PdfDocument] bytes with PDFBox to embed:
    * - Interactive PDF Document Outline (bookmarks) targeting every rendered section heading.
-   * - PDF/UA accessibility & catalog metadata (Title, Author, Subject, Creator, Language, DisplayDocTitle).
+   * - PDF catalog & document-info metadata (Title, Author, Subject, Creator, Language, DisplayDocTitle).
+   * Note: Native Android [PdfDocument] emits untagged canvas PDFs; this step does NOT create a
+   * tagged PDF/UA structure tree (StructTreeRoot/MarkInfo) and does not claim PDF/UA conformance.
    * Returns [rawPdfBytes] unchanged if bytes are not a standard PDF (e.g., headless Robolectric shadow).
    */
-  internal fun enrichPdfWithOutlineAndAccessibilityMetadata(
+  internal fun enrichPdfWithOutlineAndCatalogMetadata(
     rawPdfBytes: ByteArray,
     review: PaperReview,
     outlineEntries: List<PdfOutlineEntry>
@@ -481,7 +483,7 @@ object PdfReportExporter {
         pageCount = pdfBoxInspected.pageCount
       ).withGeometry(geometryReport).copy(
         outlineEntryCount = pdfBoxInspected.outlineEntryCount,
-        hasPdfAccessibilityMetadata = pdfBoxInspected.hasAccessibilityMetadata
+        hasPdfCatalogMetadata = pdfBoxInspected.hasCatalogMetadata
       )
       return base.copy(
         pdfByteIntegrityFailed = false,
@@ -540,7 +542,7 @@ object PdfReportExporter {
       geometryRecorder = geometryRecorder,
       outlineEntriesSink = outlineEntries
     )
-    val bytes = enrichPdfWithOutlineAndAccessibilityMetadata(
+    val bytes = enrichPdfWithOutlineAndCatalogMetadata(
       rawPdfBytes = baos.toByteArray(),
       review = review,
       outlineEntries = outlineEntries
@@ -1839,6 +1841,23 @@ object PdfReportExporter {
     covLayout.draw(canvas)
     canvas.restore()
     cursorY += covH + 9f
+
+    if (reconciledCoverageDisclosure.contains("Quantitative Coverage Partial", ignoreCase = true) ||
+      reconciledCoverageDisclosure.contains("omitted by cap", ignoreCase = true)
+    ) {
+      val partialNotice = "PARTIAL QUANTITATIVE COVERAGE NOTICE: One or more discovery, reconstruction, unsupported-domain, or ledger-injection caps were reached during deterministic statistical analysis. Treat scores and verdicts as partial screening output requiring human statistical review."
+      drawBoxedCard(
+        badgeText = "QUANTITATIVE COVERAGE PARTIAL — CAPS APPLIED",
+        bodyText = "$partialNotice\n$reconciledCoverageDisclosure",
+        palette = BadgePalette(
+          bgColor = Color.rgb(255, 251, 235),
+          borderColor = Color.rgb(245, 158, 11),
+          accentColor = Color.rgb(217, 119, 6),
+          textColor = Color.rgb(146, 64, 14)
+        ),
+        isCalloutTitle = true
+      )
+    }
 
     if (review.ledgerLoadState != LedgerLoadState.COMPLETE) {
       val degradedTitle = when (review.ledgerLoadState) {

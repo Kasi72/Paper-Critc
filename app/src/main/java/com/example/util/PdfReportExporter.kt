@@ -17,6 +17,12 @@ import android.text.TextPaint
 import androidx.core.content.FileProvider
 import com.example.data.ai.epistemic.FlawSeverityTier
 import com.example.data.ai.epistemic.ReportingStatus
+import com.example.data.ai.referee.AbstentionResult
+import com.example.data.ai.referee.AnalysisManifest
+import com.example.data.ai.referee.DocumentReadinessAssessment
+import com.example.data.ai.referee.RefereeCoverageMetrics
+import com.example.data.ai.referee.RefereeDecision
+import com.example.data.ai.referee.TamperEvidentAuditLog
 import com.example.data.model.FindingStatus
 import com.example.data.model.LedgerLoadState
 import com.example.data.model.PaperReview
@@ -1822,7 +1828,30 @@ object PdfReportExporter {
       "LEGACY_UNVALIDATED" -> "Legacy Unvalidated"
       else -> review.validationStatus.replace('_', ' ')
     }
+    val refereeDecision = RefereeDecision.fromNameOrNull(review.refereeDecision)
+    val refereeCoverage = RefereeCoverageMetrics.fromJson(review.refereeCoverageJson)
+    val abstentionResult = AbstentionResult.fromJson(review.abstentionSummaryJson)
+    val analysisManifest = AnalysisManifest.fromJson(review.analysisManifestJson)
+    val readinessAssessment = DocumentReadinessAssessment.fromJson(review.readinessSummaryJson)
+    val auditEntries = TamperEvidentAuditLog.fromJson(review.auditLogJson)
+    val auditChainValid = auditEntries.isEmpty() || TamperEvidentAuditLog.verifyChain(auditEntries)
+
     val coverageText = buildString {
+      if (refereeDecision != null) {
+        append("Referee Decision: ${refereeDecision.displayLabel}  |  ")
+      }
+      if (refereeCoverage != null) {
+        val hasCap = refereeCoverage.extractionCapApplied ||
+          refereeCoverage.claimCapApplied ||
+          refereeCoverage.pagesOmitted > 0 ||
+          refereeCoverage.claimsSkipped > 0
+        val safeCovLabel = if (hasCap && refereeCoverage.standardizedLabel.contains("Complete", ignoreCase = true)) {
+          RefereeCoverageMetrics.LABEL_PARTIAL
+        } else {
+          refereeCoverage.standardizedLabel
+        }
+        append("Coverage: $safeCovLabel (${refereeCoverage.pagesExtracted}/${refereeCoverage.totalPages} pages extracted, ${refereeCoverage.pagesAnalyzed} analyzed, ${refereeCoverage.pagesOmitted} omitted; ${refereeCoverage.claimsDiscovered} claims discovered, ${refereeCoverage.claimsRetained} retained, ${refereeCoverage.claimsReconstructed} reconstructed, ${refereeCoverage.claimsSkipped} skipped)  |  ")
+      }
       append("Source Quote Verification: $quoteVerificationLabel")
       append("  |  Scientific Verification: $scientificVerificationLabel")
       append("  |  Editorial Validation: $editorialValidationLabel")
@@ -1840,12 +1869,60 @@ object PdfReportExporter {
     canvas.translate(MARGIN_H + 8f, cursorY + 5.5f)
     covLayout.draw(canvas)
     canvas.restore()
+    geometryRecorder?.recordBodyBlock(pageNumber, "coverage_banner", MARGIN_H, cursorY, PAGE_WIDTH - MARGIN_H, cursorY + covH)
     cursorY += covH + 9f
+
+    if (abstentionResult != null && abstentionResult.shouldAbstainFromVerifiedVerdict) {
+      val abstentionBody = buildString {
+        if (abstentionResult.primaryWhatIsMissing.isNotBlank()) {
+          appendLine("What is missing: ${abstentionResult.primaryWhatIsMissing}")
+        }
+        if (abstentionResult.primaryWhyItMatters.isNotBlank()) {
+          appendLine("Why it matters: ${abstentionResult.primaryWhyItMatters}")
+        }
+        if (abstentionResult.primaryBlockedConclusion.isNotBlank()) {
+          appendLine("Blocked conclusion: ${abstentionResult.primaryBlockedConclusion}")
+        }
+        if (abstentionResult.combinedNextSteps.isNotEmpty()) {
+          append("Next steps: ${abstentionResult.combinedNextSteps.joinToString("; ")}")
+        }
+      }.trim()
+      drawBoxedCard(
+        badgeText = "SAFE ABSTENTION GATE — VERIFIED VERDICT WITHHELD",
+        bodyText = abstentionBody,
+        palette = if (abstentionResult.hardBlockAllVerdicts) severityPalette(SeverityLevel.CRITICAL) else severityPalette(SeverityLevel.WARN),
+        isCalloutTitle = true
+      )
+    }
+
+    if (analysisManifest != null || readinessAssessment != null || auditEntries.isNotEmpty()) {
+      val provBody = buildString {
+        if (readinessAssessment != null) {
+          appendLine("Document Readiness: ${readinessAssessment.readiness.displayLabel} (${readinessAssessment.supplementStatus.displayLabel})")
+        }
+        if (analysisManifest != null) {
+          appendLine("Provider & Model: ${analysisManifest.providerRoute} / ${analysisManifest.modelId}")
+          appendLine("Digests: manuscript=${analysisManifest.manuscriptSha256.take(16)}..., code=${analysisManifest.replicationCodeSha256.take(16)}..., vision=${analysisManifest.pdfVisionDigest.take(16).ifBlank { "none" }}")
+          appendLine("Versions: ruleset=${analysisManifest.rulesetVersion}, prompt=${analysisManifest.promptVersion}, app=${analysisManifest.appVersion} | Consent Verified: ${analysisManifest.consentVerified}")
+        }
+        if (auditEntries.isNotEmpty()) {
+          append("Audit Trail Integrity: ${if (auditChainValid) "SHA-256 Chain Verified (${auditEntries.size} stages)" else "CHAIN VERIFICATION FAILED"}")
+        }
+      }.trim()
+      if (provBody.isNotBlank()) {
+        drawBoxedCard(
+          badgeText = "PROVENANCE & TAMPER-EVIDENT AUDIT MANIFEST",
+          bodyText = provBody,
+          palette = calloutPalette(CalloutTone.INFO),
+          isCalloutTitle = true
+        )
+      }
+    }
 
     if (reconciledCoverageDisclosure.contains("Quantitative Coverage Partial", ignoreCase = true) ||
       reconciledCoverageDisclosure.contains("omitted by cap", ignoreCase = true)
     ) {
-      val partialNotice = "PARTIAL QUANTITATIVE COVERAGE NOTICE: One or more discovery, reconstruction, unsupported-domain, or ledger-injection caps were reached during deterministic statistical analysis. Treat scores and verdicts as partial screening output requiring human statistical review."
+      val partialNotice = "PARTIAL QUANTITATIVE COVERAGE NOTICE: One or more discovery, reconstruction, unsupported-domain, or ledger-injection caps were reached during deterministic statistical analysis. Treat scores as partial screening output requiring human statistical review."
       drawBoxedCard(
         badgeText = "QUANTITATIVE COVERAGE PARTIAL — CAPS APPLIED",
         bodyText = "$partialNotice\n$reconciledCoverageDisclosure",

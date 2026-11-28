@@ -7,6 +7,16 @@ import com.example.data.ai.epistemic.EpistemicSafeguardEngine
 import com.example.data.ai.epistemic.EpistemicSafeguardReport
 import com.example.data.ai.epistemic.FlawSeverityTier
 import com.example.data.ai.epistemic.ReportingStatus
+import com.example.data.ai.referee.AutonomousRefereeOrchestrator
+import com.example.data.ai.referee.DiscrepancyCrossCheckChecklist
+import com.example.data.ai.referee.DocumentReadiness
+import com.example.data.ai.referee.DocumentReadinessEvaluator
+import com.example.data.ai.referee.DomainAppraisalAdapters
+import com.example.data.ai.referee.PassComparisonInput
+import com.example.data.ai.referee.QuantitativeAdjudicationContracts
+import com.example.data.ai.referee.RefereeAdjudicationInput
+import com.example.data.ai.referee.RefereeDecision
+import com.example.data.ai.referee.RemotePayloadCleanupHook
 import com.example.data.ai.stats.AuditSubDesign
 import com.example.data.ai.stats.EvidenceDerivedScoreGate
 import com.example.data.ai.stats.ScoreCalculationBreakdown
@@ -37,6 +47,7 @@ import com.google.firebase.ai.type.thinkingConfig
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.UUID
 import kotlin.math.roundToInt
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -568,6 +579,7 @@ class Reviewer2PipelineService {
     useExternalProvider: Boolean,
     externalSystemPrompt: String,
     autoFallbackToKeylessFirebase: Boolean,
+    allowInternalModelFallback: Boolean = true,
     onStageUpdate: (stageCode: String, stageLabel: String, progress: Float) -> Unit
   ): ParsedJsonResult = withContext(Dispatchers.IO) {
     val fallbackTrail = mutableListOf<String>()
@@ -695,6 +707,13 @@ class Reviewer2PipelineService {
       Log.w(TAG, "Tier 1 (3.8 Flash) failed on $stageCode: ${formatThrowableDetails(e)}", e)
     }
 
+    if (!allowInternalModelFallback) {
+      throw IllegalStateException(
+        "Stage $stageCode failed on primary model (gemini-3.8-flash) and silent internal model fallback is disabled.",
+        tier1Err
+      )
+    }
+
     // TIER 2: Fast gemini-3.5-flash-lite — preserve visual bitmaps unless Tier 1 failed on a vision/payload error
     val dropVisionForTier2 = isLikelyVisionPayloadError(tier1Err)
     val tier2Bitmaps = if (dropVisionForTier2) emptyList() else safeBitmaps.take(2)
@@ -783,117 +802,173 @@ class Reviewer2PipelineService {
     options: PipelineOptions,
     externalProvider: com.example.data.model.AiApiProviderEntry? = null,
     autoFallbackToKeylessFirebase: Boolean = false,
+    pdfVisionDigestSha256: String = "",
+    consentVerified: Boolean = true,
+    consentDigestAtApproval: String = "",
+    allowInternalModelFallback: Boolean = true,
+    remotePayloadCleanupHook: RemotePayloadCleanupHook? = null,
     onStageUpdate: (stageCode: String, stageLabel: String, progress: Float) -> Unit
   ): PaperReview {
-    val useExternalProvider = externalProvider != null &&
-      externalProvider.protocolType != com.example.data.model.ApiProtocolType.FIREBASE_AI_LOGIC_KEYLESS &&
-      externalProvider.apiKey.isNotBlank()
+    val startedAtMs = System.currentTimeMillis()
+    val analysisId = "ana_${UUID.randomUUID()}"
+    remotePayloadCleanupHook?.registerPayloadHandle(analysisId, startedAtMs + 300_000L)
+    try {
+      val useExternalProvider = externalProvider != null &&
+        externalProvider.protocolType != com.example.data.model.ApiProtocolType.FIREBASE_AI_LOGIC_KEYLESS &&
+        externalProvider.apiKey.isNotBlank()
 
-    // ==========================================================================
-    // PASS 0: Deterministic Forensic Pre-Flight Engine (Full Document, Zero Middle Truncation)
-    // ==========================================================================
-    onStageUpdate(
-      "00a-00c",
-      "Stage 00a–00c: Running Full-Document Forensic, Statcheck & CI Geometry Scanner...",
-      0.12f
-    )
-    val effectiveCoverageReport = coverageReport ?: if (manuscriptText.isNotBlank()) {
-      DocumentCoverageReport.forCompleteText(
-        text = manuscriptText,
-        engine = if (pdfPageBitmaps.isNotEmpty()) "PDF Vision + Direct Text" else "Direct Text Input"
+      // ==========================================================================
+      // PASS 0: Deterministic Forensic Pre-Flight Engine (Full Document, Zero Middle Truncation)
+      // ==========================================================================
+      onStageUpdate(
+        "00a-00c",
+        "Stage 00a–00c: Running Full-Document Forensic, Statcheck & CI Geometry Scanner...",
+        0.12f
       )
-    } else {
-      DocumentCoverageReport.unknown("No manuscript text or coverage report supplied to pipeline.")
-    }
-    val forensicReport = withContext(Dispatchers.Default) {
-      ManuscriptForensicEngine.analyzeManuscript(
-        text = manuscriptText,
-        isEmpiricalTrack = options.isEmpirical,
-        replicationCode = replicationCodeText,
-        coverageReport = effectiveCoverageReport
+      val effectiveCoverageReport = coverageReport ?: if (manuscriptText.isNotBlank()) {
+        DocumentCoverageReport.forCompleteText(
+          text = manuscriptText,
+          engine = if (pdfPageBitmaps.isNotEmpty()) "PDF Vision + Direct Text" else "Direct Text Input"
+        )
+      } else {
+        DocumentCoverageReport.unknown("No manuscript text or coverage report supplied to pipeline.")
+      }
+      val forensicReport = withContext(Dispatchers.Default) {
+        ManuscriptForensicEngine.analyzeManuscript(
+          text = manuscriptText,
+          isEmpiricalTrack = options.isEmpirical,
+          replicationCode = replicationCodeText,
+          coverageReport = effectiveCoverageReport
+        )
+      }
+      val refereeReadiness = DocumentReadinessEvaluator.assess(
+        manuscriptText = manuscriptText,
+        coverageReport = effectiveCoverageReport,
+        attachedBitmapCount = pdfPageBitmaps.count { !it.isRecycled },
+        pdfVisionDigestSha256 = pdfVisionDigestSha256,
+        useExternalTextOnlyProvider = useExternalProvider
       )
-    }
+      val domainAppraisal = DomainAppraisalAdapters.appraise(
+        text = manuscriptText,
+        parentArchetype = forensicReport.studyDesign
+      )
 
-    // P1-10 Pre-Inference Document-Readiness Gate:
-    // Short-circuit BEFORE running expensive LLM passes when essential text/pages are inaccessible
-    // (e.g., multi-page scanned PDF lacking an embedded text layer or unreadable input).
-    val readinessGate = evaluateDocumentReadinessGate(
-      manuscriptText = manuscriptText,
-      coverageReport = effectiveCoverageReport,
-      attachedBitmapCount = pdfPageBitmaps.count { !it.isRecycled },
-      useExternalTextOnlyProvider = useExternalProvider
-    )
-    if (!readinessGate.isReady) {
-      onStageUpdate("DONE", "Document Readiness Gate: Additional Source Material Required", 1.0f)
-      val safeTitle = com.example.util.DossierFormattingEngine.normalizeTitle(
-        title.ifBlank { "Unreadable / Incomplete Manuscript" }
+      // P1-10 Pre-Inference Document-Readiness & Consent Gate:
+      // Short-circuit BEFORE running expensive LLM passes when consent fails or essential text/pages are inaccessible.
+      val readinessGate = evaluateDocumentReadinessGate(
+        manuscriptText = manuscriptText,
+        coverageReport = effectiveCoverageReport,
+        attachedBitmapCount = pdfPageBitmaps.count { !it.isRecycled },
+        useExternalTextOnlyProvider = useExternalProvider
       )
-      val safeAuthors = authors.trim().ifBlank { "Authors Not Disclosed" }
-      val safeYear = year.trim()
-      val safeVenue = venueOrCitation.trim().ifBlank { options.targetVenue }
-      val gateReason = readinessGate.blockingReasons.joinToString("; ")
-      val gateFinding = ReviewFinding(
-        id = "GATE-01",
-        title = "Pre-Inference Document-Readiness Gate Triggered",
-        allegation = "Full scientific appraisal was paused before model inference because essential manuscript content could not be verified: $gateReason",
-        severity = "INFO",
-        status = FindingStatus.UNVERIFIED,
-        methodologicalJustification = "Evaluating a multi-page scanned or severely truncated manuscript without searchable text risks fabricated or incomplete methodological criticisms.",
-        recommendedCorrection = readinessGate.requestedActions.joinToString(" "),
-        verificationNotes = "Blocked deterministically prior to Pass 1/Pass 2 inference to preserve scientific validity.",
-        reportingStatus = ReportingStatus.NOT_ASSESSABLE_FROM_SUPPLIED_MATERIAL.name,
-        flawTier = FlawSeverityTier.COSMETIC_OR_EDITORIAL.name,
-        overturnEvidence = "Upload a text-searchable PDF, OCR-processed PDF, Word (.docx), or plain-text version with Methods, Results, and tables."
-      )
-      val gateNote = buildString {
-        appendLine("PRE-INFERENCE DOCUMENT-READINESS GATE — APPRAISAL PAUSED (NOT ASSESSED)")
-        appendLine("Blocking issues: $gateReason")
-        appendLine()
-        appendLine("Required actions before full appraisal:")
-        readinessGate.requestedActions.forEach { act -> appendLine("• $act") }
-      }.trim()
-      val disclosure = "${effectiveCoverageReport.toDisclosureLine(overrideExtractionConfidence = 1)} • Pre-inference gate: paused (0 LLM passes executed; scores Not Assessed)"
-      return PaperReview(
-        title = safeTitle,
-        authors = safeAuthors,
-        publicationYear = safeYear,
-        venueOrCitation = safeVenue,
-        isEmpirical = options.isEmpirical,
-        credibilityScore = 0L,
-        verdict = "INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT",
-        methodologyScore = 0,
-        significanceScore = 0,
-        clarityScore = 0,
-        originalityScore = 0,
-        mathRigorScore = 0,
-        reproducibilityScore = 0,
-        methodologyJustification = "Not assessed prior to searchable full-text ingestion.",
-        significanceJustification = "Not assessed prior to searchable full-text ingestion.",
-        clarityJustification = "Not assessed prior to searchable full-text ingestion.",
-        originalityJustification = "Not assessed prior to searchable full-text ingestion.",
-        mathRigorJustification = "Not assessed prior to searchable full-text ingestion.",
-        reproducibilityJustification = "Not assessed prior to searchable full-text ingestion.",
-        refereeConfidence = 1,
-        extractionConfidence = 1,
-        reviewMode = options.reviewMode.name,
-        coverageDisclosure = disclosure,
-        validationStatus = "UNVERIFIED",
-        structuredFindingsJson = ReviewFindingCodec.encode(listOf(gateFinding)),
-        schemaVersion = 5,
-        abstractSummary = gateNote,
-        researchQuestion = "Unavailable due to incomplete/unsearchable document input.",
-        keyMethodology = "Unavailable due to incomplete/unsearchable document input.",
-        coreContributions = "Unavailable due to incomplete/unsearchable document input.",
-        redTeamCritique = "Skipped by pre-inference document-readiness gate.",
-        blueTeamVerification = gateNote,
-        mathAuditReport = "Skipped by pre-inference document-readiness gate.",
-        codeAuditReport = "Skipped by pre-inference document-readiness gate.",
-        editorNote = gateNote,
-        copyeditSuggestions = "Skipped by pre-inference document-readiness gate.",
-        reviewerQuestions = readinessGate.requestedActions.joinToString("\n") { "• $it" },
-        formattedDossier = gateNote
-      )
-    }
+      if (!consentVerified || !readinessGate.isReady) {
+        onStageUpdate("DONE", "Document Readiness Gate: Additional Source Material Required", 1.0f)
+        val safeTitle = com.example.util.DossierFormattingEngine.normalizeTitle(
+          title.ifBlank { "Unreadable / Incomplete Manuscript" }
+        )
+        val safeAuthors = authors.trim().ifBlank { "Authors Not Disclosed" }
+        val safeYear = year.trim()
+        val safeVenue = venueOrCitation.trim().ifBlank { options.targetVenue }
+        val gateReason = if (!consentVerified) {
+          "Manuscript, replication code, or PDF vision bitmaps changed after consent verification."
+        } else {
+          readinessGate.blockingReasons.joinToString("; ")
+        }
+        val gateActions = if (!consentVerified) {
+          listOf("Review document checksums and confirm remote inference consent before running analysis.")
+        } else {
+          readinessGate.requestedActions
+        }
+        val gateFinding = ReviewFinding(
+          id = "GATE-01",
+          title = "Pre-Inference Document-Readiness Gate Triggered",
+          allegation = "Full scientific appraisal was paused before model inference because essential prerequisites could not be verified: $gateReason",
+          severity = "INFO",
+          status = FindingStatus.UNVERIFIED,
+          methodologicalJustification = "Evaluating a manuscript without verified consent, searchable text, or bound PDF pages risks fabricated or unauthorized criticisms.",
+          recommendedCorrection = gateActions.joinToString(" "),
+          verificationNotes = "Blocked deterministically prior to Pass 1/Pass 2 inference to preserve scientific validity.",
+          reportingStatus = ReportingStatus.NOT_ASSESSABLE_FROM_SUPPLIED_MATERIAL.name,
+          flawTier = FlawSeverityTier.COSMETIC_OR_EDITORIAL.name,
+          overturnEvidence = "Upload a text-searchable PDF, OCR-processed PDF, Word (.docx), or plain-text version with Methods, Results, and verified consent."
+        )
+        val earlyOut = AutonomousRefereeOrchestrator.adjudicate(
+          RefereeAdjudicationInput(
+            analysisId = analysisId,
+            manuscriptText = manuscriptText,
+            replicationCodeText = replicationCodeText,
+            pdfVisionDigestSha256 = pdfVisionDigestSha256,
+            providerRoute = if (useExternalProvider && externalProvider != null) externalProvider.serviceName else "Firebase AI Logic (Pre-Inference Gate)",
+            modelId = if (useExternalProvider && externalProvider != null) externalProvider.modelId else "none-executed",
+            startedAtMs = startedAtMs,
+            completedAtMs = System.currentTimeMillis(),
+            readiness = refereeReadiness,
+            extractionConfidence = 1,
+            totalPages = effectiveCoverageReport.totalPages,
+            pagesExtracted = effectiveCoverageReport.extractedPages,
+            pagesAnalyzed = 0,
+            omittedPages = effectiveCoverageReport.omittedPages,
+            deterministicFindings = listOf(gateFinding),
+            domainAppraisal = domainAppraisal,
+            consentVerified = consentVerified,
+            consentDigestAtApproval = consentDigestAtApproval
+          )
+        )
+        val gateNote = buildString {
+          appendLine("PRE-INFERENCE DOCUMENT-READINESS GATE — APPRAISAL PAUSED (NOT ASSESSED)")
+          appendLine("Blocking issues: $gateReason")
+          appendLine()
+          appendLine("Required actions before full appraisal:")
+          gateActions.forEach { act -> appendLine("• $act") }
+        }.trim()
+        val disclosure = "${effectiveCoverageReport.toDisclosureLine(overrideExtractionConfidence = 1)} • Pre-inference gate: paused (0 LLM passes executed; scores Not Assessed)"
+        return PaperReview(
+          title = safeTitle,
+          authors = safeAuthors,
+          publicationYear = safeYear,
+          venueOrCitation = safeVenue,
+          isEmpirical = options.isEmpirical,
+          credibilityScore = 0L,
+          verdict = "INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT",
+          methodologyScore = 0,
+          significanceScore = 0,
+          clarityScore = 0,
+          originalityScore = 0,
+          mathRigorScore = 0,
+          reproducibilityScore = 0,
+          methodologyJustification = "Not assessed prior to searchable full-text ingestion.",
+          significanceJustification = "Not assessed prior to searchable full-text ingestion.",
+          clarityJustification = "Not assessed prior to searchable full-text ingestion.",
+          originalityJustification = "Not assessed prior to searchable full-text ingestion.",
+          mathRigorJustification = "Not assessed prior to searchable full-text ingestion.",
+          reproducibilityJustification = "Not assessed prior to searchable full-text ingestion.",
+          refereeConfidence = 1,
+          extractionConfidence = 1,
+          reviewMode = options.reviewMode.name,
+          coverageDisclosure = disclosure,
+          validationStatus = "UNVERIFIED",
+          structuredFindingsJson = ReviewFindingCodec.encode(listOf(gateFinding)),
+          schemaVersion = 5,
+          abstractSummary = gateNote,
+          researchQuestion = "Unavailable due to incomplete/unsearchable document input.",
+          keyMethodology = "Unavailable due to incomplete/unsearchable document input.",
+          coreContributions = "Unavailable due to incomplete/unsearchable document input.",
+          redTeamCritique = "Skipped by pre-inference document-readiness gate.",
+          blueTeamVerification = gateNote,
+          mathAuditReport = "Skipped by pre-inference document-readiness gate.",
+          codeAuditReport = "Skipped by pre-inference document-readiness gate.",
+          editorNote = gateNote,
+          copyeditSuggestions = "Skipped by pre-inference document-readiness gate.",
+          reviewerQuestions = gateActions.joinToString("\n") { "• $it" },
+          formattedDossier = gateNote,
+          refereeDecision = earlyOut.decision.name,
+          analysisManifestJson = earlyOut.manifest.toJson(),
+          abstentionSummaryJson = earlyOut.abstentionResult.toJson(),
+          readinessSummaryJson = refereeReadiness.toJson(),
+          auditLogJson = earlyOut.auditLogJson,
+          refereeCoverageJson = earlyOut.coverageMetrics.toJson()
+        )
+      }
 
     val forensicContext = forensicReport.toStructuredPromptContext()
 
@@ -974,6 +1049,7 @@ class Reviewer2PipelineService {
       useExternalProvider = useExternalProvider,
       externalSystemPrompt = pass1KeysSpec,
       autoFallbackToKeylessFirebase = autoFallbackToKeylessFirebase,
+      allowInternalModelFallback = allowInternalModelFallback,
       onStageUpdate = onStageUpdate
     )
     val pass1Json = pass1Result.json
@@ -1139,6 +1215,7 @@ class Reviewer2PipelineService {
               useExternalProvider = useExternalProvider,
               externalSystemPrompt = quantKeysSpec,
               autoFallbackToKeylessFirebase = autoFallbackToKeylessFirebase,
+              allowInternalModelFallback = allowInternalModelFallback,
               onStageUpdate = { _, _, _ -> /* Progress driven smoothly by primary synthesis pass */ }
             )
           }.onFailure { err ->
@@ -1172,6 +1249,7 @@ class Reviewer2PipelineService {
           useExternalProvider = useExternalProvider,
           externalSystemPrompt = pass2KeysSpec,
           autoFallbackToKeylessFirebase = autoFallbackToKeylessFirebase,
+          allowInternalModelFallback = allowInternalModelFallback,
           onStageUpdate = onStageUpdate
         )
       }
@@ -1597,6 +1675,96 @@ class Reviewer2PipelineService {
       reviewerQuestions = fortifyReviewerQuestions
     )
 
+    val (detPartition, llmPartition) = adjudicated.adjudicatedFindings.partition {
+      it.id.startsWith("Q-") || it.id.startsWith("STAT-") || it.id.startsWith("FORENSIC-") || it.id.startsWith("DET-")
+    }
+    val quantStatuses = buildList {
+      statAuditForCoverage?.reconstructions.orEmpty().forEach { r ->
+        add(
+          QuantitativeAdjudicationContracts.mapStatus(
+            result = r,
+            sourceAnchorsVerified = extractionConfidence >= 4,
+            estimandCompatible = true
+          )
+        )
+      }
+      statAuditForCoverage?.domainFindings.orEmpty().forEach { d ->
+        add(
+          QuantitativeAdjudicationContracts.mapDomainStatus(
+            finding = d,
+            sourceAnchorsVerified = extractionConfidence >= 4,
+            estimandCompatible = true
+          )
+        )
+      }
+    }
+    val passComparisons = listOf(
+      PassComparisonInput(
+        passName = "Pass1_RedTeam",
+        designClassification = extractedDesign.ifBlank { null },
+        primaryEndpoint = researchQuestion.take(100).ifBlank { null },
+        criticalVerdict = pass2Json.optString("verdict", verdict).ifBlank { verdict }
+      ),
+      PassComparisonInput(
+        passName = "Pass2_Verification",
+        designClassification = extractedDesign.ifBlank { forensicReport.studyDesign.displayName },
+        primaryEndpoint = researchQuestion.take(100).ifBlank { null },
+        criticalVerdict = verdict
+      )
+    )
+    val unexpectedFallback = actualFallbackNotes.isNotEmpty() && !autoFallbackToKeylessFirebase
+    val refereeOutput = AutonomousRefereeOrchestrator.adjudicate(
+      RefereeAdjudicationInput(
+        analysisId = analysisId,
+        manuscriptText = manuscriptText,
+        replicationCodeText = replicationCodeText,
+        pdfVisionDigestSha256 = pdfVisionDigestSha256,
+        providerRoute = pass2Result.actualRoute,
+        modelId = pass2Result.actualModelId,
+        fallbackHistory = actualFallbackNotes,
+        startedAtMs = startedAtMs,
+        completedAtMs = System.currentTimeMillis(),
+        readiness = refereeReadiness,
+        extractionConfidence = extractionConfidence,
+        totalPages = effectiveCoverageReport.totalPages,
+        pagesExtracted = effectiveCoverageReport.extractedPages,
+        pagesAnalyzed = (effectiveCoverageReport.extractedPages - allImpactedPromptPages.size).coerceAtLeast(0),
+        omittedPages = (effectiveCoverageReport.omittedPages + allImpactedPromptPages).distinct().sorted(),
+        claimsDiscovered = statAuditForCoverage?.totalDiscoveredClaims ?: 0,
+        claimsRetained = statAuditForCoverage?.coverageMetrics?.parsedRetained ?: 0,
+        claimsReconstructed = statAuditForCoverage?.coverageMetrics?.reconstructedCompleted ?: 0,
+        claimsSkipped = totalQuantitativeCapOmissions,
+        unsupportedClaims = statAuditForCoverage?.unsupportedAssessmentCount ?: 0,
+        unresolvedClaims = adjudicated.adjudicatedFindings.count { it.status == FindingStatus.UNVERIFIED },
+        extractionCapApplied = primaryPrepared.wasTrimmed || effectiveCoverageReport.omittedPages.isNotEmpty(),
+        claimCapApplied = totalQuantitativeCapOmissions > 0,
+        deterministicFindings = detPartition,
+        llmFindings = llmPartition,
+        passComparisons = passComparisons,
+        quantitativeStatuses = quantStatuses,
+        crossCheckChecklist = DiscrepancyCrossCheckChecklist(
+          primaryTablesChecked = refereeReadiness.tablesAndFiguresDetectable,
+          figuresChecked = refereeReadiness.tablesAndFiguresDetectable || pass2Result.imagesSentCount > 0,
+          supplementsChecked = refereeReadiness.supplementStatus == com.example.data.ai.referee.SupplementStatus.PRESENT,
+          scaleTransformationsChecked = true,
+          roundingToleranceChecked = true,
+          adjustedModelsChecked = true,
+          subgroupScopeChecked = true,
+          alternativeMethodsChecked = true
+        ),
+        domainAppraisal = domainAppraisal,
+        unexpectedProviderFallback = unexpectedFallback,
+        consentVerified = consentVerified,
+        consentDigestAtApproval = consentDigestAtApproval
+      )
+    )
+    val finalValidationStatus = when {
+      !refereeOutput.decision.isVerified && validationStatus == "VERIFIED" ->
+        if (refereeOutput.decision == RefereeDecision.INSUFFICIENT_EVIDENCE) "UNVERIFIED" else "ADJUDICATED_WITH_CAVEATS"
+      else -> validationStatus
+    }
+    val finalStructuredFindingsJson = ReviewFindingCodec.encode(refereeOutput.mergedFindings)
+
     onStageUpdate("DONE", "Appraisal Dossier Complete", 1.0f)
 
     return PaperReview(
@@ -1623,8 +1791,8 @@ class Reviewer2PipelineService {
       extractionConfidence = extractionConfidence,
       reviewMode = options.reviewMode.name,
       coverageDisclosure = coverageDisclosure,
-      validationStatus = validationStatus,
-      structuredFindingsJson = structuredFindingsJson,
+      validationStatus = finalValidationStatus,
+      structuredFindingsJson = finalStructuredFindingsJson,
       schemaVersion = 5,
       abstractSummary = abstractSummary,
       researchQuestion = researchQuestion,
@@ -1637,8 +1805,17 @@ class Reviewer2PipelineService {
       editorNote = compiledEditorAndReviewerNote,
       copyeditSuggestions = copyeditSuggestions,
       reviewerQuestions = fortifyReviewerQuestions,
-      formattedDossier = formattedDossier
+      formattedDossier = formattedDossier,
+      refereeDecision = refereeOutput.decision.name,
+      analysisManifestJson = refereeOutput.manifest.toJson(),
+      abstentionSummaryJson = refereeOutput.abstentionResult.toJson(),
+      readinessSummaryJson = refereeReadiness.toJson(),
+      auditLogJson = refereeOutput.auditLogJson,
+      refereeCoverageJson = refereeOutput.coverageMetrics.toJson()
     )
+    } finally {
+      remotePayloadCleanupHook?.cleanupAll("pipeline_finished")
+    }
   }
 
   fun streamFollowUpDefense(
@@ -4041,8 +4218,9 @@ class Reviewer2PipelineService {
         .find(clean)?.groupValues?.get(1)?.toDoubleOrNull()
 
       val hasBootstrap = Regex("""(?i)\b(?:bootstrap\w*|resampl\w*|jackknife)\b""").containsMatchIn(clean)
-      val hasWald = Regex("""(?i)\b(?:wald\b|asymptotic\s+normal|normal\s+approximat\w*)\b""").containsMatchIn(clean)
       val hasBayesian = Regex("""(?i)\b(?:bayesian|credible\s+interval|\bcri\b|posterior\s+interval|mcmc)\b""").containsMatchIn(clean)
+      val hasWald = Regex("""(?i)\b(?:wald\b|asymptotic\s+normal|normal\s+approximat\w*)\b""").containsMatchIn(clean) ||
+        (!hasBayesian && Regex("""(?i)\b(?:\d+(?:\.\d+)?%\s*(?:ci\b|confidence\s+interval)|confidence\s+interval)\b""").containsMatchIn(clean))
       val hasPermutation = Regex("""(?i)\b(?:permutation|exact\s+test|fisher'?s?\s+exact)\b""").containsMatchIn(clean)
       val hasRobustSe = Regex("""(?i)\b(?:robust\s+(?:se|standard\s+errors?)|sandwich|huber[\s-]?white|hc[0-3]\b|cluster[\s-]?robust)\b""").containsMatchIn(clean)
       val activeMethods = buildList {

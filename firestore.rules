@@ -26,6 +26,8 @@ service cloud.firestore {
         'coverageDisclosure', 'validationStatus', 'structuredFindingsJson',
         'schemaVersion', 'findingsChunkCount', 'findingsChecksum',
         'narrativeChunkCount', 'narrativeChecksum',
+        'refereeDecision', 'analysisManifestJson', 'abstentionSummaryJson',
+        'readinessSummaryJson', 'auditLogJson', 'refereeCoverageJson',
         'abstractSummary', 'researchQuestion', 'keyMethodology', 'coreContributions',
         'redTeamCritique', 'blueTeamVerification', 'mathAuditReport',
         'codeAuditReport', 'editorNote', 'copyeditSuggestions',
@@ -76,21 +78,19 @@ service cloud.firestore {
              d.isEmpirical is bool &&
              d.credibilityScore is int && d.credibilityScore >= 0 && d.credibilityScore <= 100 &&
              (('reviewMode' in d)
-               ? (isModeAlignedVerdict(d.reviewMode, d.verdict) &&
-                  d.keys().hasAll(['methodologyScore', 'significanceScore', 'clarityScore', 'originalityScore', 'mathRigorScore', 'reproducibilityScore']) &&
-                  isV4RubricConsistent(d))
+               ? (isModeAlignedVerdict(d.reviewMode, d.verdict) && isV4RubricConsistent(d))
                : isLegacyReviewSchema(d)) &&
-             d.abstractSummary is string && d.abstractSummary.size() <= 5000 &&
-             d.researchQuestion is string && d.researchQuestion.size() <= 3000 &&
-             d.keyMethodology is string && d.keyMethodology.size() <= 4000 &&
-             d.coreContributions is string && d.coreContributions.size() <= 6000 &&
-             d.redTeamCritique is string && d.redTeamCritique.size() <= 12000 &&
-             d.blueTeamVerification is string && d.blueTeamVerification.size() <= 10000 &&
-             d.mathAuditReport is string && d.mathAuditReport.size() <= 8000 &&
-             d.codeAuditReport is string && d.codeAuditReport.size() <= 8000 &&
-             d.editorNote is string && d.editorNote.size() <= 8000 &&
-             d.copyeditSuggestions is string && d.copyeditSuggestions.size() <= 8000 &&
-             d.reviewerQuestions is string && d.reviewerQuestions.size() <= 8000 &&
+             d.abstractSummary is string &&
+             d.researchQuestion is string &&
+             d.keyMethodology is string &&
+             d.coreContributions is string &&
+             d.redTeamCritique is string &&
+             d.blueTeamVerification is string &&
+             d.mathAuditReport is string &&
+             d.codeAuditReport is string &&
+             d.editorNote is string &&
+             d.copyeditSuggestions is string &&
+             d.reviewerQuestions is string &&
              d.formattedDossier is string && d.formattedDossier != '' && d.formattedDossier.size() <= 40000 &&
              d.bookmarked is bool &&
              d.personalNotes is string && d.personalNotes.size() <= 5000 &&
@@ -99,45 +99,43 @@ service cloud.firestore {
     }
 
     function isValidJustifications(d) {
-      let mj = d.get('methodologyJustification', '');
-      let sj = d.get('significanceJustification', '');
-      let cj = d.get('clarityJustification', '');
-      let oj = d.get('originalityJustification', '');
-      let rj = d.get('mathRigorJustification', '');
-      let pj = d.get('reproducibilityJustification', '');
-      return mj is string && mj.size() <= 4000 &&
-             sj is string && sj.size() <= 4000 &&
-             cj is string && cj.size() <= 4000 &&
-             oj is string && oj.size() <= 4000 &&
-             rj is string && rj.size() <= 4000 &&
-             pj is string && pj.size() <= 4000;
+      return (!('methodologyJustification' in d) || d.methodologyJustification is string) &&
+             (!('significanceJustification' in d) || d.significanceJustification is string) &&
+             (!('clarityJustification' in d) || d.clarityJustification is string) &&
+             (!('originalityJustification' in d) || d.originalityJustification is string) &&
+             (!('mathRigorJustification' in d) || d.mathRigorJustification is string) &&
+             (!('reproducibilityJustification' in d) || d.reproducibilityJustification is string);
     }
 
-    function isValidAuditMeta(d) {
-      let rc = d.get('refereeConfidence', 3);
-      let ec = d.get('extractionConfidence', 3);
-      let sf = d.get('structuredFindingsJson', '');
-      let fc = d.get('findingsChunkCount', 0);
-      let nc = d.get('narrativeChunkCount', 0);
-      return rc is int && rc >= 1 && rc <= 5 &&
-             ec is int && ec >= 1 && ec <= 5 &&
-             d.get('coverageDisclosure', '') is string && d.get('coverageDisclosure', '').size() <= 2000 &&
-             d.get('validationStatus', 'LEGACY_UNVALIDATED') in ['VERIFIED', 'ADJUDICATED_WITH_CAVEATS', 'PARTIALLY_VALIDATED', 'PROVISIONAL', 'UNVERIFIED', 'LEGACY_UNVALIDATED', 'REQUIRES_REANALYSIS'] &&
-             sf is string && sf.size() <= 60000 &&
-             d.get('schemaVersion', 5) is int && d.get('schemaVersion', 5) >= 1 && d.get('schemaVersion', 5) <= 20 &&
-             fc is int && fc >= 0 && fc <= 64 &&
-             d.get('findingsChecksum', '') is string && d.get('findingsChecksum', '').size() <= 128 &&
-             nc is int && nc >= 0 && nc <= 64 &&
-             d.get('narrativeChecksum', '') is string && d.get('narrativeChecksum', '').size() <= 128;
+    function isValidAuditMetaCore(d) {
+      return (!('refereeConfidence' in d) || (d.refereeConfidence is int && d.refereeConfidence >= 1 && d.refereeConfidence <= 5)) &&
+             (!('extractionConfidence' in d) || (d.extractionConfidence is int && d.extractionConfidence >= 1 && d.extractionConfidence <= 5)) &&
+             (!('coverageDisclosure' in d) || (d.coverageDisclosure is string && d.coverageDisclosure.size() <= 2000)) &&
+             (!('validationStatus' in d) || d.validationStatus in ['VERIFIED', 'ADJUDICATED_WITH_CAVEATS', 'PARTIALLY_VALIDATED', 'PROVISIONAL', 'UNVERIFIED', 'LEGACY_UNVALIDATED', 'REQUIRES_REANALYSIS']) &&
+             (!('structuredFindingsJson' in d) || (d.structuredFindingsJson is string && d.structuredFindingsJson.size() <= 60000)) &&
+             (!('schemaVersion' in d) || (d.schemaVersion is int && d.schemaVersion >= 1 && d.schemaVersion <= 20)) &&
+             (!('findingsChunkCount' in d) || (d.findingsChunkCount is int && d.findingsChunkCount >= 0 && d.findingsChunkCount <= 64)) &&
+             (!('narrativeChunkCount' in d) || (d.narrativeChunkCount is int && d.narrativeChunkCount >= 0 && d.narrativeChunkCount <= 64));
+    }
+
+    function isValidRefereeMeta(d) {
+      return (!('findingsChecksum' in d) || d.findingsChecksum is string) &&
+             (!('narrativeChecksum' in d) || d.narrativeChecksum is string) &&
+             (!('refereeDecision' in d) || (d.refereeDecision is string && d.refereeDecision.size() <= 64)) &&
+             (!('analysisManifestJson' in d) || d.analysisManifestJson is string) &&
+             (!('abstentionSummaryJson' in d) || d.abstentionSummaryJson is string) &&
+             (!('readinessSummaryJson' in d) || d.readinessSummaryJson is string) &&
+             (!('auditLogJson' in d) || d.auditLogJson is string) &&
+             (!('refereeCoverageJson' in d) || d.refereeCoverageJson is string);
     }
 
     function isValidPartialFieldUpdate(next, prev) {
       let changed = next.diff(prev).affectedKeys();
-      return next.updatedAt is timestamp && next.updatedAt <= request.time &&
-             (
+      return (
                (changed.hasOnly(['bookmarked', 'updatedAt']) && next.bookmarked is bool) ||
                (changed.hasOnly(['personalNotes', 'updatedAt']) && next.personalNotes is string && next.personalNotes.size() <= 5000)
-             );
+             ) &&
+             next.updatedAt is timestamp && next.updatedAt <= request.time;
     }
 
     function isValidFindingsChunk(d) {
@@ -159,7 +157,8 @@ service cloud.firestore {
                        hasAllowedReviewKeys(request.resource.data) &&
                        isValidCoreReview(request.resource.data) &&
                        isValidJustifications(request.resource.data) &&
-                       isValidAuditMeta(request.resource.data);
+                       isValidAuditMetaCore(request.resource.data) &&
+                       isValidRefereeMeta(request.resource.data);
 
       allow update: if isOwner(userId) &&
                        isValidId(reviewId) &&
@@ -170,7 +169,8 @@ service cloud.firestore {
                          (hasAllowedReviewKeys(request.resource.data) &&
                           isValidCoreReview(request.resource.data) &&
                           isValidJustifications(request.resource.data) &&
-                          isValidAuditMeta(request.resource.data))
+                          isValidAuditMetaCore(request.resource.data) &&
+                          isValidRefereeMeta(request.resource.data))
                        );
 
       allow delete: if isOwner(userId) && isValidId(reviewId) && resource.data.userId == request.auth.uid;

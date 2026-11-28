@@ -56,7 +56,9 @@ data class EvidenceAnchor(
   val exactQuote: String = "",
   val startOffset: Int? = null,
   val endOffset: Int? = null,
-  val boundingBox: List<Float>? = null
+  val boundingBox: List<Float>? = null,
+  val extractionMethod: String = "",
+  val sourceChecksum: String = ""
 )
 
 enum class FindingStatus(val displayBadge: String) {
@@ -92,7 +94,8 @@ data class ReviewFinding(
   val reportingStatus: String = "", // REPORTED_AND_ADEQUATE, REPORTED_BUT_INADEQUATE, NOT_REPORTED, NOT_ASSESSABLE_FROM_SUPPLIED_MATERIAL
   val flawTier: String = "", // FATAL_TO_PRIMARY_CONCLUSION, MATERIALLY_WEAKENS_CONFIDENCE, REQUIRES_REPORTING_CORRECTION, WORTHWHILE_ENHANCEMENT, COSMETIC_OR_EDITORIAL
   val overturnEvidence: String = "", // Minimum concrete evidence that would overturn this critique
-  val provenanceSummary: String = "" // Page, deterministic/model source, parserVersion, ruleVersion, promptCoverage
+  val provenanceSummary: String = "", // Page, deterministic/model source, parserVersion, ruleVersion, promptCoverage
+  val propositionId: String = "" // Canonical ScientificProposition identifier when extracted
 )
 
 object ReviewFindingCodec {
@@ -115,6 +118,7 @@ object ReviewFindingCodec {
       if (f.flawTier.isNotBlank()) obj.put("flawTier", f.flawTier)
       if (f.overturnEvidence.isNotBlank()) obj.put("overturnEvidence", f.overturnEvidence)
       if (f.provenanceSummary.isNotBlank()) obj.put("provenanceSummary", f.provenanceSummary)
+      if (f.propositionId.isNotBlank()) obj.put("propositionId", f.propositionId)
       arr.put(obj)
     }
     return arr.toString()
@@ -143,7 +147,8 @@ object ReviewFindingCodec {
               reportingStatus = obj.optString("reportingStatus", ""),
               flawTier = obj.optString("flawTier", ""),
               overturnEvidence = obj.optString("overturnEvidence", ""),
-              provenanceSummary = obj.optString("provenanceSummary", "")
+              provenanceSummary = obj.optString("provenanceSummary", ""),
+              propositionId = obj.optString("propositionId", "")
             )
           )
         }
@@ -168,6 +173,8 @@ object ReviewFindingCodec {
         a.boundingBox.forEach { coord -> boxArr.put(coord.toDouble()) }
         obj.put("boundingBox", boxArr)
       }
+      if (a.extractionMethod.isNotBlank()) obj.put("extractionMethod", a.extractionMethod)
+      if (a.sourceChecksum.isNotBlank()) obj.put("sourceChecksum", a.sourceChecksum)
       arr.put(obj)
     }
     return arr
@@ -196,7 +203,9 @@ object ReviewFindingCodec {
             exactQuote = obj.optString("exactQuote", ""),
             startOffset = if (obj.has("startOffset") && !obj.isNull("startOffset")) obj.optInt("startOffset") else null,
             endOffset = if (obj.has("endOffset") && !obj.isNull("endOffset")) obj.optInt("endOffset") else null,
-            boundingBox = decodedBox
+            boundingBox = decodedBox,
+            extractionMethod = obj.optString("extractionMethod", ""),
+            sourceChecksum = obj.optString("sourceChecksum", "")
           )
         )
       }
@@ -793,6 +802,12 @@ data class PaperReview(
   val findingsChecksum: String = "",
   val narrativeChunkCount: Int = 0,
   val narrativeChecksum: String = "",
+  val refereeDecision: String = "",
+  val analysisManifestJson: String = "",
+  val abstentionSummaryJson: String = "",
+  val readinessSummaryJson: String = "",
+  val auditLogJson: String = "",
+  val refereeCoverageJson: String = "",
   // Narrative dossier sections
   val abstractSummary: String = "",
   val researchQuestion: String = "",

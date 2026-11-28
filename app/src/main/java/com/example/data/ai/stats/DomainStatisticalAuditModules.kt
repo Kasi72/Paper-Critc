@@ -43,16 +43,26 @@ object DomainStatisticalAuditModules {
       l.contains("competing risk") || l.contains("fine-gray") || l.contains("time-to-event") || l.contains("log-rank")
     val hasRct = l.contains("randomized controlled") || l.contains("randomised controlled") || l.contains("randomly assigned") ||
       l.contains("consort") || l.contains("double-blind") || l.contains("placebo-controlled") || l.contains("intention-to-treat")
-    val hasCohort = l.contains("cohort") || l.contains("case-control") || l.contains("strobe") || l.contains("propensity score") ||
+    val hasCaseControl = l.contains("case-control") || l.contains("case control") ||
+      (l.contains("matched controls") && l.contains("cases"))
+    val hasPredictionModel = l.contains("tripod") || l.contains("probast") ||
+      (l.contains("prediction model") && (l.contains("calibration") || l.contains("external validation") || l.contains("auroc")))
+    val hasQualitative = l.contains("qualitative") || l.contains("coreq") || l.contains("srqr") ||
+      l.contains("thematic analysis") || l.contains("grounded theory") || l.contains("semi-structured interview") ||
+      l.contains("focus group")
+    val hasCohort = l.contains("cohort") || l.contains("strobe") || l.contains("propensity score") ||
       l.contains("retrospective") || l.contains("prospective observational") || l.contains("cross-sectional") || l.contains("observational")
 
     return when {
       hasMetaPooling -> AuditSubDesign.META_ANALYSIS
       hasSysReview -> AuditSubDesign.SYSTEMATIC_REVIEW
+      hasQualitative && !hasRct && !hasPredictionModel -> AuditSubDesign.QUALITATIVE_STUDY
       hasTheoremProof && !hasRct && !hasCohort -> AuditSubDesign.FORMAL_THEOREM
       hasEconometrics -> AuditSubDesign.ECONOMETRIC_PANEL
+      hasPredictionModel -> AuditSubDesign.PREDICTION_MODEL
       hasMlBenchmark -> AuditSubDesign.ML_BENCHMARK
       hasDiagnostic && !hasRct -> AuditSubDesign.DIAGNOSTIC_ACCURACY
+      hasCaseControl && !hasRct -> AuditSubDesign.CASE_CONTROL
       hasSurvival && !hasRct -> AuditSubDesign.SURVIVAL_ANALYSIS
       hasRct -> AuditSubDesign.RCT
       hasCohort -> AuditSubDesign.OBSERVATIONAL_COHORT
@@ -61,7 +71,11 @@ object DomainStatisticalAuditModules {
       parentArchetype == StudyDesignArchetype.MACHINE_LEARNING_AI -> AuditSubDesign.ML_BENCHMARK
       parentArchetype == StudyDesignArchetype.THEORETICAL_FORMAL -> AuditSubDesign.FORMAL_THEOREM
       parentArchetype == StudyDesignArchetype.CLINICAL_EPIDEMIOLOGICAL -> AuditSubDesign.OBSERVATIONAL_COHORT
-      else -> AuditSubDesign.GENERAL_EMPIRICAL
+      else -> {
+        val hasEmpiricalQuantitativeCues = l.contains("p =") || l.contains("p <") || l.contains("95% ci") ||
+          l.contains("mean") || l.contains("median") || l.contains("regression") || l.contains("participants")
+        if (hasEmpiricalQuantitativeCues) AuditSubDesign.GENERAL_EMPIRICAL else AuditSubDesign.DESIGN_UNCERTAIN
+      }
     }
   }
 
@@ -75,14 +89,18 @@ object DomainStatisticalAuditModules {
     return when (subDesign) {
       AuditSubDesign.RCT,
       AuditSubDesign.OBSERVATIONAL_COHORT,
+      AuditSubDesign.CASE_CONTROL,
       AuditSubDesign.DIAGNOSTIC_ACCURACY,
       AuditSubDesign.SURVIVAL_ANALYSIS -> auditClinicalEpidemiological(text, lower, subDesign, ledger)
       AuditSubDesign.SYSTEMATIC_REVIEW,
       AuditSubDesign.META_ANALYSIS -> auditSystematicReviewMetaAnalysis(text, lower, subDesign, ledger)
       AuditSubDesign.ECONOMETRIC_PANEL -> auditEconometricsCausal(text, lower, ledger)
+      AuditSubDesign.PREDICTION_MODEL,
       AuditSubDesign.ML_BENCHMARK -> auditMachineLearningComputational(text, lower, ledger)
       AuditSubDesign.FORMAL_THEOREM -> auditFormalMathematics(text, lower)
-      AuditSubDesign.GENERAL_EMPIRICAL -> auditGeneralEmpirical(lower, ledger)
+      AuditSubDesign.QUALITATIVE_STUDY -> auditQualitativeStudy(lower)
+      AuditSubDesign.GENERAL_EMPIRICAL,
+      AuditSubDesign.DESIGN_UNCERTAIN -> auditGeneralEmpirical(lower, ledger)
     }
   }
 
@@ -1018,6 +1036,41 @@ object DomainStatisticalAuditModules {
           detail = "Hypothesis-test p-values reported without accompanying effect sizes or confidence intervals.",
           consequence = "Statistical significance alone cannot establish practical or scientific magnitude.",
           recommendedAction = "Report point estimates with 95% confidence intervals alongside p-values."
+        )
+      )
+    }
+    return out
+  }
+
+  private fun auditQualitativeStudy(l: String): List<DomainAuditFinding> {
+    val out = mutableListOf<DomainAuditFinding>()
+    if (!l.contains("reflexiv") && !l.contains("positionality")) {
+      out.add(
+        DomainAuditFinding(
+          findingId = "QUAL-01",
+          domainModule = "Qualitative/CASP-COREQ",
+          criterion = "Researcher Reflexivity & Positionality",
+          findingType = StatisticalFindingType.REPORTING_OMISSION,
+          status = QuantFindingStatus.WARN,
+          isScreeningSignal = true,
+          detail = "No explicit researcher reflexivity or positionality statement detected in qualitative Methods.",
+          consequence = "Limits transparency into interviewer/analyst influence on theme construction.",
+          recommendedAction = "Document researcher background, assumptions, and relationship to participants per COREQ/SRQR."
+        )
+      )
+    }
+    if (!l.contains("saturation") && !l.contains("information power")) {
+      out.add(
+        DomainAuditFinding(
+          findingId = "QUAL-02",
+          domainModule = "Qualitative/CASP-COREQ",
+          criterion = "Sampling & Saturation Justification",
+          findingType = StatisticalFindingType.REPORTING_OMISSION,
+          status = QuantFindingStatus.WARN,
+          isScreeningSignal = true,
+          detail = "Qualitative sample-size stopping criterion (thematic saturation or information power) not explicitly stated.",
+          consequence = "Unclear whether thematic breadth adequately captured participant perspectives.",
+          recommendedAction = "Report purposive sampling strategy and saturation/information-power justification."
         )
       )
     }

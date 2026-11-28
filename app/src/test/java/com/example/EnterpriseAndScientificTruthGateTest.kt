@@ -1964,13 +1964,14 @@ class EnterpriseAndScientificTruthGateTest {
         rawDb.close()
       }
 
-      // 2. Open with Room at v9 running real MIGRATION_5_6 -> MIGRATION_6_7 -> MIGRATION_7_8 -> MIGRATION_8_9
+      // 2. Open with Room at v10 running real MIGRATION_5_6 -> ... -> MIGRATION_9_10
       migratedDb = Room.databaseBuilder(context, PaperCriticSqlDatabase::class.java, dbName)
         .addMigrations(
           PaperCriticSqlDatabase.MIGRATION_5_6,
           PaperCriticSqlDatabase.MIGRATION_6_7,
           PaperCriticSqlDatabase.MIGRATION_7_8,
-          PaperCriticSqlDatabase.MIGRATION_8_9
+          PaperCriticSqlDatabase.MIGRATION_8_9,
+          PaperCriticSqlDatabase.MIGRATION_9_10
         )
         .allowMainThreadQueries()
         .build()

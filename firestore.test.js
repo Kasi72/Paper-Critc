@@ -457,4 +457,33 @@ test("Unassessed readiness-gate zero-score records and lossless narrative_chunks
   await assertSucceeds(unassessedRef.delete());
 });
 
+test("Referee provenance, manifest, abstention, and audit-log metadata rules", async () => {
+  const aliceDb = testEnv.authenticatedContext(ALICE_UID).firestore();
+  const created = new Date(Date.now() - 1500);
+  const ref = aliceDb.collection("users").doc(ALICE_UID).collection("reviews").doc("review_referee_meta_01");
 
+  await assertSucceeds(
+    ref.set(
+      buildFullV4ReviewPayload(ALICE_UID, created, {
+        refereeDecision: "VERIFIED_WITH_MINOR_CONCERNS",
+        analysisManifestJson: "{\"analysisId\":\"ana-1\",\"modelId\":\"gemini-3.8-flash\"}",
+        abstentionSummaryJson: "{\"shouldAbstainFromVerifiedVerdict\":false}",
+        readinessSummaryJson: "{\"readiness\":\"READY\"}",
+        auditLogJson: "[{\"sequence\":0,\"entryHash\":\"abc\"}]",
+        refereeCoverageJson: "{\"standardizedLabel\":\"Complete quantitative coverage\"}",
+      })
+    )
+  );
+
+  // Oversized refereeDecision (> 64 chars) MUST fail
+  const badRef = aliceDb.collection("users").doc(ALICE_UID).collection("reviews").doc("review_referee_bad_01");
+  await assertFails(
+    badRef.set(
+      buildFullV4ReviewPayload(ALICE_UID, created, {
+        refereeDecision: "X".repeat(80),
+      })
+    )
+  );
+
+  await assertSucceeds(ref.delete());
+});

@@ -711,7 +711,7 @@ class ReviewRepository(
         normalizeVerdict(review.verdict, resolvedMode)
       }
       val authoritativeComposite = if (isUnassessed) 0L else rubric.overallCredibilityScore.toLong().coerceIn(0L, 100L)
-      return mapOf(
+      val basePayload = mutableMapOf<String, Any>(
         "userId" to uid,
         "title" to review.title.trim().take(500).ifEmpty { "Untitled Manuscript" },
         "authors" to review.authors.trim().take(500).ifEmpty { "Authors not verified" },
@@ -763,6 +763,25 @@ class ReviewRepository(
         "createdAt" to createdAtValue,
         "updatedAt" to updatedAtValue
       )
+      if (review.refereeDecision.isNotBlank()) {
+        basePayload["refereeDecision"] = review.refereeDecision.trim().take(64)
+      }
+      if (review.analysisManifestJson.isNotBlank()) {
+        basePayload["analysisManifestJson"] = review.analysisManifestJson.trim().take(8000)
+      }
+      if (review.abstentionSummaryJson.isNotBlank()) {
+        basePayload["abstentionSummaryJson"] = review.abstentionSummaryJson.trim().take(8000)
+      }
+      if (review.readinessSummaryJson.isNotBlank()) {
+        basePayload["readinessSummaryJson"] = review.readinessSummaryJson.trim().take(6000)
+      }
+      if (review.auditLogJson.isNotBlank()) {
+        basePayload["auditLogJson"] = review.auditLogJson.trim().take(24000)
+      }
+      if (review.refereeCoverageJson.isNotBlank()) {
+        basePayload["refereeCoverageJson"] = review.refereeCoverageJson.trim().take(4000)
+      }
+      return basePayload
     }
   }
 }

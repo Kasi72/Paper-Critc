@@ -82,6 +82,12 @@ data class SqlReviewCacheEntity(
   val personalNotesRevision: Long = 0L,
   val localAnnotationUpdatedAtMs: Long = 0L,
   val searchGroundingReport: String = "",
+  val refereeDecision: String = "",
+  val analysisManifestJson: String = "",
+  val abstentionSummaryJson: String = "",
+  val readinessSummaryJson: String = "",
+  val auditLogJson: String = "",
+  val refereeCoverageJson: String = "",
   val createdAtSeconds: Long = System.currentTimeMillis() / 1000L,
   val createdAtNanos: Int = 0,
   val updatedAtEpochMs: Long = System.currentTimeMillis()
@@ -126,6 +132,12 @@ data class SqlReviewCacheEntity(
       findingsChecksum = findingsChecksum,
       narrativeChunkCount = narrativeChunkCount,
       narrativeChecksum = narrativeChecksum,
+      refereeDecision = refereeDecision,
+      analysisManifestJson = analysisManifestJson,
+      abstentionSummaryJson = abstentionSummaryJson,
+      readinessSummaryJson = readinessSummaryJson,
+      auditLogJson = auditLogJson,
+      refereeCoverageJson = refereeCoverageJson,
       abstractSummary = abstractSummary,
       researchQuestion = researchQuestion,
       keyMethodology = keyMethodology,
@@ -215,6 +227,12 @@ data class SqlReviewCacheEntity(
         personalNotesRevision = personalNotesRevision,
         localAnnotationUpdatedAtMs = localAnnotationUpdatedAtMs,
         searchGroundingReport = searchGroundingReport,
+        refereeDecision = review.refereeDecision,
+        analysisManifestJson = review.analysisManifestJson,
+        abstentionSummaryJson = review.abstentionSummaryJson,
+        readinessSummaryJson = review.readinessSummaryJson,
+        auditLogJson = review.auditLogJson,
+        refereeCoverageJson = review.refereeCoverageJson,
         createdAtSeconds = review.createdAt?.seconds ?: 0L,
         createdAtNanos = review.createdAt?.nanoseconds ?: 0,
         updatedAtEpochMs = review.updatedAt?.toDate()?.time ?: System.currentTimeMillis()
@@ -445,7 +463,7 @@ interface PaperCriticSqlDao {
     SqlChatMessageEntity::class,
     SqlApiProviderEntity::class
   ],
-  version = 9,
+  version = 10,
   exportSchema = false
 )
 abstract class PaperCriticSqlDatabase : RoomDatabase() {
@@ -671,6 +689,22 @@ abstract class PaperCriticSqlDatabase : RoomDatabase() {
       }
     }
 
+    /**
+     * Non-destructive v9 -> v10 upgrade:
+     * - Adds autonomous referee provenance, manifest, readiness, abstention, audit log,
+     *   and standardized coverage metadata columns.
+     */
+    val MIGRATION_9_10 = object : Migration(9, 10) {
+      override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE sql_review_cache ADD COLUMN refereeDecision TEXT NOT NULL DEFAULT ''")
+        db.execSQL("ALTER TABLE sql_review_cache ADD COLUMN analysisManifestJson TEXT NOT NULL DEFAULT ''")
+        db.execSQL("ALTER TABLE sql_review_cache ADD COLUMN abstentionSummaryJson TEXT NOT NULL DEFAULT ''")
+        db.execSQL("ALTER TABLE sql_review_cache ADD COLUMN readinessSummaryJson TEXT NOT NULL DEFAULT ''")
+        db.execSQL("ALTER TABLE sql_review_cache ADD COLUMN auditLogJson TEXT NOT NULL DEFAULT ''")
+        db.execSQL("ALTER TABLE sql_review_cache ADD COLUMN refereeCoverageJson TEXT NOT NULL DEFAULT ''")
+      }
+    }
+
     fun getDatabase(context: Context): PaperCriticSqlDatabase {
       return INSTANCE ?: synchronized(this) {
         val instance = Room.databaseBuilder(
@@ -684,7 +718,8 @@ abstract class PaperCriticSqlDatabase : RoomDatabase() {
             MIGRATION_5_6,
             MIGRATION_6_7,
             MIGRATION_7_8,
-            MIGRATION_8_9
+            MIGRATION_8_9,
+            MIGRATION_9_10
           )
           .build()
         INSTANCE = instance

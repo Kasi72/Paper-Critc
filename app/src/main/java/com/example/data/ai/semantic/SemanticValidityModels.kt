@@ -135,12 +135,36 @@ data class CalculatorAssumptionContract(
   val calculatorScope: String,
   val assumptionsSatisfied: List<String>,
   val assumptionsUnknown: List<String>,
-  val alternativeValidInterpretations: List<String>
+  val alternativeValidInterpretations: List<String>,
+  val inputs: String = "",
+  val formula: String = "",
+  val estimand: String = "",
+  val scale: String = "",
+  val confidenceLevel: String = "95%",
+  val nullValue: String = "",
+  val tailDirection: String = "Two-tailed",
+  val degreesOfFreedom: String = "",
+  val multiplicityAdjustment: String = "",
+  val alternativeExplanations: List<String> = alternativeValidInterpretations
 ) {
   fun toCompactString(): String = buildString {
     if (assumptionsSatisfied.isNotEmpty()) append("Satisfied: ${assumptionsSatisfied.joinToString("; ")}. ")
     if (assumptionsUnknown.isNotEmpty()) append("Unknown: ${assumptionsUnknown.joinToString("; ")}. ")
     if (alternativeValidInterpretations.isNotEmpty()) append("Alt valid interpretations: ${alternativeValidInterpretations.joinToString("; ")}.")
+  }.trim()
+
+  fun toDetailedSummary(): String = buildString {
+    append("Scope: $calculatorScope")
+    if (inputs.isNotBlank()) append(" | Inputs: $inputs")
+    if (formula.isNotBlank()) append(" | Formula: $formula")
+    if (estimand.isNotBlank()) append(" | Estimand: $estimand")
+    if (scale.isNotBlank()) append(" | Scale: $scale")
+    if (confidenceLevel.isNotBlank()) append(" | CI=$confidenceLevel")
+    if (nullValue.isNotBlank()) append(" | Null=$nullValue")
+    if (tailDirection.isNotBlank()) append(" | Tail=$tailDirection")
+    if (degreesOfFreedom.isNotBlank()) append(" | DF=$degreesOfFreedom")
+    if (multiplicityAdjustment.isNotBlank()) append(" | Multiplicity: $multiplicityAdjustment")
+    if (alternativeExplanations.isNotEmpty()) append(" | Alternative explanations: ${alternativeExplanations.joinToString("; ")}")
   }.trim()
 }
 

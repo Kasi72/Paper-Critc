@@ -75,15 +75,19 @@ enum class IntervalType(val label: String) {
  */
 enum class AuditSubDesign(val displayName: String, val parentArchetype: StudyDesignArchetype) {
   RCT("Randomized Controlled Trial (RCT)", StudyDesignArchetype.CLINICAL_EPIDEMIOLOGICAL),
-  OBSERVATIONAL_COHORT("Observational Cohort / Case-Control Study", StudyDesignArchetype.CLINICAL_EPIDEMIOLOGICAL),
+  OBSERVATIONAL_COHORT("Observational Cohort Study", StudyDesignArchetype.CLINICAL_EPIDEMIOLOGICAL),
+  CASE_CONTROL("Case-Control Study", StudyDesignArchetype.CLINICAL_EPIDEMIOLOGICAL),
   DIAGNOSTIC_ACCURACY("Diagnostic Accuracy / Prognostic Validation Study", StudyDesignArchetype.CLINICAL_EPIDEMIOLOGICAL),
   SURVIVAL_ANALYSIS("Survival / Time-to-Event Study", StudyDesignArchetype.CLINICAL_EPIDEMIOLOGICAL),
   SYSTEMATIC_REVIEW("Systematic Review (Qualitative / Narrative Synthesis)", StudyDesignArchetype.SYSTEMATIC_REVIEW_META_ANALYSIS),
   META_ANALYSIS("Systematic Review & Quantitative Meta-Analysis", StudyDesignArchetype.SYSTEMATIC_REVIEW_META_ANALYSIS),
+  PREDICTION_MODEL("Clinical / ML Prediction Model (TRIPOD)", StudyDesignArchetype.MACHINE_LEARNING_AI),
+  QUALITATIVE_STUDY("Qualitative Research Study (CASP/SRQR/COREQ)", StudyDesignArchetype.GENERAL_EMPIRICAL),
   ECONOMETRIC_PANEL("Econometrics / Panel & Causal Inference Study", StudyDesignArchetype.ECONOMETRICS_CAUSAL),
   ML_BENCHMARK("Machine Learning / Computational Benchmark", StudyDesignArchetype.MACHINE_LEARNING_AI),
   FORMAL_THEOREM("Formal Mathematics / Theoretical Proof Paper", StudyDesignArchetype.THEORETICAL_FORMAL),
-  GENERAL_EMPIRICAL("General Empirical Quantitative Study", StudyDesignArchetype.GENERAL_EMPIRICAL)
+  GENERAL_EMPIRICAL("General Empirical Quantitative Study", StudyDesignArchetype.GENERAL_EMPIRICAL),
+  DESIGN_UNCERTAIN("Uncertain / Ambiguous Study Design", StudyDesignArchetype.GENERAL_EMPIRICAL)
 }
 
 /**

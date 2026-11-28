@@ -93,6 +93,12 @@ import com.example.data.ai.GeminiModelTier
 import com.example.data.ai.GroundedWebSource
 import com.example.data.ai.epistemic.FlawSeverityTier
 import com.example.data.ai.epistemic.ReportingStatus
+import com.example.data.ai.referee.AbstentionResult
+import com.example.data.ai.referee.AnalysisManifest
+import com.example.data.ai.referee.DocumentReadinessAssessment
+import com.example.data.ai.referee.RefereeCoverageMetrics
+import com.example.data.ai.referee.RefereeDecision
+import com.example.data.ai.referee.TamperEvidentAuditLog
 import com.example.data.model.FindingStatus
 import com.example.data.model.LedgerLoadState
 import com.example.data.model.PaperReview
@@ -558,6 +564,64 @@ fun DossierDetailView(
           )
         }
 
+        val refereeDecision = remember(review.id, review.refereeDecision) {
+          RefereeDecision.fromNameOrNull(review.refereeDecision)
+        }
+        val abstentionResult = remember(review.id, review.abstentionSummaryJson) {
+          AbstentionResult.fromJson(review.abstentionSummaryJson)
+        }
+        val analysisManifest = remember(review.id, review.analysisManifestJson) {
+          AnalysisManifest.fromJson(review.analysisManifestJson)
+        }
+        val readinessAssessment = remember(review.id, review.readinessSummaryJson) {
+          DocumentReadinessAssessment.fromJson(review.readinessSummaryJson)
+        }
+        val auditEntries = remember(review.id, review.auditLogJson) {
+          TamperEvidentAuditLog.fromJson(review.auditLogJson)
+        }
+        val auditChainValid = remember(auditEntries) {
+          auditEntries.isEmpty() || TamperEvidentAuditLog.verifyChain(auditEntries)
+        }
+        val refereeCoverage = remember(review.id, review.refereeCoverageJson) {
+          RefereeCoverageMetrics.fromJson(review.refereeCoverageJson)
+        }
+
+        if (refereeDecision != null) {
+          Spacer(modifier = Modifier.height(6.dp))
+          val refColor = when {
+            refereeDecision.isVerified -> CupertinoGreen
+            refereeDecision == RefereeDecision.MATERIAL_CONCERNS -> CupertinoAmber
+            refereeDecision == RefereeDecision.MAJOR_UNRESOLVED_CONCERNS -> CupertinoRed
+            else -> CupertinoBlue
+          }
+          val refShape = SquircleShape(cornerRadius = 6.dp, smoothing = 0.88f)
+          Row(
+            modifier = Modifier
+              .clip(refShape)
+              .background(refColor.copy(alpha = 0.11f))
+              .border(0.6.dp, refColor.copy(alpha = 0.35f), refShape)
+              .padding(horizontal = 8.dp, vertical = 4.dp)
+              .testTag("dossier_referee_decision_badge"),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(5.dp)
+          ) {
+            Icon(
+              imageVector = Icons.Default.Gavel,
+              contentDescription = "Autonomous Referee Decision",
+              tint = refColor,
+              modifier = Modifier.size(13.dp)
+            )
+            Text(
+              text = "REFEREE DECISION: ${refereeDecision.displayLabel.uppercase(Locale.US)}",
+              style = MaterialTheme.typography.labelSmall,
+              fontFamily = JetBrainsMonoFamily,
+              fontSize = 9.5.sp,
+              fontWeight = FontWeight.Bold,
+              color = refColor
+            )
+          }
+        }
+
         if (review.coverageDisclosure.isNotBlank() || review.validationStatus.isNotBlank()) {
           Spacer(modifier = Modifier.height(6.dp))
           val valColor = when (review.validationStatus.uppercase(Locale.US)) {
@@ -595,6 +659,194 @@ fun DossierDetailView(
           }
         }
 
+        if (refereeCoverage != null) {
+          Spacer(modifier = Modifier.height(6.dp))
+          val hasAnyCap = refereeCoverage.extractionCapApplied ||
+            refereeCoverage.claimCapApplied ||
+            refereeCoverage.pagesOmitted > 0 ||
+            refereeCoverage.claimsSkipped > 0
+          val safeLabel = if (hasAnyCap && refereeCoverage.standardizedLabel.contains("Complete", ignoreCase = true)) {
+            RefereeCoverageMetrics.LABEL_PARTIAL
+          } else {
+            refereeCoverage.standardizedLabel
+          }
+          val covColor = when (safeLabel) {
+            RefereeCoverageMetrics.LABEL_COMPLETE -> CupertinoGreen
+            RefereeCoverageMetrics.LABEL_PARTIAL, RefereeCoverageMetrics.LABEL_PRELIMINARY -> CupertinoAmber
+            else -> CupertinoRed
+          }
+          val covShape = SquircleShape(cornerRadius = 8.dp, smoothing = 0.88f)
+          Column(
+            modifier = Modifier
+              .fillMaxWidth()
+              .clip(covShape)
+              .background(covColor.copy(alpha = 0.08f))
+              .border(0.6.dp, covColor.copy(alpha = 0.32f), covShape)
+              .padding(horizontal = 10.dp, vertical = 7.dp)
+              .testTag("dossier_coverage_metrics_card"),
+            verticalArrangement = Arrangement.spacedBy(3.dp)
+          ) {
+            Text(
+              text = safeLabel.uppercase(Locale.US),
+              style = MaterialTheme.typography.labelSmall,
+              fontFamily = JetBrainsMonoFamily,
+              fontSize = 9.5.sp,
+              fontWeight = FontWeight.Bold,
+              color = covColor
+            )
+            Text(
+              text = "Pages: ${refereeCoverage.pagesExtracted}/${refereeCoverage.totalPages} extracted • ${refereeCoverage.pagesAnalyzed} analyzed • ${refereeCoverage.pagesOmitted} omitted",
+              style = MaterialTheme.typography.labelSmall,
+              fontSize = 10.sp,
+              color = MaterialTheme.colorScheme.onSurface
+            )
+            Text(
+              text = "Claims: ${refereeCoverage.claimsDiscovered} discovered • ${refereeCoverage.claimsRetained} retained • ${refereeCoverage.claimsReconstructed} reconstructed • ${refereeCoverage.claimsSkipped} skipped",
+              style = MaterialTheme.typography.labelSmall,
+              fontSize = 10.sp,
+              color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Text(
+              text = "Anchors verified: ${refereeCoverage.sourceAnchorsVerified} • Unsupported: ${refereeCoverage.unsupportedClaims} • Unresolved: ${refereeCoverage.unresolvedClaims} • Disagreements: ${refereeCoverage.interPassDisagreements}",
+              style = MaterialTheme.typography.labelSmall,
+              fontSize = 10.sp,
+              color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+          }
+        }
+
+        if (abstentionResult != null && abstentionResult.shouldAbstainFromVerifiedVerdict) {
+          Spacer(modifier = Modifier.height(6.dp))
+          val absShape = SquircleShape(cornerRadius = 8.dp, smoothing = 0.88f)
+          val absColor = if (abstentionResult.hardBlockAllVerdicts) CupertinoRed else CupertinoAmber
+          Column(
+            modifier = Modifier
+              .fillMaxWidth()
+              .clip(absShape)
+              .background(absColor.copy(alpha = 0.10f))
+              .border(0.75.dp, absColor.copy(alpha = 0.42f), absShape)
+              .padding(horizontal = 10.dp, vertical = 8.dp)
+              .testTag("dossier_abstention_gate_card"),
+            verticalArrangement = Arrangement.spacedBy(4.dp)
+          ) {
+            Text(
+              text = "SAFE ABSTENTION GATE (${abstentionResult.triggeredReasons.size} TRIGGER(S))",
+              style = MaterialTheme.typography.labelSmall,
+              fontFamily = JetBrainsMonoFamily,
+              fontSize = 9.5.sp,
+              fontWeight = FontWeight.Bold,
+              color = absColor
+            )
+            if (abstentionResult.primaryWhatIsMissing.isNotBlank()) {
+              Text(
+                text = "What is missing: ${abstentionResult.primaryWhatIsMissing}",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurface
+              )
+            }
+            if (abstentionResult.primaryWhyItMatters.isNotBlank()) {
+              Text(
+                text = "Why it matters: ${abstentionResult.primaryWhyItMatters}",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+              )
+            }
+            if (abstentionResult.primaryBlockedConclusion.isNotBlank()) {
+              Text(
+                text = "Blocked conclusion: ${abstentionResult.primaryBlockedConclusion}",
+                style = MaterialTheme.typography.labelSmall,
+                fontWeight = FontWeight.SemiBold,
+                color = absColor
+              )
+            }
+            if (abstentionResult.combinedNextSteps.isNotEmpty()) {
+              Text(
+                text = "Next steps: ${abstentionResult.combinedNextSteps.joinToString(" • ")}",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+              )
+            }
+          }
+        }
+
+        if (analysisManifest != null || readinessAssessment != null || auditEntries.isNotEmpty()) {
+          Spacer(modifier = Modifier.height(6.dp))
+          var showProvenanceDetails by rememberSaveable(review.id) { mutableStateOf(false) }
+          val provShape = SquircleShape(cornerRadius = 8.dp, smoothing = 0.88f)
+          Column(
+            modifier = Modifier
+              .fillMaxWidth()
+              .clip(provShape)
+              .background(CupertinoIndigo.copy(alpha = 0.06f))
+              .border(0.6.dp, CupertinoIndigo.copy(alpha = 0.28f), provShape)
+              .padding(horizontal = 10.dp, vertical = 7.dp)
+              .testTag("dossier_provenance_manifest_card"),
+            verticalArrangement = Arrangement.spacedBy(4.dp)
+          ) {
+            Row(
+              modifier = Modifier
+                .fillMaxWidth()
+                .clickable { showProvenanceDetails = !showProvenanceDetails }
+                .padding(vertical = 4.dp)
+                .testTag("toggle_provenance_manifest_button"),
+              horizontalArrangement = Arrangement.SpaceBetween,
+              verticalAlignment = Alignment.CenterVertically
+            ) {
+              Text(
+                text = buildString {
+                  append("PROVENANCE & AUDIT CHAIN")
+                  if (auditEntries.isNotEmpty()) {
+                    append(if (auditChainValid) " • SHA-256 VERIFIED (${auditEntries.size})" else " • CHAIN TAMPERED")
+                  }
+                },
+                style = MaterialTheme.typography.labelSmall,
+                fontFamily = JetBrainsMonoFamily,
+                fontSize = 9.sp,
+                fontWeight = FontWeight.Bold,
+                color = if (auditChainValid) CupertinoIndigo else CupertinoRed
+              )
+              Text(
+                text = if (showProvenanceDetails) "Hide ▲" else "Inspect ▼",
+                style = MaterialTheme.typography.labelSmall,
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Bold,
+                color = CupertinoBlue
+              )
+            }
+            if (showProvenanceDetails) {
+              if (readinessAssessment != null) {
+                Text(
+                  text = "Readiness: ${readinessAssessment.readiness.displayLabel} • ${readinessAssessment.supplementStatus.displayLabel}",
+                  style = MaterialTheme.typography.labelSmall,
+                  fontSize = 10.sp,
+                  color = MaterialTheme.colorScheme.onSurface
+                )
+              }
+              if (analysisManifest != null) {
+                Text(
+                  text = "Provider: ${analysisManifest.providerRoute} • Model: ${analysisManifest.modelId}",
+                  style = MaterialTheme.typography.labelSmall,
+                  fontSize = 10.sp,
+                  color = MaterialTheme.colorScheme.onSurface
+                )
+                Text(
+                  text = "Manuscript SHA-256: ${analysisManifest.manuscriptSha256.take(24)}… • Ruleset: ${analysisManifest.rulesetVersion} (${analysisManifest.promptVersion})",
+                  style = MaterialTheme.typography.labelSmall,
+                  fontFamily = JetBrainsMonoFamily,
+                  fontSize = 9.5.sp,
+                  color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Text(
+                  text = "Consent verified: ${analysisManifest.consentVerified} • Fallback trail: ${analysisManifest.fallbackHistory.ifEmpty { listOf("None") }.joinToString(", ")}",
+                  style = MaterialTheme.typography.labelSmall,
+                  fontSize = 10.sp,
+                  color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+              }
+            }
+          }
+        }
+
         if (review.coverageDisclosure.contains("Quantitative Coverage Partial", ignoreCase = true) ||
           review.coverageDisclosure.contains("omitted by cap", ignoreCase = true)
         ) {
@@ -611,7 +863,7 @@ fun DossierDetailView(
             verticalArrangement = Arrangement.spacedBy(3.dp)
           ) {
             Text(
-              text = "QUANTITATIVE COVERAGE PARTIAL — CAPS APPLIED",
+              text = "PARTIAL QUANTITATIVE COVERAGE — CAPS APPLIED",
               style = MaterialTheme.typography.labelSmall,
               fontFamily = JetBrainsMonoFamily,
               fontSize = 9.5.sp,
@@ -619,7 +871,7 @@ fun DossierDetailView(
               color = CupertinoAmber
             )
             Text(
-              text = "Discovery, reconstruction, unsupported-domain, or ledger-injection caps were reached. Scores and verdicts reflect partial deterministic screening, not a complete quantitative audit.",
+              text = "Discovery, reconstruction, unsupported-domain, or ledger-injection caps were reached. Scores reflect partial deterministic screening, not a complete quantitative audit.",
               style = MaterialTheme.typography.labelSmall,
               fontSize = 10.sp,
               color = MaterialTheme.colorScheme.onSurfaceVariant

@@ -20,6 +20,8 @@ import com.example.data.ai.GroundedWebSource
 import com.example.data.ai.ManuscriptForensicEngine
 import com.example.data.ai.Reviewer2PipelineService
 import com.example.data.ai.SearchGroundingResult
+import com.example.data.ai.referee.InMemoryRemotePayloadCleanupHook
+import com.example.data.ai.referee.TamperEvidentAuditLog
 import com.example.data.local.ANONYMOUS_OWNER_SCOPE
 import com.example.data.local.PaperCriticSqlDatabase
 import com.example.data.local.SqlChatMessageEntity
@@ -1397,25 +1399,27 @@ class PaperCriticViewModel(
     val initiatingOwnerScope = normalizeOwnerScope(initiatingUid)
     val initiatingSessionGen = sessionGeneration.get()
 
-    // Finding 8 + P1 Vision Consent: Enforce content-bound remote inference consent AT THE ANALYSIS BOUNDARY
-    if (settings.confidentialLocalOnly) {
-      val requiredConsent = computeRemoteConsentKey(
-        form = form,
-        providerRoute = providerRoute,
-        ownerScope = initiatingOwnerScope,
-        sessionGen = initiatingSessionGen,
-        enablePdfVisionPages = settings.enablePdfVisionPages
-      )
-      if (_remoteInferenceConsent.value != requiredConsent) {
-        val msg = "Remote AI inference consent is required for this exact manuscript content, PDF page images, code attachment, and provider under Local-Only Report Storage."
-        _pipelineState.value = PipelineExecutionState.Error(msg)
-        _statusBanner.value = msg
-        return
-      }
+    // Capture consent digest + vision digest AT THE ANALYSIS BOUNDARY
+    val consentAtDispatch = computeRemoteConsentKey(
+      form = form,
+      providerRoute = providerRoute,
+      ownerScope = initiatingOwnerScope,
+      sessionGen = initiatingSessionGen,
+      enablePdfVisionPages = settings.enablePdfVisionPages
+    )
+    val consentDigestSha = TamperEvidentAuditLog.sha256Hex(
+      "${consentAtDispatch.manuscriptContentSha256}|${consentAtDispatch.replicationCodeSha256}|${consentAtDispatch.pdfVisionDigestSha256}|${consentAtDispatch.providerFingerprint}"
+    )
+    if (settings.confidentialLocalOnly && _remoteInferenceConsent.value != consentAtDispatch) {
+      val msg = "Remote AI inference consent is required for this exact manuscript content, PDF page images, code attachment, and provider under Local-Only Report Storage."
+      _pipelineState.value = PipelineExecutionState.Error(msg)
+      _statusBanner.value = msg
+      return
     }
 
     // Finding 6: Strictly enforce draft-bound replication code at the analysis boundary
     val boundReplicationCode = resolveBoundReplicationCode(form)
+    val cleanupHook = InMemoryRemotePayloadCleanupHook()
 
     activePipelineJob = viewModelScope.launch {
       val currentJob = coroutineContext[Job]
@@ -1447,6 +1451,11 @@ class PaperCriticViewModel(
           options = form.options,
           externalProvider = activeExternal,
           autoFallbackToKeylessFirebase = settings.autoFallbackToKeylessEngine,
+          pdfVisionDigestSha256 = consentAtDispatch.pdfVisionDigestSha256,
+          consentVerified = !settings.confidentialLocalOnly || _remoteInferenceConsent.value == consentAtDispatch,
+          consentDigestAtApproval = consentDigestSha,
+          allowInternalModelFallback = settings.autoFallbackToKeylessEngine || providerRoute is AiProviderRoute.BuiltInKeyless,
+          remotePayloadCleanupHook = cleanupHook,
           onStageUpdate = { code, label, progress ->
             if (canCommitInferenceResult(initiatingOwnerScope, initiatingSessionGen, currentOwnerScope(), sessionGeneration.get())) {
               _pipelineState.value = PipelineExecutionState.Running(
@@ -1523,6 +1532,7 @@ class PaperCriticViewModel(
           )
         }
       } finally {
+        cleanupHook.cleanupAll("viewmodel_pipeline_exit")
         if (activePipelineJob === currentJob) {
           activePipelineJob = null
         }

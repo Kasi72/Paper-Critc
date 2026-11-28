@@ -141,6 +141,66 @@ class ReviewRepositoryRuleTest : FirestoreEmulatorTestBase() {
     assertEquals(FirebaseFirestoreException.Code.PERMISSION_DENIED, firestoreException?.code)
   }
 
+  @Test
+  fun createAndUpdateReview_provisionalAppraisalAndAuditCommitmentImmutability_enforcedByRules() = runBlocking {
+    val uid = signInTestUser(ALICE_EMAIL)
+    val repository = ReviewRepository(firestore)
+
+    val committedReview = sampleReview("Committed Provisional Paper").copy(
+      verdict = "PROVISIONAL_APPRAISAL",
+      refereeDecision = "PROVISIONAL_APPRAISAL",
+      auditLogJson = """[{"sequence":0,"stageCode":"S1_INGEST","eventType":"STAGE_COMPLETED","payloadSummary":"s1","payloadSha256":"a","previousEntryHash":"GENESIS","entryHash":"h0","timestampMs":1}]""",
+      auditCommitment = "commit-sha256-deadbeef"
+    )
+    val reviewId = withTimeout(DEFAULT_TIMEOUT_MS) {
+      repository.createReview(committedReview).getOrThrow()
+    }
+    val savedReview = withTimeout(DEFAULT_TIMEOUT_MS) {
+      repository.getReviewById(reviewId).getOrThrow()
+    }
+
+    // Bookmark / notes update preserving immutable commitment and server createdAt succeeds
+    val notesUpdate = withTimeout(DEFAULT_TIMEOUT_MS) {
+      repository.updateReview(savedReview.copy(bookmarked = true, personalNotes = "Saved after commit"))
+    }
+    assertTrue(
+      "Expected bookmark/notes update with intact auditCommitment to succeed, got ${notesUpdate.exceptionOrNull()}",
+      notesUpdate.isSuccess
+    )
+
+    // Mutating auditCommitment or auditLogJson after commit must be rejected by Firestore rules
+    val tamperResult = runCatching {
+      withTimeout(DEFAULT_TIMEOUT_MS) {
+        firestore.collection("users").document(uid)
+          .collection("reviews").document(reviewId)
+          .update(mapOf("auditCommitment" to "tampered-commitment"))
+          .await()
+      }
+    }
+    assertTrue("Mutating committed auditCommitment must fail", tamperResult.isFailure)
+    assertEquals(
+      FirebaseFirestoreException.Code.PERMISSION_DENIED,
+      tamperResult.exceptionOrNull()?.unwrapFirestoreException()?.code
+    )
+
+    // Contradictory refereeDecision vs verdict must be rejected by rules
+    val contradictoryResult = runCatching {
+      withTimeout(DEFAULT_TIMEOUT_MS) {
+        repository.createReview(
+          sampleReview("Contradictory Verdict").copy(
+            verdict = "HIGH_CREDIBILITY",
+            refereeDecision = "INSUFFICIENT_EVIDENCE"
+          )
+        ).getOrThrow()
+      }
+    }
+    assertTrue("Contradictory refereeDecision vs verdict must fail", contradictoryResult.isFailure)
+    assertEquals(
+      FirebaseFirestoreException.Code.PERMISSION_DENIED,
+      contradictoryResult.exceptionOrNull()?.unwrapFirestoreException()?.code
+    )
+  }
+
   private companion object {
     const val ALICE_EMAIL = "alice@papercritic.org"
     const val BOB_EMAIL = "bob@papercritic.org"

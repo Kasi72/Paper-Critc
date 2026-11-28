@@ -807,6 +807,7 @@ data class PaperReview(
   val abstentionSummaryJson: String = "",
   val readinessSummaryJson: String = "",
   val auditLogJson: String = "",
+  val auditCommitment: String = "",
   val refereeCoverageJson: String = "",
   // Narrative dossier sections
   val abstractSummary: String = "",

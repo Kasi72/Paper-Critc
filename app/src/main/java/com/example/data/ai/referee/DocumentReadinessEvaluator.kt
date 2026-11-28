@@ -68,8 +68,9 @@ object DocumentReadinessEvaluator {
     val searchableTextExists = !isScannedVisionOnly && words >= 15
     val totalPages = coverageReport?.totalPages ?: 1
     val extractedPages = coverageReport?.extractedPages ?: if (trimmed.isNotBlank()) 1 else 0
-    val pageCountPlausible = totalPages >= 1 && extractedPages >= 1 &&
-      (isScannedVisionOnly || words >= maxOf(10, extractedPages * 12))
+    val pageCountPlausible = totalPages >= 1 &&
+      ((isScannedVisionOnly && attachedBitmapCount >= totalPages) ||
+        (extractedPages >= 1 && (isScannedVisionOnly || words >= maxOf(10, extractedPages * 12))))
 
     // Detect garbled/replacement-char text corruption
     val replacementCharCount = trimmed.count { it == '\uFFFD' }
@@ -178,9 +179,8 @@ object DocumentReadinessEvaluator {
 
     val isIncomplete = !visionPagesBound ||
       !extractionQualityAcceptable ||
-      !methodsPresent ||
-      !resultsPresent ||
-      !pageCountPlausible
+      !pageCountPlausible ||
+      (!isScannedVisionOnly && (!methodsPresent || !resultsPresent))
 
     if (isIncomplete) {
       return DocumentReadinessAssessment(
@@ -195,12 +195,17 @@ object DocumentReadinessEvaluator {
         visionPagesBound = visionPagesBound,
         supplementStatus = supplementStatus,
         reasons = reasons,
-        requestedActions = actions.ifEmpty { listOf("Upload the complete manuscript with Methods, Results, and tables.") }
+        requestedActions = actions.ifEmpty { listOf("Upload the complete manuscript with Methods, Results, and tables.") },
+        lowTextPageCount = lowTextPenalty
       )
     }
 
     val limitationReasons = mutableListOf<String>()
     val limitationActions = mutableListOf<String>()
+    if (isScannedVisionOnly) {
+      limitationReasons.add("Scanned image-only PDF lacks a searchable text layer; deterministic text/table checks cannot verify quotes without OCR.")
+      limitationActions.add("Provide an OCR-processed PDF so exact source anchors and numerical tables can be verified.")
+    }
     if (supplementStatus == SupplementStatus.ABSENT) {
       limitationReasons.add("Manuscript references supplementary material that is not attached.")
       limitationActions.add("Attach supplementary tables/appendices if verification depends on supplement-only models.")
@@ -235,7 +240,8 @@ object DocumentReadinessEvaluator {
       visionPagesBound = visionPagesBound,
       supplementStatus = supplementStatus,
       reasons = limitationReasons,
-      requestedActions = limitationActions
+      requestedActions = limitationActions,
+      lowTextPageCount = lowTextPenalty
     )
   }
 }

@@ -95,6 +95,7 @@ import com.example.data.ai.epistemic.FlawSeverityTier
 import com.example.data.ai.epistemic.ReportingStatus
 import com.example.data.ai.referee.AbstentionResult
 import com.example.data.ai.referee.AnalysisManifest
+import com.example.data.ai.referee.AuditLogVerificationStatus
 import com.example.data.ai.referee.DocumentReadinessAssessment
 import com.example.data.ai.referee.RefereeCoverageMetrics
 import com.example.data.ai.referee.RefereeDecision
@@ -449,7 +450,23 @@ fun DossierDetailView(
                 modifier = Modifier.size(17.dp)
               )
             }
-            VerdictSquircleBadge(decision = review.verdict)
+            val headerRefereeDecision = remember(review.id, review.refereeDecision) {
+              RefereeDecision.fromNameOrNull(review.refereeDecision)
+            }
+            val effectiveHeaderVerdict = remember(review.verdict, headerRefereeDecision, review.reviewMode) {
+              if (headerRefereeDecision != null) {
+                com.example.data.ai.Reviewer2PipelineService.mapRefereeDecisionToModeVerdict(
+                  decision = headerRefereeDecision,
+                  reviewMode = review.resolvedReviewMode(),
+                  domainAppraisal = null,
+                  preOrchestratorVerdict = review.verdict,
+                  compositeScore = review.toRubric().overallCredibilityScore
+                )
+              } else {
+                review.verdict
+              }
+            }
+            VerdictSquircleBadge(decision = effectiveHeaderVerdict)
             TrackSquircleBadge(isEmpirical = review.isEmpirical)
           }
 
@@ -576,11 +593,19 @@ fun DossierDetailView(
         val readinessAssessment = remember(review.id, review.readinessSummaryJson) {
           DocumentReadinessAssessment.fromJson(review.readinessSummaryJson)
         }
-        val auditEntries = remember(review.id, review.auditLogJson) {
-          TamperEvidentAuditLog.fromJson(review.auditLogJson)
-        }
-        val auditChainValid = remember(auditEntries) {
-          auditEntries.isEmpty() || TamperEvidentAuditLog.verifyChain(auditEntries)
+        val auditVerification = remember(
+          review.id,
+          review.auditLogJson,
+          review.auditCommitment,
+          analysisManifest?.analysisId,
+          analysisManifest?.manuscriptSha256
+        ) {
+          TamperEvidentAuditLog.verifyAuditLog(
+            auditLogJson = review.auditLogJson,
+            commitment = review.auditCommitment,
+            expectedAnalysisId = analysisManifest?.analysisId.orEmpty(),
+            expectedManuscriptSha256 = analysisManifest?.manuscriptSha256.orEmpty()
+          )
         }
         val refereeCoverage = remember(review.id, review.refereeCoverageJson) {
           RefereeCoverageMetrics.fromJson(review.refereeCoverageJson)
@@ -769,10 +794,17 @@ fun DossierDetailView(
           }
         }
 
-        if (analysisManifest != null || readinessAssessment != null || auditEntries.isNotEmpty()) {
+        if (analysisManifest != null || readinessAssessment != null || auditVerification.entryCount > 0 || review.auditCommitment.isNotBlank()) {
           Spacer(modifier = Modifier.height(6.dp))
           var showProvenanceDetails by rememberSaveable(review.id) { mutableStateOf(false) }
           val provShape = SquircleShape(cornerRadius = 8.dp, smoothing = 0.88f)
+          val auditHeaderColor = when (auditVerification.status) {
+            AuditLogVerificationStatus.VERIFIED -> CupertinoIndigo
+            AuditLogVerificationStatus.LOCAL_CHAIN_ONLY,
+            AuditLogVerificationStatus.MISSING_COMMITMENT,
+            AuditLogVerificationStatus.NOT_AVAILABLE -> CupertinoAmber
+            AuditLogVerificationStatus.TAMPERED -> CupertinoRed
+          }
           Column(
             modifier = Modifier
               .fillMaxWidth()
@@ -795,15 +827,24 @@ fun DossierDetailView(
               Text(
                 text = buildString {
                   append("PROVENANCE & AUDIT CHAIN")
-                  if (auditEntries.isNotEmpty()) {
-                    append(if (auditChainValid) " • SHA-256 VERIFIED (${auditEntries.size})" else " • CHAIN TAMPERED")
+                  when (auditVerification.status) {
+                    AuditLogVerificationStatus.VERIFIED ->
+                      append(" • COMMITTED SHA-256 VERIFIED (${auditVerification.entryCount})")
+                    AuditLogVerificationStatus.LOCAL_CHAIN_ONLY ->
+                      append(" • LOCAL CHAIN ONLY (${auditVerification.entryCount})")
+                    AuditLogVerificationStatus.MISSING_COMMITMENT ->
+                      append(" • COMMITMENT MISMATCH (${auditVerification.entryCount})")
+                    AuditLogVerificationStatus.NOT_AVAILABLE ->
+                      append(" • AUDIT LOG NOT AVAILABLE")
+                    AuditLogVerificationStatus.TAMPERED ->
+                      append(" • CHAIN TAMPERED")
                   }
                 },
                 style = MaterialTheme.typography.labelSmall,
                 fontFamily = JetBrainsMonoFamily,
                 fontSize = 9.sp,
                 fontWeight = FontWeight.Bold,
-                color = if (auditChainValid) CupertinoIndigo else CupertinoRed
+                color = auditHeaderColor
               )
               Text(
                 text = if (showProvenanceDetails) "Hide ▲" else "Inspect ▼",
@@ -814,6 +855,12 @@ fun DossierDetailView(
               )
             }
             if (showProvenanceDetails) {
+              Text(
+                text = "Audit Status: ${auditVerification.status.displayLabel} — ${auditVerification.detail}",
+                style = MaterialTheme.typography.labelSmall,
+                fontSize = 10.sp,
+                color = auditHeaderColor
+              )
               if (readinessAssessment != null) {
                 Text(
                   text = "Readiness: ${readinessAssessment.readiness.displayLabel} • ${readinessAssessment.supplementStatus.displayLabel}",
@@ -1980,12 +2027,14 @@ fun VerdictSquircleBadge(decision: String) {
   val (textColor, icon) = when {
     normalized in setOf("ACCEPT", "HIGH_CREDIBILITY", "HIGH_CERTAINTY") ->
       CupertinoGreen to Icons.Default.Verified
-    normalized in setOf("MINOR_REVISION", "SOUND_WITH_CAVEATS", "MODERATE_CERTAINTY") ->
+    normalized in setOf("MINOR_REVISION", "MINOR_REVISION_WITH_CAVEATS", "SOUND_WITH_CAVEATS", "MODERATE_CERTAINTY") ->
       CupertinoBlue to Icons.Default.Verified
     normalized in setOf(
       "MAJOR_REVISION",
       "REQUIRES_CORRECTION",
       "LOW_CERTAINTY",
+      "PROVISIONAL_APPRAISAL",
+      "PROVISIONAL_APPRAISAL_DESIGN_UNCERTAIN",
       "INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT"
     ) ->
       CupertinoAmber to Icons.Default.Shield
@@ -1993,6 +2042,7 @@ fun VerdictSquircleBadge(decision: String) {
   }
   val displayLabel = when (normalized) {
     "INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT" -> "INSUFFICIENT EVIDENCE"
+    "PROVISIONAL_APPRAISAL_DESIGN_UNCERTAIN" -> "PROVISIONAL (DESIGN UNCERTAIN)"
     else -> decision.replace('_', ' ').uppercase()
   }
 

@@ -369,7 +369,19 @@ fun ArchiveScreen(
                       verticalAlignment = Alignment.CenterVertically,
                       horizontalArrangement = Arrangement.spacedBy(5.dp)
                     ) {
-                      VerdictSquircleBadge(decision = itemReview.verdict)
+                      val cardRefereeDecision = com.example.data.ai.referee.RefereeDecision.fromNameOrNull(itemReview.refereeDecision)
+                      val effectiveCardVerdict = if (cardRefereeDecision != null) {
+                        com.example.data.ai.Reviewer2PipelineService.mapRefereeDecisionToModeVerdict(
+                          decision = cardRefereeDecision,
+                          reviewMode = itemReview.resolvedReviewMode(),
+                          domainAppraisal = null,
+                          preOrchestratorVerdict = itemReview.verdict,
+                          compositeScore = itemReview.toRubric().overallCredibilityScore
+                        )
+                      } else {
+                        itemReview.verdict
+                      }
+                      VerdictSquircleBadge(decision = effectiveCardVerdict)
                       if (itemReview.id in offlineCachedIds) {
                         val sqlShape = SquircleShape(cornerRadius = 6.dp, smoothing = 0.88f)
                         Box(

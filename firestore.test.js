@@ -457,33 +457,103 @@ test("Unassessed readiness-gate zero-score records and lossless narrative_chunks
   await assertSucceeds(unassessedRef.delete());
 });
 
-test("Referee provenance, manifest, abstention, and audit-log metadata rules", async () => {
+test("Referee provenance, manifest, abstention, auditCommitment immutability, and strict bounds rules", async () => {
   const aliceDb = testEnv.authenticatedContext(ALICE_UID).firestore();
   const created = new Date(Date.now() - 1500);
   const ref = aliceDb.collection("users").doc(ALICE_UID).collection("reviews").doc("review_referee_meta_01");
+  const commitHash = "a".repeat(64);
 
   await assertSucceeds(
     ref.set(
       buildFullV4ReviewPayload(ALICE_UID, created, {
+        verdict: "REQUIRES_CORRECTION",
         refereeDecision: "VERIFIED_WITH_MINOR_CONCERNS",
         analysisManifestJson: "{\"analysisId\":\"ana-1\",\"modelId\":\"gemini-3.8-flash\"}",
         abstentionSummaryJson: "{\"shouldAbstainFromVerifiedVerdict\":false}",
         readinessSummaryJson: "{\"readiness\":\"READY\"}",
         auditLogJson: "[{\"sequence\":0,\"entryHash\":\"abc\"}]",
+        auditCommitment: commitHash,
         refereeCoverageJson: "{\"standardizedLabel\":\"Complete quantitative coverage\"}",
       })
     )
   );
 
-  // Oversized refereeDecision (> 64 chars) MUST fail
-  const badRef = aliceDb.collection("users").doc(ALICE_UID).collection("reviews").doc("review_referee_bad_01");
+  // Bookmark partial update MUST still succeed even when auditCommitment is immutable
+  await assertSucceeds(
+    ref.update({
+      bookmarked: true,
+      updatedAt: new Date(Date.now() - 1000),
+    })
+  );
+
+  // Tampering auditCommitment or auditLogJson after commitment is set MUST fail
   await assertFails(
-    badRef.set(
+    ref.update({
+      auditCommitment: "b".repeat(64),
+      updatedAt: new Date(Date.now() - 900),
+    })
+  );
+  await assertFails(
+    ref.update({
+      auditLogJson: "[{\"sequence\":0,\"entryHash\":\"tampered\"}]",
+      updatedAt: new Date(Date.now() - 800),
+    })
+  );
+
+  // PROVISIONAL_APPRAISAL verdict paired with PROVISIONAL_APPRAISAL refereeDecision succeeds
+  const provRef = aliceDb.collection("users").doc(ALICE_UID).collection("reviews").doc("review_prov_01");
+  await assertSucceeds(
+    provRef.set(
       buildFullV4ReviewPayload(ALICE_UID, created, {
-        refereeDecision: "X".repeat(80),
+        verdict: "PROVISIONAL_APPRAISAL",
+        refereeDecision: "PROVISIONAL_APPRAISAL",
       })
     )
   );
 
+  // Contradictory PROVISIONAL_APPRAISAL refereeDecision + HIGH_CREDIBILITY verdict MUST fail
+  await assertFails(
+    aliceDb.collection("users").doc(ALICE_UID).collection("reviews").doc("review_contradict_01").set(
+      buildFullV4ReviewPayload(ALICE_UID, created, {
+        credibilityScore: 95,
+        methodologyScore: 10,
+        significanceScore: 10,
+        clarityScore: 9,
+        originalityScore: 9,
+        mathRigorScore: 9,
+        reproducibilityScore: 10,
+        verdict: "HIGH_CREDIBILITY",
+        refereeDecision: "PROVISIONAL_APPRAISAL",
+      })
+    )
+  );
+
+  // Unknown refereeDecision enum MUST fail
+  await assertFails(
+    aliceDb.collection("users").doc(ALICE_UID).collection("reviews").doc("review_referee_bad_01").set(
+      buildFullV4ReviewPayload(ALICE_UID, created, {
+        refereeDecision: "UNKNOWN_VERDICT",
+      })
+    )
+  );
+
+  // Oversized narrative & malformed JSON shape MUST fail
+  await assertFails(
+    aliceDb.collection("users").doc(ALICE_UID).collection("reviews").doc("review_oversized_abs").set(
+      buildFullV4ReviewPayload(ALICE_UID, created, {
+        abstractSummary: "A".repeat(5001),
+      })
+    )
+  );
+  await assertFails(
+    aliceDb.collection("users").doc(ALICE_UID).collection("reviews").doc("review_bad_json_shape").set(
+      buildFullV4ReviewPayload(ALICE_UID, created, {
+        auditLogJson: "not-json-array",
+      })
+    )
+  );
+
+  await assertSucceeds(provRef.delete());
   await assertSucceeds(ref.delete());
 });
+

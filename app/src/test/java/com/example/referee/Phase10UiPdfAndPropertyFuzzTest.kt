@@ -11,6 +11,7 @@ import com.example.data.ai.referee.AnalysisManifest
 import com.example.data.ai.referee.AutonomousRefereeOrchestrator
 import com.example.data.ai.referee.DocumentReadiness
 import com.example.data.ai.referee.DocumentReadinessEvaluator
+import com.example.data.ai.referee.PipelineStageId
 import com.example.data.ai.referee.QuantitativeAdjudicationContracts
 import com.example.data.ai.referee.QuantitativeFindingStatus
 import com.example.data.ai.referee.RefereeCoverageMetrics
@@ -101,9 +102,16 @@ class Phase10UiPdfAndPropertyFuzzTest {
       consentVerified = true
     )
     val auditLog = TamperEvidentAuditLog().apply {
-      append("S1_INGEST", "STAGE_COMPLETED", "6/8 pages extracted", 1000L)
-      append("S8_ADJUD", "STAGE_COMPLETED", "PROVISIONAL_APPRAISAL", 2000L)
+      PipelineStageId.entries.forEachIndexed { idx, stage ->
+        append(stage.name, "STAGE_COMPLETED", "stage-$idx", 1000L + idx * 100L)
+      }
     }
+    val commitment = TamperEvidentAuditLog.computeCommitmentHash(
+      terminalHash = auditLog.entries().last().entryHash,
+      analysisId = manifest.analysisId,
+      manuscriptSha256 = manifest.manuscriptSha256,
+      stageCount = auditLog.entries().size
+    )
     val readiness = DocumentReadinessEvaluator.assess(
       manuscriptText = "Methods\nRandomized trial.\nResults\nHR 0.80 (95% CI 0.65 to 0.98).\nReferences\n1. A.",
       coverageReport = DocumentCoverageReport.forCompleteText("Methods Results"),
@@ -118,7 +126,7 @@ class Phase10UiPdfAndPropertyFuzzTest {
       venueOrCitation = "Journal of Reproducible Methods",
       isEmpirical = true,
       credibilityScore = 72L,
-      verdict = "MINOR_REVISION_WITH_CAVEATS",
+      verdict = "PROVISIONAL_APPRAISAL",
       methodologyScore = 7,
       significanceScore = 7,
       clarityScore = 8,
@@ -163,6 +171,7 @@ class Phase10UiPdfAndPropertyFuzzTest {
       abstentionSummaryJson = abstention.toJson(),
       readinessSummaryJson = readiness.toJson(),
       auditLogJson = auditLog.toJson(),
+      auditCommitment = commitment,
       refereeCoverageJson = coverage.toJson()
     )
 
@@ -179,6 +188,15 @@ class Phase10UiPdfAndPropertyFuzzTest {
     assertTrue(rendered.renderedText.contains("PROVENANCE & TAMPER-EVIDENT AUDIT MANIFEST", ignoreCase = true))
     assertTrue(rendered.renderedText.contains("SHA-256 Chain Verified", ignoreCase = true))
     assertFalse("Must never claim complete audit when caps > 0", rendered.renderedText.contains("complete audit", ignoreCase = true))
+
+    // Empty auditLogJson MUST NOT claim SHA-256 Chain Verified — must disclose Audit Log Not Available
+    val missingAuditRendered = PdfReportExporter.renderAndInspectPdf(
+      review = review.copy(auditLogJson = "", auditCommitment = ""),
+      scope = PdfExportScope.SCIENTIFIC_APPRAISAL_REPORT,
+      requireByteExtraction = false
+    )
+    assertTrue(missingAuditRendered.renderedText.contains("Audit Log Not Available", ignoreCase = true))
+    assertFalse(missingAuditRendered.renderedText.contains("SHA-256 Chain Verified", ignoreCase = true))
   }
 
   @Test

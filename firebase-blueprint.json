@@ -38,6 +38,7 @@
           "enum": [
             "ACCEPT",
             "MINOR_REVISION",
+            "MINOR_REVISION_WITH_CAVEATS",
             "MAJOR_REVISION",
             "REJECT_AND_RESUBMIT",
             "REJECT",
@@ -49,9 +50,12 @@
             "HIGH_CERTAINTY",
             "MODERATE_CERTAINTY",
             "LOW_CERTAINTY",
-            "VERY_LOW_CERTAINTY"
+            "VERY_LOW_CERTAINTY",
+            "INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT",
+            "PROVISIONAL_APPRAISAL",
+            "PROVISIONAL_APPRAISAL_DESIGN_UNCERTAIN"
           ],
-          "description": "Mode-aligned score-derived appraisal verdict (strictly matched to reviewMode)"
+          "description": "Mode-aligned verdict bounded by the canonical autonomous RefereeDecision"
         },
         "methodologyScore": {
           "type": "integer",
@@ -128,13 +132,53 @@
             "VERIFIED",
             "ADJUDICATED_WITH_CAVEATS",
             "PARTIALLY_VALIDATED",
-            "UNVERIFIED"
+            "PROVISIONAL",
+            "UNVERIFIED",
+            "LEGACY_UNVALIDATED",
+            "REQUIRES_REANALYSIS"
           ],
           "description": "Pipeline grounding and adjudication validation state"
         },
         "structuredFindingsJson": {
           "type": "string",
           "description": "Serialized JSON array of source-anchored ReviewFinding evidence ledger items"
+        },
+        "refereeDecision": {
+          "type": "string",
+          "enum": [
+            "VERIFIED_NO_MAJOR_CONCERNS",
+            "VERIFIED_WITH_MINOR_CONCERNS",
+            "MATERIAL_CONCERNS",
+            "MAJOR_UNRESOLVED_CONCERNS",
+            "INSUFFICIENT_EVIDENCE",
+            "PROVISIONAL_APPRAISAL",
+            "OUT_OF_SCOPE"
+          ],
+          "description": "Canonical autonomous referee decision"
+        },
+        "analysisManifestJson": {
+          "type": "string",
+          "description": "Serialized AnalysisManifest JSON"
+        },
+        "abstentionSummaryJson": {
+          "type": "string",
+          "description": "Serialized AbstentionResult JSON"
+        },
+        "readinessSummaryJson": {
+          "type": "string",
+          "description": "Serialized DocumentReadinessAssessment JSON"
+        },
+        "auditLogJson": {
+          "type": "string",
+          "description": "Serialized SHA-256 hash-chained TamperEvidentAuditLog JSON array"
+        },
+        "auditCommitment": {
+          "type": "string",
+          "description": "Immutable SHA-256 commitment hash binding terminal audit hash, analysisId, manuscriptSha256, and stageCount"
+        },
+        "refereeCoverageJson": {
+          "type": "string",
+          "description": "Serialized RefereeCoverageMetrics JSON"
         },
         "abstractSummary": {
           "type": "string",

@@ -19,6 +19,7 @@ import com.example.data.ai.epistemic.FlawSeverityTier
 import com.example.data.ai.epistemic.ReportingStatus
 import com.example.data.ai.referee.AbstentionResult
 import com.example.data.ai.referee.AnalysisManifest
+import com.example.data.ai.referee.AuditLogVerificationStatus
 import com.example.data.ai.referee.DocumentReadinessAssessment
 import com.example.data.ai.referee.RefereeCoverageMetrics
 import com.example.data.ai.referee.RefereeDecision
@@ -779,16 +780,29 @@ object PdfReportExporter {
     } else {
       normalizedTitle
     }
-    val isProvisionalVerdict = review.verdict.contains("PROVISIONAL", ignoreCase = true) ||
-      review.verdict.contains("INSUFFICIENT_EVIDENCE", ignoreCase = true) ||
+    val refereeDecision = RefereeDecision.fromNameOrNull(review.refereeDecision)
+    val effectiveVerdict = if (refereeDecision != null) {
+      com.example.data.ai.Reviewer2PipelineService.mapRefereeDecisionToModeVerdict(
+        decision = refereeDecision,
+        reviewMode = reviewMode,
+        domainAppraisal = null,
+        preOrchestratorVerdict = review.verdict,
+        compositeScore = authoritativeScore
+      )
+    } else {
+      review.verdict
+    }
+    val isProvisionalVerdict = effectiveVerdict.contains("PROVISIONAL", ignoreCase = true) ||
+      effectiveVerdict.contains("INSUFFICIENT_EVIDENCE", ignoreCase = true) ||
       review.validationStatus.equals("PROVISIONAL", ignoreCase = true)
-    val verdictUpper = when (review.verdict.uppercase(Locale.US)) {
+    val verdictUpper = when (effectiveVerdict.uppercase(Locale.US)) {
+      "PROVISIONAL_APPRAISAL" -> "PROVISIONAL APPRAISAL"
       "PROVISIONAL_APPRAISAL_DESIGN_UNCERTAIN" -> "PROVISIONAL APPRAISAL — DESIGN CLASSIFICATION UNCERTAIN"
       "INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT" -> "INSUFFICIENT EVIDENCE FOR ASSESSMENT"
       "MINOR_REVISION_WITH_CAVEATS" -> "MINOR REVISION WITH CAVEATS"
-      else -> review.verdict.replace('_', ' ').uppercase(Locale.US)
+      else -> effectiveVerdict.replace('_', ' ').uppercase(Locale.US)
     }
-    val verdictColor = verdictAccentColor(review.verdict)
+    val verdictColor = verdictAccentColor(effectiveVerdict)
 
     fun recordText(line: String) {
       if (renderedTextSink != null && line.isNotBlank()) {
@@ -1828,13 +1842,16 @@ object PdfReportExporter {
       "LEGACY_UNVALIDATED" -> "Legacy Unvalidated"
       else -> review.validationStatus.replace('_', ' ')
     }
-    val refereeDecision = RefereeDecision.fromNameOrNull(review.refereeDecision)
     val refereeCoverage = RefereeCoverageMetrics.fromJson(review.refereeCoverageJson)
     val abstentionResult = AbstentionResult.fromJson(review.abstentionSummaryJson)
     val analysisManifest = AnalysisManifest.fromJson(review.analysisManifestJson)
     val readinessAssessment = DocumentReadinessAssessment.fromJson(review.readinessSummaryJson)
-    val auditEntries = TamperEvidentAuditLog.fromJson(review.auditLogJson)
-    val auditChainValid = auditEntries.isEmpty() || TamperEvidentAuditLog.verifyChain(auditEntries)
+    val auditVerification = TamperEvidentAuditLog.verifyAuditLog(
+      auditLogJson = review.auditLogJson,
+      commitment = review.auditCommitment,
+      expectedAnalysisId = analysisManifest?.analysisId.orEmpty(),
+      expectedManuscriptSha256 = analysisManifest?.manuscriptSha256.orEmpty()
+    )
 
     val coverageText = buildString {
       if (refereeDecision != null) {
@@ -1895,7 +1912,7 @@ object PdfReportExporter {
       )
     }
 
-    if (analysisManifest != null || readinessAssessment != null || auditEntries.isNotEmpty()) {
+    if (analysisManifest != null || readinessAssessment != null || auditVerification.entryCount > 0 || review.auditCommitment.isNotBlank()) {
       val provBody = buildString {
         if (readinessAssessment != null) {
           appendLine("Document Readiness: ${readinessAssessment.readiness.displayLabel} (${readinessAssessment.supplementStatus.displayLabel})")
@@ -1905,15 +1922,29 @@ object PdfReportExporter {
           appendLine("Digests: manuscript=${analysisManifest.manuscriptSha256.take(16)}..., code=${analysisManifest.replicationCodeSha256.take(16)}..., vision=${analysisManifest.pdfVisionDigest.take(16).ifBlank { "none" }}")
           appendLine("Versions: ruleset=${analysisManifest.rulesetVersion}, prompt=${analysisManifest.promptVersion}, app=${analysisManifest.appVersion} | Consent Verified: ${analysisManifest.consentVerified}")
         }
-        if (auditEntries.isNotEmpty()) {
-          append("Audit Trail Integrity: ${if (auditChainValid) "SHA-256 Chain Verified (${auditEntries.size} stages)" else "CHAIN VERIFICATION FAILED"}")
+        val auditLine = when (auditVerification.status) {
+          AuditLogVerificationStatus.VERIFIED ->
+            "Audit Trail Integrity: Cryptographically Committed & SHA-256 Chain Verified (${auditVerification.entryCount} stages)"
+          AuditLogVerificationStatus.LOCAL_CHAIN_ONLY ->
+            "Audit Trail Integrity: Local SHA-256 Chain Only (No Immutable Commitment; ${auditVerification.entryCount} stages)"
+          AuditLogVerificationStatus.MISSING_COMMITMENT ->
+            "Audit Trail Integrity: Commitment Mismatch / Incomplete (${auditVerification.entryCount} stages)"
+          AuditLogVerificationStatus.NOT_AVAILABLE ->
+            "Audit Trail Integrity: Audit Log Not Available"
+          AuditLogVerificationStatus.TAMPERED ->
+            "Audit Trail Integrity: CHAIN VERIFICATION FAILED (${auditVerification.detail})"
         }
+        append(auditLine)
       }.trim()
       if (provBody.isNotBlank()) {
         drawBoxedCard(
           badgeText = "PROVENANCE & TAMPER-EVIDENT AUDIT MANIFEST",
           bodyText = provBody,
-          palette = calloutPalette(CalloutTone.INFO),
+          palette = if (auditVerification.status == AuditLogVerificationStatus.TAMPERED) {
+            severityPalette(SeverityLevel.CRITICAL)
+          } else {
+            calloutPalette(CalloutTone.INFO)
+          },
           isCalloutTitle = true
         )
       }
@@ -2157,7 +2188,7 @@ object PdfReportExporter {
     val alignedEditorNote = com.example.data.ai.Reviewer2PipelineService.alignEditorNoteWithVerdictAndMode(
       rawEditorNote = review.editorNote,
       findings = findings,
-      resolvedVerdict = review.verdict,
+      resolvedVerdict = effectiveVerdict,
       reviewMode = reviewMode
     )
     drawStructuredBlocks(alignedEditorNote, stripInternalTags = true)
@@ -2257,6 +2288,7 @@ object PdfReportExporter {
         "MAJOR_REVISION",
         "REQUIRES_CORRECTION",
         "LOW_CERTAINTY",
+        "PROVISIONAL_APPRAISAL",
         "PROVISIONAL_APPRAISAL_DESIGN_UNCERTAIN",
         "INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT"
       ) -> Color.rgb(217, 119, 6)

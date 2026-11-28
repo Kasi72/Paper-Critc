@@ -1,6 +1,8 @@
 package com.example.data.ai.referee
 
 import com.example.data.ai.StudyDesignArchetype
+import com.example.data.ai.epistemic.BidirectionalAdjudicator
+import com.example.data.ai.epistemic.BidirectionalAdjudicator.MethodMentionStatus
 import com.example.data.ai.semantic.CalibratedStudyDesign
 import com.example.data.ai.semantic.SemanticValidityEngine
 import com.example.data.ai.stats.AuditSubDesign
@@ -29,7 +31,11 @@ data class DomainCriterionEvaluation(
   val domainKey: String,
   val label: String,
   val rating: DomainCriterionRating,
-  val detail: String
+  val detail: String,
+  val mentionStatus: MethodMentionStatus = MethodMentionStatus.UNCLEAR,
+  val evidenceSection: String = "",
+  val supportingQuote: String = "",
+  val counterEvidenceQuote: String = ""
 )
 
 data class DomainAppraisalReport(
@@ -45,28 +51,35 @@ data class DomainAppraisalReport(
 /**
  * Phase 6 Domain-Specific Appraisal Adapters covering all 7 required research designs
  * plus the explicit DESIGN_UNCERTAIN fallback restricting strong verified verdicts.
+ *
+ * Uses section-aware, negation-aware [BidirectionalAdjudicator.classifyMethodMentionStatus]
+ * evidence verification rather than raw substring checks.
  */
 object DomainAppraisalAdapters {
+
+  private val referencesCutoffRegex = Regex("""(?im)^\s*(?:\d+(?:\.\d+)*\.?\s+)?(references|bibliography|works\s+cited)\s*$""")
 
   fun appraise(
     text: String,
     parentArchetype: StudyDesignArchetype
   ): DomainAppraisalReport {
     val cleanText = SemanticValidityEngine.extractActiveDesignClassificationText(text)
-    val l = cleanText.lowercase(Locale.US)
-    val subDesign = DomainStatisticalAuditModules.classifySubDesign(cleanText, parentArchetype)
-    val calibrated = SemanticValidityEngine.classifyDesignWithConfidence(cleanText, parentArchetype)
+    val refCutoff = referencesCutoffRegex.find(cleanText)?.range?.first ?: cleanText.length
+    val bodyText = cleanText.substring(0, refCutoff)
+    val l = bodyText.lowercase(Locale.US)
+    val subDesign = DomainStatisticalAuditModules.classifySubDesign(bodyText, parentArchetype)
+    val calibrated = SemanticValidityEngine.classifyDesignWithConfidence(bodyText, parentArchetype)
 
     val domain = resolveDomain(subDesign, calibrated.calibratedDesign, l, calibrated.abstained)
 
     return when (domain) {
-      AppraisalDomain.RANDOMIZED_TRIAL -> buildRctRob2(l, calibrated.primaryConfidence)
-      AppraisalDomain.OBSERVATIONAL_COHORT -> buildCohortRobinsINos(l, calibrated.primaryConfidence)
-      AppraisalDomain.CASE_CONTROL -> buildCaseControlNos(l, calibrated.primaryConfidence)
-      AppraisalDomain.DIAGNOSTIC_STUDY -> buildDiagnosticQuadas2(l, calibrated.primaryConfidence)
-      AppraisalDomain.SYSTEMATIC_REVIEW_META_ANALYSIS -> buildSystematicReviewAmstar2Grade(l, calibrated.primaryConfidence)
-      AppraisalDomain.PREDICTION_MODEL -> buildPredictionTripod(l, calibrated.primaryConfidence)
-      AppraisalDomain.QUALITATIVE_STUDY -> buildQualitativeCaspSrqrCoreq(l, calibrated.primaryConfidence)
+      AppraisalDomain.RANDOMIZED_TRIAL -> buildRctRob2(bodyText, calibrated.primaryConfidence)
+      AppraisalDomain.OBSERVATIONAL_COHORT -> buildCohortRobinsINos(bodyText, calibrated.primaryConfidence)
+      AppraisalDomain.CASE_CONTROL -> buildCaseControlNos(bodyText, calibrated.primaryConfidence)
+      AppraisalDomain.DIAGNOSTIC_STUDY -> buildDiagnosticQuadas2(bodyText, calibrated.primaryConfidence)
+      AppraisalDomain.SYSTEMATIC_REVIEW_META_ANALYSIS -> buildSystematicReviewAmstar2Grade(bodyText, calibrated.primaryConfidence)
+      AppraisalDomain.PREDICTION_MODEL -> buildPredictionTripod(bodyText, calibrated.primaryConfidence)
+      AppraisalDomain.QUALITATIVE_STUDY -> buildQualitativeCaspSrqrCoreq(bodyText, calibrated.primaryConfidence)
       AppraisalDomain.DESIGN_UNCERTAIN -> DomainAppraisalReport(
         domain = AppraisalDomain.DESIGN_UNCERTAIN,
         instrumentName = "Provisional Design-Uncertain Fallback",
@@ -85,13 +98,159 @@ object DomainAppraisalAdapters {
     }
   }
 
+  private fun extractSentenceAt(text: String, start: Int, end: Int): String {
+    var s = start
+    while (s > 0 && text[s - 1] != '\n' && text[s - 1] != '.') s--
+    var e = end
+    while (e < text.length && text[e] != '\n' && text[e] != '.') e++
+    return text.substring(s, e.coerceAtMost(text.length)).replace(Regex("""\s+"""), " ").trim().take(240)
+  }
+
+  private data class CriterionScan(
+    val rating: DomainCriterionRating,
+    val status: MethodMentionStatus,
+    val section: String,
+    val supportingQuote: String,
+    val counterEvidenceQuote: String,
+    val statusNote: String
+  )
+
+  private fun scanCriterion(
+    bodyText: String,
+    pattern: Regex,
+    absenceRating: DomainCriterionRating = DomainCriterionRating.SOME_CONCERN
+  ): CriterionScan {
+    if (bodyText.isBlank()) {
+      return CriterionScan(absenceRating, MethodMentionStatus.UNCLEAR, "", "", "", "No text provided")
+    }
+    var performedMatch: Triple<String, String, String>? = null // (sentence, section, matchedVal)
+    var notPerformedMatch: Pair<String, String>? = null // (sentence, section)
+    var proposedOrPriorMatch: Triple<MethodMentionStatus, String, String>? = null
+
+    pattern.findAll(bodyText).forEach { m ->
+      val section = BidirectionalAdjudicator.resolveSectionAtOffset(bodyText, m.range.first)
+      if (section.equals("References", ignoreCase = true)) return@forEach
+      val sentence = extractSentenceAt(bodyText, m.range.first, m.range.last + 1)
+      val status = BidirectionalAdjudicator.classifyMethodMentionStatus(sentence, m.value, section)
+      when (status) {
+        MethodMentionStatus.PERFORMED -> {
+          if (performedMatch == null) performedMatch = Triple(sentence, section, m.value)
+        }
+        MethodMentionStatus.NOT_PERFORMED -> {
+          if (notPerformedMatch == null) notPerformedMatch = sentence to section
+        }
+        MethodMentionStatus.PROPOSED_ONLY, MethodMentionStatus.CITED_AS_PRIOR_WORK -> {
+          if (proposedOrPriorMatch == null) proposedOrPriorMatch = Triple(status, sentence, section)
+        }
+        MethodMentionStatus.UNCLEAR -> Unit
+      }
+    }
+
+    if (performedMatch != null) {
+      val (sent, sec, _) = performedMatch!!
+      return CriterionScan(
+        rating = DomainCriterionRating.LOW_CONCERN,
+        status = MethodMentionStatus.PERFORMED,
+        section = sec,
+        supportingQuote = sent,
+        counterEvidenceQuote = "",
+        statusNote = "Verified performed in $sec"
+      )
+    }
+    if (notPerformedMatch != null) {
+      val (sent, sec) = notPerformedMatch!!
+      return CriterionScan(
+        rating = DomainCriterionRating.HIGH_CONCERN,
+        status = MethodMentionStatus.NOT_PERFORMED,
+        section = sec,
+        supportingQuote = "",
+        counterEvidenceQuote = sent,
+        statusNote = "Explicitly not performed / omitted ($sec)"
+      )
+    }
+    if (proposedOrPriorMatch != null) {
+      val (st, sent, sec) = proposedOrPriorMatch!!
+      val label = if (st == MethodMentionStatus.PROPOSED_ONLY) "proposed for future work only" else "cited only as prior work"
+      return CriterionScan(
+        rating = absenceRating,
+        status = st,
+        section = sec,
+        supportingQuote = "",
+        counterEvidenceQuote = sent,
+        statusNote = "Keyword $label ($sec); not confirmed performed"
+      )
+    }
+    return CriterionScan(
+      rating = absenceRating,
+      status = MethodMentionStatus.UNCLEAR,
+      section = "",
+      supportingQuote = "",
+      counterEvidenceQuote = "",
+      statusNote = "Not reported in active body sections"
+    )
+  }
+
+  private fun buildCriterion(
+    domainKey: String,
+    label: String,
+    scan: CriterionScan,
+    baseDetail: String
+  ): DomainCriterionEvaluation {
+    val detailText = "$baseDetail [${scan.statusNote}]"
+    return DomainCriterionEvaluation(
+      domainKey = domainKey,
+      label = label,
+      rating = scan.rating,
+      detail = detailText,
+      mentionStatus = scan.status,
+      evidenceSection = scan.section,
+      supportingQuote = scan.supportingQuote,
+      counterEvidenceQuote = scan.counterEvidenceQuote
+    )
+  }
+
+  private fun combineDualScans(
+    domainKey: String,
+    label: String,
+    s1: CriterionScan,
+    s2: CriterionScan,
+    baseDetail: String
+  ): DomainCriterionEvaluation {
+    val rating = when {
+      s1.status == MethodMentionStatus.NOT_PERFORMED || s2.status == MethodMentionStatus.NOT_PERFORMED ->
+        DomainCriterionRating.HIGH_CONCERN
+      s1.status == MethodMentionStatus.PERFORMED && s2.status == MethodMentionStatus.PERFORMED ->
+        DomainCriterionRating.LOW_CONCERN
+      s1.status == MethodMentionStatus.PERFORMED || s2.status == MethodMentionStatus.PERFORMED ->
+        DomainCriterionRating.SOME_CONCERN
+      else -> DomainCriterionRating.HIGH_CONCERN
+    }
+    val status = when {
+      s1.status == MethodMentionStatus.NOT_PERFORMED || s2.status == MethodMentionStatus.NOT_PERFORMED -> MethodMentionStatus.NOT_PERFORMED
+      s1.status == MethodMentionStatus.PERFORMED && s2.status == MethodMentionStatus.PERFORMED -> MethodMentionStatus.PERFORMED
+      else -> MethodMentionStatus.UNCLEAR
+    }
+    val quote = listOf(s1.supportingQuote, s2.supportingQuote).filter { it.isNotBlank() }.joinToString(" | ").take(240)
+    val counter = listOf(s1.counterEvidenceQuote, s2.counterEvidenceQuote).filter { it.isNotBlank() }.joinToString(" | ").take(240)
+    val sec = listOf(s1.section, s2.section).filter { it.isNotBlank() }.distinct().joinToString("/")
+    return DomainCriterionEvaluation(
+      domainKey = domainKey,
+      label = label,
+      rating = rating,
+      detail = "$baseDetail [${s1.statusNote}; ${s2.statusNote}]",
+      mentionStatus = status,
+      evidenceSection = sec,
+      supportingQuote = quote,
+      counterEvidenceQuote = counter
+    )
+  }
+
   private fun resolveDomain(
     subDesign: AuditSubDesign,
     calibratedDesign: CalibratedStudyDesign,
     l: String,
     abstained: Boolean
   ): AppraisalDomain {
-    // Explicit high-specificity checks for Case-Control, Qualitative, and Prediction Model first
     if (subDesign == AuditSubDesign.CASE_CONTROL || calibratedDesign == CalibratedStudyDesign.CASE_CONTROL) {
       return AppraisalDomain.CASE_CONTROL
     }
@@ -119,19 +278,34 @@ object DomainAppraisalAdapters {
     }
   }
 
-  private fun buildRctRob2(l: String, conf: Double): DomainAppraisalReport {
-    val hasConcealment = l.contains("allocation concealment") || l.contains("central") || l.contains("sealed") || l.contains("iwrs")
-    val hasBlinding = l.contains("double-blind") || l.contains("triple-blind") || l.contains("masked outcome")
-    val hasItt = l.contains("intention-to-treat") || l.contains("intent-to-treat") || Regex("""\bitt\b""").containsMatchIn(l)
-    val hasMissingNote = l.contains("attrition") || l.contains("missing") || l.contains("loss to follow-up")
-    val hasRegistration = Regex("""\b(?:nct\d{6,}|isrctn\d{6,}|registered|protocol)\b""").containsMatchIn(l)
+  private fun buildRctRob2(bodyText: String, conf: Double): DomainAppraisalReport {
+    val concealmentScan = scanCriterion(
+      bodyText,
+      Regex("""(?i)\b(?:allocation\s+concealment|concealed\s+allocation|central\s+(?:web[\s-]?based\s+)?randomiz\w*|sealed\s+(?:opaque\s+)?envelopes?|iwrs|interactive\s+web\s+response)\b""")
+    )
+    val blindingScan = scanCriterion(
+      bodyText,
+      Regex("""(?i)\b(?:double[\s-]?blind\w*|triple[\s-]?blind\w*|masked\s+outcome\s+adjudication|outcome\s+assessors?\s+(?:were\s+)?(?:blinded|masked)|open[\s-]?label|unblinded)\b""")
+    )
+    val ittScan = scanCriterion(
+      bodyText,
+      Regex("""(?i)\b(?:intention[\s-]?to[\s-]?treat|intent[\s-]?to[\s-]?treat|\bitt\b)\b""")
+    )
+    val attritionScan = scanCriterion(
+      bodyText,
+      Regex("""(?i)\b(?:attrition|loss\s+to\s+follow[\s-]?up|missing\s+outcome\s+data|drop[\s-]?out\s+rate|consort\s+flow)\b""")
+    )
+    val registrationScan = scanCriterion(
+      bodyText,
+      Regex("""(?i)\b(?:nct\d{6,}|isrctn\d{6,}|pre[\s-]?regist(?:ered|ration)|trial\s+protocol)\b""")
+    )
 
     val criteria = listOf(
-      DomainCriterionEvaluation("ROB2_D1", "D1: Randomization & Allocation Concealment", if (hasConcealment) DomainCriterionRating.LOW_CONCERN else DomainCriterionRating.SOME_CONCERN, "Random sequence & concealed allocation"),
-      DomainCriterionEvaluation("ROB2_D2", "D2: Deviations from Intended Interventions (ITT & Blinding)", if (hasItt && hasBlinding) DomainCriterionRating.LOW_CONCERN else if (hasItt || hasBlinding) DomainCriterionRating.SOME_CONCERN else DomainCriterionRating.HIGH_CONCERN, "ITT estimand and participant/personnel masking"),
-      DomainCriterionEvaluation("ROB2_D3", "D3: Missing Outcome Data / Attrition", if (hasMissingNote) DomainCriterionRating.LOW_CONCERN else DomainCriterionRating.SOME_CONCERN, "Completeness of outcome follow-up"),
-      DomainCriterionEvaluation("ROB2_D4", "D4: Measurement of Outcome", if (hasBlinding) DomainCriterionRating.LOW_CONCERN else DomainCriterionRating.SOME_CONCERN, "Assessor masking and objective endpoint checks"),
-      DomainCriterionEvaluation("ROB2_D5", "D5: Selection of Reported Result / Pre-registration", if (hasRegistration) DomainCriterionRating.LOW_CONCERN else DomainCriterionRating.SOME_CONCERN, "Trial protocol / primary endpoint registration")
+      buildCriterion("ROB2_D1", "D1: Randomization & Allocation Concealment", concealmentScan, "Random sequence & concealed allocation"),
+      combineDualScans("ROB2_D2", "D2: Deviations from Intended Interventions (ITT & Blinding)", ittScan, blindingScan, "ITT estimand and participant/personnel masking"),
+      buildCriterion("ROB2_D3", "D3: Missing Outcome Data / Attrition", attritionScan, "Completeness of outcome follow-up"),
+      buildCriterion("ROB2_D4", "D4: Measurement of Outcome", blindingScan, "Assessor masking and objective endpoint checks"),
+      buildCriterion("ROB2_D5", "D5: Selection of Reported Result / Pre-registration", registrationScan, "Trial protocol / primary endpoint registration")
     )
     return DomainAppraisalReport(
       domain = AppraisalDomain.RANDOMIZED_TRIAL,
@@ -139,23 +313,43 @@ object DomainAppraisalAdapters {
       classificationConfidence = conf,
       restrictsVerdictDueToUncertainDesign = false,
       rubricCriteria = criteria,
-      domainSummaryNote = "Evaluated with RoB 2 (5 signaling domains); weighted credibility score does NOT substitute for RoB 2 domain judgments."
+      domainSummaryNote = "Evaluated with section-aware RoB 2 (5 signaling domains); weighted credibility score does NOT substitute for RoB 2 domain judgments."
     )
   }
 
-  private fun buildCohortRobinsINos(l: String, conf: Double): DomainAppraisalReport {
-    val hasConfounding = l.contains("adjusted") || l.contains("propensity") || l.contains("inverse probability") || l.contains("multivariable")
-    val hasImmortalGuard = l.contains("time-varying") || l.contains("landmark") || l.contains("target trial")
-    val hasMissing = l.contains("multiple imputation") || l.contains("missing") || l.contains("attrition")
-    val hasOutcomeDef = l.contains("validated") || l.contains("icd") || l.contains("adjudicat")
-    val hasSensitivity = l.contains("e-value") || l.contains("sensitivity analysis") || l.contains("negative control")
+  private fun buildCohortRobinsINos(bodyText: String, conf: Double): DomainAppraisalReport {
+    val confoundingScan = scanCriterion(
+      bodyText,
+      Regex("""(?i)\b(?:multivariable\s+(?:cox|logistic|linear|poisson|regression)?\s*(?:adjusted|model)|propensity[\s-]?(?:score|matched|weighted)|inverse\s+probability\s+(?:of\s+treatment\s+)?weighting|adjusted\s+for\s+(?:age|sex|baseline|confound\w*)|confounder\s+adjustment)\b"""),
+      absenceRating = DomainCriterionRating.HIGH_CONCERN
+    )
+    val immortalScan = scanCriterion(
+      bodyText,
+      Regex("""(?i)\b(?:time[\s-]?varying|landmark\s+analys\w*|target\s+trial|immortal[\s-]?time)\b""")
+    )
+    val exposureClassScan = scanCriterion(
+      bodyText,
+      Regex("""(?i)\b(?:exposure\s+ascertainment|time[\s-]?updated\s+exposure|validated\s+exposure|pharmacy\s+dispens\w*)\b""")
+    )
+    val missingScan = scanCriterion(
+      bodyText,
+      Regex("""(?i)\b(?:multiple\s+imputation|\bmice\b|missing\s+data\s+(?:imputation|sensitivity)|attrition\s+analys\w*)\b""")
+    )
+    val outcomeDefScan = scanCriterion(
+      bodyText,
+      Regex("""(?i)\b(?:validated\s+(?:outcome|endpoint|icd)|icd[\s-]?(?:9|10)|adjudicat(?:ed|ion)\s+endpoint)\b""")
+    )
+    val sensitivityScan = scanCriterion(
+      bodyText,
+      Regex("""(?i)\b(?:e[\s-]?value|sensitivity\s+analys\w*|negative\s+control\s+(?:outcome|exposure))\b""")
+    )
 
     val criteria = listOf(
-      DomainCriterionEvaluation("ROBINS_D1", "Confounding & Baseline Adjustment", if (hasConfounding) DomainCriterionRating.LOW_CONCERN else DomainCriterionRating.HIGH_CONCERN, "DAG / multivariable or propensity control"),
-      DomainCriterionEvaluation("ROBINS_D2", "Selection of Participants & Immortal-Time Bias", if (hasImmortalGuard) DomainCriterionRating.LOW_CONCERN else DomainCriterionRating.SOME_CONCERN, "Time-zero alignment & selection safeguards"),
-      DomainCriterionEvaluation("ROBINS_D3", "Classification of Exposure / Intervention", DomainCriterionRating.SOME_CONCERN, "Non-differential vs differential exposure classification"),
-      DomainCriterionEvaluation("ROBINS_D5", "Missing Data & Attrition Handling", if (hasMissing) DomainCriterionRating.LOW_CONCERN else DomainCriterionRating.SOME_CONCERN, "MICE/IPW vs complete-case sensitivity"),
-      DomainCriterionEvaluation("ROBINS_D6", "Outcome Ascertainment & Unmeasured Confounding Sensitivity", if (hasOutcomeDef && hasSensitivity) DomainCriterionRating.LOW_CONCERN else DomainCriterionRating.SOME_CONCERN, "Objective endpoint validation & E-value/sensitivity")
+      buildCriterion("ROBINS_D1", "Confounding & Baseline Adjustment", confoundingScan, "DAG / multivariable or propensity control"),
+      buildCriterion("ROBINS_D2", "Selection of Participants & Immortal-Time Bias", immortalScan, "Time-zero alignment & selection safeguards"),
+      buildCriterion("ROBINS_D3", "Classification of Exposure / Intervention", exposureClassScan, "Non-differential vs differential exposure classification"),
+      buildCriterion("ROBINS_D5", "Missing Data & Attrition Handling", missingScan, "MICE/IPW vs complete-case sensitivity"),
+      combineDualScans("ROBINS_D6", "Outcome Ascertainment & Unmeasured Confounding Sensitivity", outcomeDefScan, sensitivityScan, "Objective endpoint validation & E-value/sensitivity")
     )
     return DomainAppraisalReport(
       domain = AppraisalDomain.OBSERVATIONAL_COHORT,
@@ -163,23 +357,39 @@ object DomainAppraisalAdapters {
       classificationConfidence = conf,
       restrictsVerdictDueToUncertainDesign = false,
       rubricCriteria = criteria,
-      domainSummaryNote = "Evaluated with ROBINS-I / Newcastle-Ottawa observational cohort domains; weighted score is non-substitutable."
+      domainSummaryNote = "Evaluated with section-aware ROBINS-I / Newcastle-Ottawa observational cohort domains; weighted score is non-substitutable."
     )
   }
 
-  private fun buildCaseControlNos(l: String, conf: Double): DomainAppraisalReport {
-    val hasCaseDef = l.contains("incident") || l.contains("histolog") || l.contains("confirmed case") || l.contains("diagnostic criteria")
-    val hasControlSel = l.contains("population-based") || l.contains("matched control") || l.contains("incidence density")
-    val hasMatching = l.contains("matched") || l.contains("conditional logistic") || l.contains("adjusted")
-    val hasExposureBlind = l.contains("blinded") || l.contains("structured interview") || l.contains("medical record")
-    val hasNonResponse = l.contains("response rate") || l.contains("missing") || l.contains("recall bias")
+  private fun buildCaseControlNos(bodyText: String, conf: Double): DomainAppraisalReport {
+    val caseDefScan = scanCriterion(
+      bodyText,
+      Regex("""(?i)\b(?:incident\s+cases?|histolog\w+\s+confirm\w*|confirmed\s+cases?|diagnostic\s+criteria)\b""")
+    )
+    val controlSelScan = scanCriterion(
+      bodyText,
+      Regex("""(?i)\b(?:population[\s-]?based\s+(?:case[\s-]?control|controls?)|matched\s+controls?|incidence\s+density\s+sampl\w*)\b""")
+    )
+    val matchingScan = scanCriterion(
+      bodyText,
+      Regex("""(?i)\b(?:conditional\s+logistic|matched\s+(?:controls?|by\s+age)|multivariable\s+(?:logistic\s+)?adjusted)\b"""),
+      absenceRating = DomainCriterionRating.HIGH_CONCERN
+    )
+    val exposureBlindScan = scanCriterion(
+      bodyText,
+      Regex("""(?i)\b(?:blinded\s+(?:structured\s+)?interview|structured\s+interview|medical\s+record\s+(?:abstraction|review))\b""")
+    )
+    val nonResponseScan = scanCriterion(
+      bodyText,
+      Regex("""(?i)\b(?:response\s+rate|recall\s+bias|non[\s-]?response)\b""")
+    )
 
     val criteria = listOf(
-      DomainCriterionEvaluation("CC_D1", "Adequacy of Case Definition", if (hasCaseDef) DomainCriterionRating.LOW_CONCERN else DomainCriterionRating.SOME_CONCERN, "Independent validation & incident vs prevalent case clarity"),
-      DomainCriterionEvaluation("CC_D2", "Selection & Representativeness of Controls", if (hasControlSel) DomainCriterionRating.LOW_CONCERN else DomainCriterionRating.SOME_CONCERN, "Same source population / Berkson bias prevention"),
-      DomainCriterionEvaluation("CC_D3", "Comparability & Confounding (Matching / Conditional Model)", if (hasMatching) DomainCriterionRating.LOW_CONCERN else DomainCriterionRating.HIGH_CONCERN, "Matched design paired with conditional logistic or multivariable adjustment"),
-      DomainCriterionEvaluation("CC_D4", "Exposure Ascertainment & Recall Bias Mitigation", if (hasExposureBlind) DomainCriterionRating.LOW_CONCERN else DomainCriterionRating.SOME_CONCERN, "Blinded interview or objective prior records"),
-      DomainCriterionEvaluation("CC_D5", "Same Ascertainment Method & Non-Response Balance", if (hasNonResponse) DomainCriterionRating.LOW_CONCERN else DomainCriterionRating.SOME_CONCERN, "Comparable response/missingness across cases and controls")
+      buildCriterion("CC_D1", "Adequacy of Case Definition", caseDefScan, "Independent validation & incident vs prevalent case clarity"),
+      buildCriterion("CC_D2", "Selection & Representativeness of Controls", controlSelScan, "Same source population / Berkson bias prevention"),
+      buildCriterion("CC_D3", "Comparability & Confounding (Matching / Conditional Model)", matchingScan, "Matched design paired with conditional logistic or multivariable adjustment"),
+      buildCriterion("CC_D4", "Exposure Ascertainment & Recall Bias Mitigation", exposureBlindScan, "Blinded interview or objective prior records"),
+      buildCriterion("CC_D5", "Same Ascertainment Method & Non-Response Balance", nonResponseScan, "Comparable response/missingness across cases and controls")
     )
     return DomainAppraisalReport(
       domain = AppraisalDomain.CASE_CONTROL,
@@ -187,21 +397,34 @@ object DomainAppraisalAdapters {
       classificationConfidence = conf,
       restrictsVerdictDueToUncertainDesign = false,
       rubricCriteria = criteria,
-      domainSummaryNote = "Evaluated with Case-Control Newcastle-Ottawa / ROBINS-I adapter; odds ratios only (absolute risk not directly estimable without base rates)."
+      domainSummaryNote = "Evaluated with section-aware Case-Control Newcastle-Ottawa / ROBINS-I adapter; odds ratios only (absolute risk not directly estimable without base rates)."
     )
   }
 
-  private fun buildDiagnosticQuadas2(l: String, conf: Double): DomainAppraisalReport {
-    val hasConsecutive = l.contains("consecutive") || l.contains("random sample") || l.contains("prospective")
-    val hasIndexBlind = l.contains("blinded") || l.contains("prespecified threshold") || l.contains("pre-specified cutoff")
-    val hasRefStd = l.contains("reference standard") || l.contains("gold standard") || l.contains("rt-pcr") || l.contains("biopsy")
-    val hasFlowTiming = l.contains("all patients received") || l.contains("verification bias") || l.contains("interval between")
+  private fun buildDiagnosticQuadas2(bodyText: String, conf: Double): DomainAppraisalReport {
+    val consecutiveScan = scanCriterion(
+      bodyText,
+      Regex("""(?i)\b(?:consecutive\s+(?:patients?|sample|enrollment)|random\s+sample|prospective\s+(?:diagnostic\s+)?cohort)\b""")
+    )
+    val indexBlindScan = scanCriterion(
+      bodyText,
+      Regex("""(?i)\b(?:blinded\s+interpretation|pre[\s-]?specified\s+(?:threshold|cutoff)|masked\s+to\s+(?:the\s+)?reference)\b""")
+    )
+    val refStdScan = scanCriterion(
+      bodyText,
+      Regex("""(?i)\b(?:reference\s+standard|gold\s+standard|rt[\s-]?pcr|histopatholog\w*\s+biopsy|biopsy)\b"""),
+      absenceRating = DomainCriterionRating.HIGH_CONCERN
+    )
+    val flowTimingScan = scanCriterion(
+      bodyText,
+      Regex("""(?i)\b(?:all\s+patients\s+received|partial\s+verification|verification\s+bias|interval\s+between\s+index)\b""")
+    )
 
     val criteria = listOf(
-      DomainCriterionEvaluation("Q2_D1", "Patient Selection (Consecutive / Avoid Case-Control Spectrum Bias)", if (hasConsecutive) DomainCriterionRating.LOW_CONCERN else DomainCriterionRating.SOME_CONCERN, "Representative clinical spectrum"),
-      DomainCriterionEvaluation("Q2_D2", "Index Test (Blinded Interpretation & Prespecified Threshold)", if (hasIndexBlind) DomainCriterionRating.LOW_CONCERN else DomainCriterionRating.SOME_CONCERN, "Threshold locked prior to reference comparison"),
-      DomainCriterionEvaluation("Q2_D3", "Reference Standard (Accuracy & Independence from Index)", if (hasRefStd) DomainCriterionRating.LOW_CONCERN else DomainCriterionRating.HIGH_CONCERN, "Avoids incorporation bias"),
-      DomainCriterionEvaluation("Q2_D4", "Flow & Timing (Partial Verification & Appropriate Interval)", if (hasFlowTiming) DomainCriterionRating.LOW_CONCERN else DomainCriterionRating.SOME_CONCERN, "All participants verified with consistent reference standard")
+      buildCriterion("Q2_D1", "Patient Selection (Consecutive / Avoid Case-Control Spectrum Bias)", consecutiveScan, "Representative clinical spectrum"),
+      buildCriterion("Q2_D2", "Index Test (Blinded Interpretation & Prespecified Threshold)", indexBlindScan, "Threshold locked prior to reference comparison"),
+      buildCriterion("Q2_D3", "Reference Standard (Accuracy & Independence from Index)", refStdScan, "Avoids incorporation bias"),
+      buildCriterion("Q2_D4", "Flow & Timing (Partial Verification & Appropriate Interval)", flowTimingScan, "All participants verified with consistent reference standard")
     )
     return DomainAppraisalReport(
       domain = AppraisalDomain.DIAGNOSTIC_STUDY,
@@ -209,23 +432,39 @@ object DomainAppraisalAdapters {
       classificationConfidence = conf,
       restrictsVerdictDueToUncertainDesign = false,
       rubricCriteria = criteria,
-      domainSummaryNote = "Evaluated with QUADAS-2 across all 4 diagnostic bias domains."
+      domainSummaryNote = "Evaluated with section-aware QUADAS-2 across all 4 diagnostic bias domains."
     )
   }
 
-  private fun buildSystematicReviewAmstar2Grade(l: String, conf: Double): DomainAppraisalReport {
-    val hasProtocol = l.contains("prospero") || l.contains("crd") || l.contains("protocol")
-    val hasDuplicate = l.contains("two independent") || l.contains("duplicate") || l.contains("kappa")
-    val hasRobTool = l.contains("rob 2") || l.contains("rob-2") || l.contains("robins-i") || l.contains("newcastle-ottawa") || l.contains("quadas")
-    val hasHeterogeneity = l.contains("i2") || l.contains("i²") || l.contains("tau") || l.contains("reml") || l.contains("dersimonian")
-    val hasPubBias = l.contains("egger") || l.contains("funnel") || l.contains("begg") || l.contains("trim-and-fill")
+  private fun buildSystematicReviewAmstar2Grade(bodyText: String, conf: Double): DomainAppraisalReport {
+    val protocolScan = scanCriterion(
+      bodyText,
+      Regex("""(?i)\b(?:prospero|crd\d{6,}|pre[\s-]?registered\s+protocol|review\s+protocol)\b""")
+    )
+    val duplicateScan = scanCriterion(
+      bodyText,
+      Regex("""(?i)\b(?:two\s+independent\s+(?:reviewers?|authors?|extractors?)|duplicate\s+(?:screening|extraction)|cohen'?s?\s+kappa|\bκ\s*=)\b""")
+    )
+    val robToolScan = scanCriterion(
+      bodyText,
+      Regex("""(?i)\b(?:rob[\s-]?2|robins[\s-]?i|newcastle[\s-]?ottawa|quadas[\s-]?2)\b"""),
+      absenceRating = DomainCriterionRating.HIGH_CONCERN
+    )
+    val heterogeneityScan = scanCriterion(
+      bodyText,
+      Regex("""(?i)\b(?:i[²2]\s*=|tau[\s-]?squared|τ²|dersimonian|reml|random[\s-]?effects\s+meta[\s-]?analys\w*|prediction\s+interval)\b""")
+    )
+    val pubBiasScan = scanCriterion(
+      bodyText,
+      Regex("""(?i)\b(?:egger'?s?\s+(?:test|regression)|funnel\s+plot|begg'?s?\s+test|trim[\s-]?and[\s-]?fill)\b""")
+    )
 
     val criteria = listOf(
-      DomainCriterionEvaluation("AMSTAR_PICO_PROTO", "Protocol Registration (PROSPERO) & PICO Clarity", if (hasProtocol) DomainCriterionRating.LOW_CONCERN else DomainCriterionRating.SOME_CONCERN, "Pre-specified review eligibility and methods"),
-      DomainCriterionEvaluation("AMSTAR_DUP", "Duplicate Study Selection & Data Extraction", if (hasDuplicate) DomainCriterionRating.LOW_CONCERN else DomainCriterionRating.SOME_CONCERN, "Dual-reviewer consensus and inter-rater reliability"),
-      DomainCriterionEvaluation("AMSTAR_ROB", "Validated Risk-of-Bias Instrument (Distinct from PRISMA)", if (hasRobTool) DomainCriterionRating.LOW_CONCERN else DomainCriterionRating.HIGH_CONCERN, "RoB 2 / ROBINS-I / NOS / QUADAS-2 appraisal"),
-      DomainCriterionEvaluation("AMSTAR_SYNTH", "Synthesis Model, Heterogeneity (I²/τ²) & Prediction Interval", if (hasHeterogeneity) DomainCriterionRating.LOW_CONCERN else DomainCriterionRating.SOME_CONCERN, "Appropriate random-effects/HKSJ pooling"),
-      DomainCriterionEvaluation("AMSTAR_PUBBIAS", "Publication Bias & Certainty Rating (GRADE)", if (hasPubBias) DomainCriterionRating.LOW_CONCERN else DomainCriterionRating.SOME_CONCERN, "Funnel/Egger investigation and certainty grading")
+      buildCriterion("AMSTAR_PICO_PROTO", "Protocol Registration (PROSPERO) & PICO Clarity", protocolScan, "Pre-specified review eligibility and methods"),
+      buildCriterion("AMSTAR_DUP", "Duplicate Study Selection & Data Extraction", duplicateScan, "Dual-reviewer consensus and inter-rater reliability"),
+      buildCriterion("AMSTAR_ROB", "Validated Risk-of-Bias Instrument (Distinct from PRISMA)", robToolScan, "RoB 2 / ROBINS-I / NOS / QUADAS-2 appraisal"),
+      buildCriterion("AMSTAR_SYNTH", "Synthesis Model, Heterogeneity (I²/τ²) & Prediction Interval", heterogeneityScan, "Appropriate random-effects/HKSJ pooling"),
+      buildCriterion("AMSTAR_PUBBIAS", "Publication Bias & Certainty Rating (GRADE)", pubBiasScan, "Funnel/Egger investigation and certainty grading")
     )
     return DomainAppraisalReport(
       domain = AppraisalDomain.SYSTEMATIC_REVIEW_META_ANALYSIS,
@@ -233,21 +472,34 @@ object DomainAppraisalAdapters {
       classificationConfidence = conf,
       restrictsVerdictDueToUncertainDesign = false,
       rubricCriteria = criteria,
-      domainSummaryNote = "Evaluated with AMSTAR 2 / GRADE synthesis adapter (distinguishing PRISMA reporting from RoB/certainty)."
+      domainSummaryNote = "Evaluated with section-aware AMSTAR 2 / GRADE synthesis adapter (distinguishing PRISMA reporting from RoB/certainty)."
     )
   }
 
-  private fun buildPredictionTripod(l: String, conf: Double): DomainAppraisalReport {
-    val hasCalibration = l.contains("calibration") || l.contains("brier") || l.contains("ece")
-    val hasExternal = l.contains("external validation") || l.contains("temporal validation") || l.contains("out-of-distribution")
-    val hasSplitGuard = l.contains("patient-level") || l.contains("hospital-level") || l.contains("nested cross-validation") || l.contains("grouped")
-    val hasClinicalUtility = l.contains("decision curve") || l.contains("net benefit") || l.contains("pr-auc")
+  private fun buildPredictionTripod(bodyText: String, conf: Double): DomainAppraisalReport {
+    val splitScan = scanCriterion(
+      bodyText,
+      Regex("""(?i)\b(?:patient[\s-]?level\s+split|hospital[\s-]?level|subject[\s-]?level|nested\s+cross[\s-]?validation|groupkfold)\b""")
+    )
+    val calibScan = scanCriterion(
+      bodyText,
+      Regex("""(?i)\b(?:calibration\s+(?:slope|intercept|plot|curve)|brier\s+score|expected\s+calibration\s+error|\bece\b)\b"""),
+      absenceRating = DomainCriterionRating.HIGH_CONCERN
+    )
+    val externalScan = scanCriterion(
+      bodyText,
+      Regex("""(?i)\b(?:external\s+validation|temporal\s+validation|out[\s-]?of[\s-]?distribution\s+validation|independent\s+validation\s+cohort)\b""")
+    )
+    val utilityScan = scanCriterion(
+      bodyText,
+      Regex("""(?i)\b(?:decision\s+curve\s+analys\w*|net\s+benefit|pr[\s-]?auc|precision[\s-]?recall\s+auc)\b""")
+    )
 
     val criteria = listOf(
-      DomainCriterionEvaluation("TRIPOD_PART", "Participants & Leakage-Free Grouping / Splitting", if (hasSplitGuard) DomainCriterionRating.LOW_CONCERN else DomainCriterionRating.SOME_CONCERN, "Patient/site-disjoint splits & in-fold preprocessing"),
-      DomainCriterionEvaluation("TRIPOD_CALIB", "Calibration Slope / Brier / ECE Reporting", if (hasCalibration) DomainCriterionRating.LOW_CONCERN else DomainCriterionRating.HIGH_CONCERN, "Risk probability calibration beyond AUROC"),
-      DomainCriterionEvaluation("TRIPOD_EXT", "External / Temporal Validation", if (hasExternal) DomainCriterionRating.LOW_CONCERN else DomainCriterionRating.SOME_CONCERN, "Out-of-sample generalizability across sites/time"),
-      DomainCriterionEvaluation("TRIPOD_UTIL", "Clinical Net Benefit & Imbalance Metrics", if (hasClinicalUtility) DomainCriterionRating.LOW_CONCERN else DomainCriterionRating.SOME_CONCERN, "Decision-curve analysis / PR-AUC")
+      buildCriterion("TRIPOD_PART", "Participants & Leakage-Free Grouping / Splitting", splitScan, "Patient/site-disjoint splits & in-fold preprocessing"),
+      buildCriterion("TRIPOD_CALIB", "Calibration Slope / Brier / ECE Reporting", calibScan, "Risk probability calibration beyond AUROC"),
+      buildCriterion("TRIPOD_EXT", "External / Temporal Validation", externalScan, "Out-of-sample generalizability across sites/time"),
+      buildCriterion("TRIPOD_UTIL", "Clinical Net Benefit & Imbalance Metrics", utilityScan, "Decision-curve analysis / PR-AUC")
     )
     return DomainAppraisalReport(
       domain = AppraisalDomain.PREDICTION_MODEL,
@@ -255,23 +507,38 @@ object DomainAppraisalAdapters {
       classificationConfidence = conf,
       restrictsVerdictDueToUncertainDesign = false,
       rubricCriteria = criteria,
-      domainSummaryNote = "Evaluated with TRIPOD / PROBAST prediction-model adapter (calibration, leakage, and external validation)."
+      domainSummaryNote = "Evaluated with section-aware TRIPOD / PROBAST prediction-model adapter (calibration, leakage, and external validation)."
     )
   }
 
-  private fun buildQualitativeCaspSrqrCoreq(l: String, conf: Double): DomainAppraisalReport {
-    val hasReflexivity = l.contains("reflexiv") || l.contains("positionality")
-    val hasSaturation = l.contains("saturation") || l.contains("purposive") || l.contains("maximum variation")
-    val hasAuditTrail = l.contains("audit trail") || l.contains("dual-cod") || l.contains("triangulat") || l.contains("member check") || l.contains("inter-coder")
-    val hasFramework = l.contains("coreq") || l.contains("srqr") || l.contains("casp") || l.contains("thematic analysis") || l.contains("grounded theory")
-    val hasEthics = l.contains("ethics") || l.contains("irb") || l.contains("informed consent")
+  private fun buildQualitativeCaspSrqrCoreq(bodyText: String, conf: Double): DomainAppraisalReport {
+    val frameworkScan = scanCriterion(
+      bodyText,
+      Regex("""(?i)\b(?:coreq|srqr|casp|thematic\s+analysis|grounded\s+theory|phenomenolog\w+)\b""")
+    )
+    val reflexivityScan = scanCriterion(
+      bodyText,
+      Regex("""(?i)\b(?:reflexiv\w*|positionality\s+statement)\b""")
+    )
+    val saturationScan = scanCriterion(
+      bodyText,
+      Regex("""(?i)\b(?:thematic\s+saturation|data\s+saturation|purposive\s+sampl\w*|maximum\s+variation)\b""")
+    )
+    val trustScan = scanCriterion(
+      bodyText,
+      Regex("""(?i)\b(?:audit\s+trail|dual[\s-]?cod\w*|triangulat\w*|member\s+check\w*|inter[\s-]?coder)\b""")
+    )
+    val ethicsScan = scanCriterion(
+      bodyText,
+      Regex("""(?i)\b(?:irb\b|ethics\s+(?:approval|committee)|informed\s+consent)\b""")
+    )
 
     val criteria = listOf(
-      DomainCriterionEvaluation("QUAL_DESIGN", "Qualitative Methodology Congruence (CASP/SRQR/COREQ)", if (hasFramework) DomainCriterionRating.LOW_CONCERN else DomainCriterionRating.SOME_CONCERN, "Clear methodological framing (grounded theory, thematic, phenomenology)"),
-      DomainCriterionEvaluation("QUAL_REFLEX", "Researcher Reflexivity & Positionality", if (hasReflexivity) DomainCriterionRating.LOW_CONCERN else DomainCriterionRating.SOME_CONCERN, "Explicit accounting of researcher relationship and assumptions"),
-      DomainCriterionEvaluation("QUAL_SAMP", "Purposive Sampling & Saturation Justification", if (hasSaturation) DomainCriterionRating.LOW_CONCERN else DomainCriterionRating.SOME_CONCERN, "Information power / thematic saturation criteria"),
-      DomainCriterionEvaluation("QUAL_TRUST", "Trustworthiness (Audit Trail, Triangulation, Member Checking)", if (hasAuditTrail) DomainCriterionRating.LOW_CONCERN else DomainCriterionRating.SOME_CONCERN, "Analytical credibility and confirmability"),
-      DomainCriterionEvaluation("QUAL_ETHICS", "Ethical Clarity & Context Transferability", if (hasEthics) DomainCriterionRating.LOW_CONCERN else DomainCriterionRating.SOME_CONCERN, "Consent, confidentiality, and thick context description")
+      buildCriterion("QUAL_DESIGN", "Qualitative Methodology Congruence (CASP/SRQR/COREQ)", frameworkScan, "Clear methodological framing (grounded theory, thematic, phenomenology)"),
+      buildCriterion("QUAL_REFLEX", "Researcher Reflexivity & Positionality", reflexivityScan, "Explicit accounting of researcher relationship and assumptions"),
+      buildCriterion("QUAL_SAMP", "Purposive Sampling & Saturation Justification", saturationScan, "Information power / thematic saturation criteria"),
+      buildCriterion("QUAL_TRUST", "Trustworthiness (Audit Trail, Triangulation, Member Checking)", trustScan, "Analytical credibility and confirmability"),
+      buildCriterion("QUAL_ETHICS", "Ethical Clarity & Context Transferability", ethicsScan, "Consent, confidentiality, and thick context description")
     )
     return DomainAppraisalReport(
       domain = AppraisalDomain.QUALITATIVE_STUDY,
@@ -279,7 +546,7 @@ object DomainAppraisalAdapters {
       classificationConfidence = conf,
       restrictsVerdictDueToUncertainDesign = false,
       rubricCriteria = criteria,
-      domainSummaryNote = "Evaluated with CASP / SRQR / COREQ qualitative appraisal adapter; inapplicable NHST/p-value checks suppressed."
+      domainSummaryNote = "Evaluated with section-aware CASP / SRQR / COREQ qualitative appraisal adapter; inapplicable NHST/p-value checks suppressed."
     )
   }
 }

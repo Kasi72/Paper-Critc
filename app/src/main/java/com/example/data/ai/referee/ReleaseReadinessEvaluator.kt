@@ -2,9 +2,14 @@ package com.example.data.ai.referee
 
 import com.example.data.ai.Reviewer2PipelineService
 import com.example.data.ai.StudyDesignArchetype
-import com.example.data.model.EvidenceAnchor
 import com.example.data.model.FindingStatus
 import com.example.data.model.ReviewFinding
+
+enum class ReleaseValidationState {
+  INTERNAL_INVARIANTS_PASS,
+  EXTERNAL_VALIDATION_PENDING,
+  RELEASE_BLOCKED
+}
 
 data class ReleaseGateCheckResult(
   val gateNumber: Int,
@@ -18,12 +23,20 @@ data class ReleaseReadinessReport(
   val passedCount: Int,
   val totalGates: Int,
   val gates: List<ReleaseGateCheckResult>,
-  val externallyValidated: Boolean = false
+  val externallyValidated: Boolean = false,
+  val validationState: ReleaseValidationState =
+    if (allGatesPassed) ReleaseValidationState.EXTERNAL_VALIDATION_PENDING else ReleaseValidationState.RELEASE_BLOCKED,
+  val statusHeadline: String = when {
+    !allGatesPassed -> "RELEASE BLOCKED — INTERNAL INVARIANT FAILURE"
+    !externallyValidated -> "INTERNAL INVARIANTS PASS — EXTERNAL VALIDATION PENDING"
+    else -> "INTERNALLY AND EXTERNALLY VALIDATED"
+  }
 )
 
 /**
  * Phase 12 Release-Gate Verification Evaluator.
- * Validates all 12 architectural invariants before a release can be signed off.
+ * Validates all 12 architectural invariants and surfaces explicit [ReleaseValidationState]
+ * so internal harness passes are never conflated with external clinical/corpus validation.
  */
 object ReleaseReadinessEvaluator {
 
@@ -192,16 +205,16 @@ object ReleaseReadinessEvaluator {
       )
     )
 
-    // 9. Provenance & tamper-evident audit chain + cleanup hook
-    val hook = InMemoryRemotePayloadCleanupHook()
+    // 9. Provenance & tamper-evident audit chain + local reference cleanup hook
+    val hook = LocalReferenceCleanupHook()
     hook.registerPayloadHandle("h1", 9999999L)
     val cleaned = hook.cleanupAll("gate_check")
     results.add(
       ReleaseGateCheckResult(
         9,
         "Tamper-Evident Audit Chain, Manifest & Cleanup",
-        orchOut.auditLogChainValid && cleaned == 1 && hook.activeHandles().isEmpty(),
-        "Audit chain valid=${orchOut.auditLogChainValid}, cleaned=$cleaned handle(s)."
+        orchOut.auditLogChainValid && !hook.capability.supportsRemoteDeletion && cleaned == 1 && hook.activeHandles().isEmpty(),
+        "Audit chain valid=${orchOut.auditLogChainValid}, supportsRemoteDeletion=${hook.capability.supportsRemoteDeletion}, cleaned=$cleaned handle(s)."
       )
     )
 
@@ -240,12 +253,24 @@ object ReleaseReadinessEvaluator {
       )
     )
 
+    val allPassed = results.all { it.passed }
+    val state = if (allPassed) {
+      ReleaseValidationState.EXTERNAL_VALIDATION_PENDING
+    } else {
+      ReleaseValidationState.RELEASE_BLOCKED
+    }
     return ReleaseReadinessReport(
-      allGatesPassed = results.all { it.passed },
+      allGatesPassed = allPassed,
       passedCount = results.count { it.passed },
       totalGates = results.size,
       gates = results,
-      externallyValidated = false
+      externallyValidated = false,
+      validationState = state,
+      statusHeadline = if (allPassed) {
+        "INTERNAL INVARIANTS PASS — EXTERNAL VALIDATION PENDING"
+      } else {
+        "RELEASE BLOCKED — INTERNAL INVARIANT FAILURE"
+      }
     )
   }
 }

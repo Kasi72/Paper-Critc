@@ -87,6 +87,7 @@ data class SqlReviewCacheEntity(
   val abstentionSummaryJson: String = "",
   val readinessSummaryJson: String = "",
   val auditLogJson: String = "",
+  val auditCommitment: String = "",
   val refereeCoverageJson: String = "",
   val createdAtSeconds: Long = System.currentTimeMillis() / 1000L,
   val createdAtNanos: Int = 0,
@@ -137,6 +138,7 @@ data class SqlReviewCacheEntity(
       abstentionSummaryJson = abstentionSummaryJson,
       readinessSummaryJson = readinessSummaryJson,
       auditLogJson = auditLogJson,
+      auditCommitment = auditCommitment,
       refereeCoverageJson = refereeCoverageJson,
       abstractSummary = abstractSummary,
       researchQuestion = researchQuestion,
@@ -232,6 +234,7 @@ data class SqlReviewCacheEntity(
         abstentionSummaryJson = review.abstentionSummaryJson,
         readinessSummaryJson = review.readinessSummaryJson,
         auditLogJson = review.auditLogJson,
+        auditCommitment = review.auditCommitment,
         refereeCoverageJson = review.refereeCoverageJson,
         createdAtSeconds = review.createdAt?.seconds ?: 0L,
         createdAtNanos = review.createdAt?.nanoseconds ?: 0,
@@ -463,7 +466,7 @@ interface PaperCriticSqlDao {
     SqlChatMessageEntity::class,
     SqlApiProviderEntity::class
   ],
-  version = 10,
+  version = 11,
   exportSchema = false
 )
 abstract class PaperCriticSqlDatabase : RoomDatabase() {
@@ -705,6 +708,17 @@ abstract class PaperCriticSqlDatabase : RoomDatabase() {
       }
     }
 
+    /**
+     * Non-destructive v10 -> v11 upgrade:
+     * - Adds immutable SHA-256 [auditCommitment] column binding the audit log terminal hash to the
+     *   analysis manifest and manuscript digest.
+     */
+    val MIGRATION_10_11 = object : Migration(10, 11) {
+      override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE sql_review_cache ADD COLUMN auditCommitment TEXT NOT NULL DEFAULT ''")
+      }
+    }
+
     fun getDatabase(context: Context): PaperCriticSqlDatabase {
       return INSTANCE ?: synchronized(this) {
         val instance = Room.databaseBuilder(
@@ -719,7 +733,8 @@ abstract class PaperCriticSqlDatabase : RoomDatabase() {
             MIGRATION_6_7,
             MIGRATION_7_8,
             MIGRATION_8_9,
-            MIGRATION_9_10
+            MIGRATION_9_10,
+            MIGRATION_10_11
           )
           .build()
         INSTANCE = instance

@@ -535,15 +535,15 @@ class ReviewRepository(
   companion object {
     private val POST_PUB_VERDICTS = setOf(
       "HIGH_CREDIBILITY", "SOUND_WITH_CAVEATS", "REQUIRES_CORRECTION", "MAJOR_CONCERNS", "LOW_CREDIBILITY",
-      "INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT", "PROVISIONAL_APPRAISAL_DESIGN_UNCERTAIN"
+      "INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT", "PROVISIONAL_APPRAISAL", "PROVISIONAL_APPRAISAL_DESIGN_UNCERTAIN"
     )
     private val JOURNAL_VERDICTS = setOf(
       "ACCEPT", "MINOR_REVISION", "MINOR_REVISION_WITH_CAVEATS", "MAJOR_REVISION", "REJECT_AND_RESUBMIT", "REJECT",
-      "INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT", "PROVISIONAL_APPRAISAL_DESIGN_UNCERTAIN"
+      "INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT", "PROVISIONAL_APPRAISAL", "PROVISIONAL_APPRAISAL_DESIGN_UNCERTAIN"
     )
     private val CLINICAL_VERDICTS = setOf(
       "HIGH_CERTAINTY", "MODERATE_CERTAINTY", "LOW_CERTAINTY", "VERY_LOW_CERTAINTY",
-      "INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT", "PROVISIONAL_APPRAISAL_DESIGN_UNCERTAIN"
+      "INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT", "PROVISIONAL_APPRAISAL", "PROVISIONAL_APPRAISAL_DESIGN_UNCERTAIN"
     )
 
     private val ALLOWED_VALIDATION_STATUSES = setOf(
@@ -653,6 +653,9 @@ class ReviewRepository(
       if (upper in allowedVerdictsForMode(mode)) return upper
       if (upper.contains("PROVISIONAL") && upper.contains("UNCERTAIN")) {
         return "PROVISIONAL_APPRAISAL_DESIGN_UNCERTAIN"
+      }
+      if (upper.contains("PROVISIONAL")) {
+        return "PROVISIONAL_APPRAISAL"
       }
       if (upper.contains("INSUFFICIENT_EVIDENCE")) {
         return "INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT"
@@ -777,6 +780,9 @@ class ReviewRepository(
       }
       if (review.auditLogJson.isNotBlank()) {
         basePayload["auditLogJson"] = review.auditLogJson.trim().take(24000)
+      }
+      if (review.auditCommitment.isNotBlank()) {
+        basePayload["auditCommitment"] = review.auditCommitment.trim().take(128)
       }
       if (review.refereeCoverageJson.isNotBlank()) {
         basePayload["refereeCoverageJson"] = review.refereeCoverageJson.trim().take(4000)

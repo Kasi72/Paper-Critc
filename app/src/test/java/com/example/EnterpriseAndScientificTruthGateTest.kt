@@ -1020,13 +1020,23 @@ class EnterpriseAndScientificTruthGateTest {
     )
     assertFalse("10-page scanned PDF with only 5 attached images must be blocked", partialGate.isReady)
 
+    val unboundGate = Reviewer2PipelineService.evaluateDocumentReadinessGate(
+      manuscriptText = "PDF MANUSCRIPT (SCANNED / IMAGE-BASED): ten_page_scan.pdf",
+      coverageReport = scanned10Coverage.copy(visionPagesAttached = 10),
+      attachedBitmapCount = 10,
+      useExternalTextOnlyProvider = false,
+      pdfVisionDigestSha256 = ""
+    )
+    assertFalse("10-page scanned PDF without bound vision digest must be blocked", unboundGate.isReady)
+
     val fullGate = Reviewer2PipelineService.evaluateDocumentReadinessGate(
       manuscriptText = "PDF MANUSCRIPT (SCANNED / IMAGE-BASED): ten_page_scan.pdf",
       coverageReport = scanned10Coverage.copy(visionPagesAttached = 10),
       attachedBitmapCount = 10,
-      useExternalTextOnlyProvider = false
+      useExternalTextOnlyProvider = false,
+      pdfVisionDigestSha256 = "vis-digest-10pages"
     )
-    assertTrue("10-page scanned PDF with all 10 page images attached passes multimodal readiness gate", fullGate.isReady)
+    assertTrue("10-page scanned PDF with all 10 page images attached and bound digest passes multimodal readiness gate", fullGate.isReady)
   }
 
   @Test
@@ -1964,14 +1974,15 @@ class EnterpriseAndScientificTruthGateTest {
         rawDb.close()
       }
 
-      // 2. Open with Room at v10 running real MIGRATION_5_6 -> ... -> MIGRATION_9_10
+      // 2. Open with Room at v11 running real MIGRATION_5_6 -> ... -> MIGRATION_10_11
       migratedDb = Room.databaseBuilder(context, PaperCriticSqlDatabase::class.java, dbName)
         .addMigrations(
           PaperCriticSqlDatabase.MIGRATION_5_6,
           PaperCriticSqlDatabase.MIGRATION_6_7,
           PaperCriticSqlDatabase.MIGRATION_7_8,
           PaperCriticSqlDatabase.MIGRATION_8_9,
-          PaperCriticSqlDatabase.MIGRATION_9_10
+          PaperCriticSqlDatabase.MIGRATION_9_10,
+          PaperCriticSqlDatabase.MIGRATION_10_11
         )
         .allowMainThreadQueries()
         .build()

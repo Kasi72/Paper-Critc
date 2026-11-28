@@ -168,7 +168,7 @@ data class AnalysisManifest(
     obj.put("providerRoute", providerRoute)
     obj.put("modelId", modelId)
     val fb = JSONArray()
-    fallbackHistory.forEach { fb.put(it) }
+    fallbackHistory.take(16).forEach { fb.put(it.take(160)) }
     obj.put("fallbackHistory", fb)
     obj.put("promptVersion", promptVersion)
     obj.put("rulesetVersion", rulesetVersion)
@@ -195,7 +195,7 @@ data class AnalysisManifest(
           modelId = o.optString("modelId", ""),
           fallbackHistory = buildList {
             if (fbArr != null) {
-              for (i in 0 until fbArr.length()) {
+              for (i in 0 until minOf(fbArr.length(), 16)) {
                 fbArr.optString(i).takeIf { it.isNotBlank() }?.let { add(it) }
               }
             }
@@ -213,6 +213,27 @@ data class AnalysisManifest(
   }
 }
 
+enum class AuditLogVerificationStatus(val displayLabel: String) {
+  VERIFIED("Cryptographically Committed (9 Stages)"),
+  LOCAL_CHAIN_ONLY("Local Hash Chain Only (No Immutable Commitment)"),
+  MISSING_COMMITMENT("Commitment Mismatch / Incomplete"),
+  NOT_AVAILABLE("Audit Log Not Available"),
+  TAMPERED("Audit Chain Tampered / Invalid")
+}
+
+data class AuditLogVerificationResult(
+  val status: AuditLogVerificationStatus,
+  val entryCount: Int,
+  val terminalHash: String,
+  val detail: String
+) {
+  val isChainIntact: Boolean
+    get() = status == AuditLogVerificationStatus.VERIFIED || status == AuditLogVerificationStatus.LOCAL_CHAIN_ONLY
+
+  val isCommittedAndVerified: Boolean
+    get() = status == AuditLogVerificationStatus.VERIFIED
+}
+
 data class AuditLogEntry(
   val sequence: Int,
   val stageCode: String,
@@ -226,6 +247,7 @@ data class AuditLogEntry(
 
 /**
  * Phase 9 tamper-evident SHA-256 hash-chained audit trail.
+ * Empty audit logs NEVER report valid/verified; they report [AuditLogVerificationStatus.NOT_AVAILABLE].
  */
 class TamperEvidentAuditLog {
   private val records = mutableListOf<AuditLogEntry>()
@@ -268,7 +290,7 @@ class TamperEvidentAuditLog {
 
   fun toJson(): String {
     val arr = JSONArray()
-    records.forEach { e ->
+    records.take(64).forEach { e ->
       val o = JSONObject()
       o.put("sequence", e.sequence)
       o.put("stageCode", e.stageCode)
@@ -299,8 +321,15 @@ class TamperEvidentAuditLog {
       timestampMs: Long
     ): String = sha256Hex("$sequence|$stageCode|$eventType|$payloadSummary|$payloadSha256|$previousEntryHash|$timestampMs")
 
+    fun computeCommitmentHash(
+      terminalHash: String,
+      analysisId: String,
+      manuscriptSha256: String,
+      stageCount: Int
+    ): String = sha256Hex("COMMIT_V1|$terminalHash|$analysisId|$manuscriptSha256|$stageCount")
+
     fun verifyChain(entries: List<AuditLogEntry>): Boolean {
-      if (entries.isEmpty()) return true
+      if (entries.isEmpty()) return false
       var expectedPrev = "GENESIS"
       entries.forEachIndexed { idx, entry ->
         if (entry.sequence != idx) return false
@@ -320,6 +349,110 @@ class TamperEvidentAuditLog {
         expectedPrev = entry.entryHash
       }
       return true
+    }
+
+    fun verifyAuditLog(
+      auditLogJson: String,
+      commitment: String = "",
+      expectedAnalysisId: String = "",
+      expectedManuscriptSha256: String = "",
+      expectedStageCount: Int = 9
+    ): AuditLogVerificationResult {
+      val trimmed = auditLogJson.trim()
+      if (trimmed.isBlank()) {
+        return AuditLogVerificationResult(
+          status = AuditLogVerificationStatus.NOT_AVAILABLE,
+          entryCount = 0,
+          terminalHash = "",
+          detail = "Audit log payload absent."
+        )
+      }
+      val entries = runCatching {
+        val arr = JSONArray(trimmed)
+        buildList {
+          for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: return AuditLogVerificationResult(
+              status = AuditLogVerificationStatus.TAMPERED,
+              entryCount = i,
+              terminalHash = "",
+              detail = "Malformed audit entry at index $i."
+            )
+            add(
+              AuditLogEntry(
+                sequence = o.optInt("sequence", i),
+                stageCode = o.optString("stageCode", ""),
+                eventType = o.optString("eventType", ""),
+                payloadSummary = o.optString("payloadSummary", ""),
+                payloadSha256 = o.optString("payloadSha256", ""),
+                previousEntryHash = o.optString("previousEntryHash", ""),
+                entryHash = o.optString("entryHash", ""),
+                timestampMs = o.optLong("timestampMs", 0L)
+              )
+            )
+          }
+        }
+      }.getOrElse {
+        return AuditLogVerificationResult(
+          status = AuditLogVerificationStatus.TAMPERED,
+          entryCount = 0,
+          terminalHash = "",
+          detail = "Unparseable audit log JSON."
+        )
+      }
+      if (entries.isEmpty()) {
+        return AuditLogVerificationResult(
+          status = AuditLogVerificationStatus.NOT_AVAILABLE,
+          entryCount = 0,
+          terminalHash = "",
+          detail = "Audit log contains zero entries."
+        )
+      }
+      if (!verifyChain(entries)) {
+        return AuditLogVerificationResult(
+          status = AuditLogVerificationStatus.TAMPERED,
+          entryCount = entries.size,
+          terminalHash = entries.last().entryHash,
+          detail = "SHA-256 hash chain verification failed."
+        )
+      }
+      val terminalHash = entries.last().entryHash
+      if (commitment.isBlank()) {
+        return AuditLogVerificationResult(
+          status = AuditLogVerificationStatus.LOCAL_CHAIN_ONLY,
+          entryCount = entries.size,
+          terminalHash = terminalHash,
+          detail = "Local SHA-256 chain intact (${entries.size} entries), but no immutable server commitment is recorded."
+        )
+      }
+      if (expectedAnalysisId.isBlank() || expectedManuscriptSha256.isBlank() || entries.size != expectedStageCount) {
+        return AuditLogVerificationResult(
+          status = AuditLogVerificationStatus.MISSING_COMMITMENT,
+          entryCount = entries.size,
+          terminalHash = terminalHash,
+          detail = "Cannot verify commitment without manifest IDs and full $expectedStageCount stages (found ${entries.size})."
+        )
+      }
+      val expectedCommitment = computeCommitmentHash(
+        terminalHash = terminalHash,
+        analysisId = expectedAnalysisId,
+        manuscriptSha256 = expectedManuscriptSha256,
+        stageCount = entries.size
+      )
+      return if (expectedCommitment == commitment.trim()) {
+        AuditLogVerificationResult(
+          status = AuditLogVerificationStatus.VERIFIED,
+          entryCount = entries.size,
+          terminalHash = terminalHash,
+          detail = "SHA-256 chain and immutable commitment verified across ${entries.size} stages."
+        )
+      } else {
+        AuditLogVerificationResult(
+          status = AuditLogVerificationStatus.TAMPERED,
+          entryCount = entries.size,
+          terminalHash = terminalHash,
+          detail = "Audit log terminal hash / stage count disagrees with persisted immutable commitment."
+        )
+      }
     }
 
     fun fromJson(raw: String): List<AuditLogEntry> {
@@ -348,16 +481,32 @@ class TamperEvidentAuditLog {
   }
 }
 
+data class ProviderRetentionCapability(
+  val supportsRemoteDeletion: Boolean = false,
+  val retentionDisclosure: String =
+    "Local reference tracking only (supportsRemoteDeletion=false). Remote inference providers manage payload retention according to their own API policy."
+)
+
 /**
- * Phase 9 temporary remote payload cleanup contract.
+ * Phase 9 temporary payload reference cleanup contract.
+ * Implementations MUST accurately disclose via [capability] whether remote provider deletion exists.
  */
 interface RemotePayloadCleanupHook {
+  val capability: ProviderRetentionCapability
+    get() = ProviderRetentionCapability(supportsRemoteDeletion = false)
+
   fun registerPayloadHandle(handleId: String, expiresAtMs: Long)
   fun cleanupAll(reason: String): Int
   fun activeHandles(): List<String>
 }
 
-class InMemoryRemotePayloadCleanupHook : RemotePayloadCleanupHook {
+/**
+ * Client-side local payload reference tracker. Clears in-memory references/handles created during
+ * pipeline execution; does NOT delete payloads stored remotely by external LLM APIs.
+ */
+class LocalReferenceCleanupHook(
+  override val capability: ProviderRetentionCapability = ProviderRetentionCapability(supportsRemoteDeletion = false)
+) : RemotePayloadCleanupHook {
   private val handles = linkedMapOf<String, Long>()
   private val cleanupHistory = mutableListOf<String>()
 
@@ -372,12 +521,15 @@ class InMemoryRemotePayloadCleanupHook : RemotePayloadCleanupHook {
   override fun cleanupAll(reason: String): Int {
     val count = handles.size
     handles.clear()
-    cleanupHistory.add("$reason:$count")
+    cleanupHistory.add("$reason:$count (localReferencesClearedOnly)")
     return count
   }
 
   @Synchronized
   override fun activeHandles(): List<String> = handles.keys.toList()
+
+  @Synchronized
+  fun cleanupHistory(): List<String> = cleanupHistory.toList()
 }
 
 data class RefereeCoverageMetrics(
@@ -508,6 +660,7 @@ data class RefereeAdjudicationOutput(
   val auditLogEntries: List<AuditLogEntry>,
   val auditLogJson: String,
   val auditLogChainValid: Boolean,
+  val auditCommitment: String = "",
   val coverageMetrics: RefereeCoverageMetrics,
   val neverVerifiedReasons: List<String>
 )
@@ -552,12 +705,16 @@ object AbstentionGate {
       )
     }
 
-    if (!input.readiness.extractionQualityAcceptable || input.extractionConfidence < 4) {
+    if (!input.readiness.extractionQualityAcceptable || input.extractionConfidence < 4 || !input.readiness.searchableTextExists) {
       reasons.add(
         AbstentionReason(
           trigger = AbstentionTrigger.POOR_OCR_OR_EXTRACTION,
-          whatIsMissing = "High-fidelity searchable text extraction (confidence=${input.extractionConfidence}/5).",
-          whyItMatters = "Low OCR quality introduces character corruption and silent misreading of decimal signs/CIs.",
+          whatIsMissing = if (!input.readiness.searchableTextExists) {
+            "Searchable text layer (scanned/image-only input; confidence=${input.extractionConfidence}/5)."
+          } else {
+            "High-fidelity searchable text extraction (confidence=${input.extractionConfidence}/5)."
+          },
+          whyItMatters = "Low OCR quality or missing text layer introduces character corruption and prevents exact quote verification.",
           blockedConclusion = "Verified quantitative and methodological verdict blocked.",
           nextStepsForUser = listOf("Provide a native text-searchable PDF, Word (.docx), or clean OCR transcript.")
         )
@@ -623,14 +780,27 @@ object AbstentionGate {
       )
     }
 
-    if (input.omittedPages.isNotEmpty() || input.extractionCapApplied || input.claimCapApplied || input.claimsSkipped > 0) {
+    val materialSupplementOrCoverageGap = input.omittedPages.isNotEmpty() ||
+      input.extractionCapApplied ||
+      input.claimCapApplied ||
+      input.claimsSkipped > 0 ||
+      input.readiness.supplementStatus == SupplementStatus.ABSENT ||
+      !input.readiness.referencesSeparated ||
+      input.readiness.lowTextPageCount > 0
+    if (materialSupplementOrCoverageGap) {
       reasons.add(
         AbstentionReason(
           trigger = AbstentionTrigger.CAPPED_MANUSCRIPT_COVERAGE,
-          whatIsMissing = "Full manuscript or claim coverage (${input.omittedPages.size} omitted pages, ${input.claimsSkipped} skipped claims).",
-          whyItMatters = "Truncated pages or capped claim extraction can hide primary limitations or errata.",
+          whatIsMissing = buildList {
+            if (input.omittedPages.isNotEmpty()) add("${input.omittedPages.size} omitted pages")
+            if (input.claimsSkipped > 0 || input.claimCapApplied) add("${input.claimsSkipped} skipped claims")
+            if (input.readiness.supplementStatus == SupplementStatus.ABSENT) add("referenced supplementary material absent")
+            if (!input.readiness.referencesSeparated) add("references boundary unclear")
+            if (input.readiness.lowTextPageCount > 0) add("${input.readiness.lowTextPageCount} sparse/low-text pages")
+          }.joinToString(", ").ifBlank { "Full manuscript coverage" },
+          whyItMatters = "Truncated pages, absent supplements, or unseparated references can hide primary limitations, errata, or sensitivity models.",
           blockedConclusion = "Claim of a complete verified audit is blocked.",
-          nextStepsForUser = listOf("Analyze omitted pages/sections separately or reduce prompt constraints.")
+          nextStepsForUser = listOf("Supply complete manuscript, attachments/supplements, or inspect omitted sections separately.")
         )
       )
     }

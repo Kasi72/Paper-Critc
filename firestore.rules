@@ -11,10 +11,28 @@ service cloud.firestore {
     }
 
     function isValidId(id) {
-      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+      return id is string && id.matches('^[a-zA-Z0-9_\\-]{1,128}$');
     }
 
-    function hasAllowedReviewKeys(d) {
+    function isValidV4RubricAndMode(d) {
+      return (d.reviewMode + ':' + d.verdict).matches('^(POST_PUBLICATION_APPRAISAL:(HIGH_CREDIBILITY|SOUND_WITH_CAVEATS|REQUIRES_CORRECTION|MAJOR_CONCERNS|LOW_CREDIBILITY)|JOURNAL_REFEREE:(ACCEPT|MINOR_REVISION(_WITH_CAVEATS)?|MAJOR_REVISION|REJECT(_AND_RESUBMIT)?)|CLINICAL_EVIDENCE_APPRAISAL:(HIGH|MODERATE|LOW|VERY_LOW)_CERTAINTY|(POST_PUBLICATION_APPRAISAL|JOURNAL_REFEREE|CLINICAL_EVIDENCE_APPRAISAL):(INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT|PROVISIONAL_APPRAISAL(_DESIGN_UNCERTAIN)?))$') &&
+             ((d.verdict == 'INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT' && d.credibilityScore == 0 &&
+               d.methodologyScore == 0 && d.significanceScore == 0 && d.clarityScore == 0 &&
+               d.originalityScore == 0 && d.mathRigorScore == 0 && d.reproducibilityScore == 0) ||
+              (d.methodologyScore is int && d.methodologyScore >= 1 && d.methodologyScore <= 10 &&
+               d.significanceScore is int && d.significanceScore >= 1 && d.significanceScore <= 10 &&
+               d.clarityScore is int && d.clarityScore >= 1 && d.clarityScore <= 10 &&
+               d.originalityScore is int && d.originalityScore >= 1 && d.originalityScore <= 10 &&
+               d.mathRigorScore is int && d.mathRigorScore >= 1 && d.mathRigorScore <= 10 &&
+               d.reproducibilityScore is int && d.reproducibilityScore >= 1 && d.reproducibilityScore <= 10 &&
+               d.credibilityScore == int((d.methodologyScore * 25 + d.significanceScore * 20 + d.clarityScore * 15 + d.originalityScore * 15 + d.mathRigorScore * 15 + d.reproducibilityScore * 10 + 5) / 10))) &&
+             (!('refereeDecision' in d) ||
+              ((d.refereeDecision + ':' + d.verdict).matches('^((VERIFIED_NO_MAJOR_CONCERNS|VERIFIED_WITH_MINOR_CONCERNS):.+|(INSUFFICIENT_EVIDENCE|OUT_OF_SCOPE):INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT|PROVISIONAL_APPRAISAL:PROVISIONAL_APPRAISAL(_DESIGN_UNCERTAIN)?|(MATERIAL_CONCERNS|MAJOR_UNRESOLVED_CONCERNS):.+)$') &&
+               !(d.refereeDecision in ['MATERIAL_CONCERNS', 'MAJOR_UNRESOLVED_CONCERNS'] && d.verdict in ['ACCEPT', 'HIGH_CREDIBILITY', 'HIGH_CERTAINTY'])));
+    }
+
+    function isValidFullReview(userId) {
+      let d = request.resource.data;
       return d.keys().hasOnly([
         'userId', 'title', 'authors', 'publicationYear', 'venueOrCitation',
         'isEmpirical', 'credibilityScore', 'verdict',
@@ -27,115 +45,77 @@ service cloud.firestore {
         'schemaVersion', 'findingsChunkCount', 'findingsChecksum',
         'narrativeChunkCount', 'narrativeChecksum',
         'refereeDecision', 'analysisManifestJson', 'abstentionSummaryJson',
-        'readinessSummaryJson', 'auditLogJson', 'refereeCoverageJson',
+        'readinessSummaryJson', 'auditLogJson', 'auditCommitment', 'refereeCoverageJson',
         'abstractSummary', 'researchQuestion', 'keyMethodology', 'coreContributions',
         'redTeamCritique', 'blueTeamVerification', 'mathAuditReport',
         'codeAuditReport', 'editorNote', 'copyeditSuggestions',
         'reviewerQuestions', 'formattedDossier', 'bookmarked',
         'personalNotes', 'createdAt', 'updatedAt'
-      ]);
+      ]) &&
+      d.userId == userId &&
+      d.title is string && d.title != '' && d.title.size() <= 500 &&
+      d.authors is string && d.authors != '' && d.authors.size() <= 500 &&
+      d.publicationYear is string &&
+      d.venueOrCitation is string &&
+      d.isEmpirical is bool &&
+      d.credibilityScore is int && d.credibilityScore >= 0 && d.credibilityScore <= 100 &&
+      (('reviewMode' in d)
+        ? isValidV4RubricAndMode(d)
+        : (!d.keys().hasAny(['methodologyScore', 'significanceScore', 'clarityScore', 'originalityScore', 'mathRigorScore', 'reproducibilityScore']) &&
+           d.verdict.matches('^(ACCEPT|MINOR_REVISION|MAJOR_REVISION|REJECT_AND_RESUBMIT|REJECT)$'))) &&
+      d.abstractSummary is string && d.abstractSummary.size() <= 5000 &&
+      d.researchQuestion is string &&
+      d.keyMethodology is string &&
+      d.coreContributions is string &&
+      d.redTeamCritique is string &&
+      d.blueTeamVerification is string &&
+      d.mathAuditReport is string &&
+      d.codeAuditReport is string &&
+      d.editorNote is string &&
+      d.copyeditSuggestions is string &&
+      d.reviewerQuestions is string &&
+      d.formattedDossier is string && d.formattedDossier != '' && d.formattedDossier.size() <= 40000 &&
+      d.bookmarked is bool &&
+      d.personalNotes is string && d.personalNotes.size() <= 5000 &&
+      d.createdAt is timestamp && d.createdAt <= request.time &&
+      d.updatedAt is timestamp && d.updatedAt <= request.time &&
+      (!('methodologyJustification' in d) || d.methodologyJustification is string) &&
+      (!('significanceJustification' in d) || d.significanceJustification is string) &&
+      (!('clarityJustification' in d) || d.clarityJustification is string) &&
+      (!('originalityJustification' in d) || d.originalityJustification is string) &&
+      (!('mathRigorJustification' in d) || d.mathRigorJustification is string) &&
+      (!('reproducibilityJustification' in d) || d.reproducibilityJustification is string) &&
+      (!('refereeConfidence' in d) || (d.refereeConfidence is int && d.refereeConfidence >= 1 && d.refereeConfidence <= 5)) &&
+      (!('extractionConfidence' in d) || (d.extractionConfidence is int && d.extractionConfidence >= 1 && d.extractionConfidence <= 5)) &&
+      (!('coverageDisclosure' in d) || (d.coverageDisclosure is string && d.coverageDisclosure.size() <= 2000)) &&
+      (!('validationStatus' in d) || d.validationStatus.matches('^(VERIFIED|ADJUDICATED_WITH_CAVEATS|PARTIALLY_VALIDATED|PROVISIONAL|UNVERIFIED|LEGACY_UNVALIDATED|REQUIRES_REANALYSIS)$')) &&
+      (!('structuredFindingsJson' in d) || (d.structuredFindingsJson.size() <= 60000 && (d.structuredFindingsJson == '' || d.structuredFindingsJson.matches('(?s)^\\[.*\\]$')))) &&
+      (!('schemaVersion' in d) || (d.schemaVersion is int && d.schemaVersion >= 1 && d.schemaVersion <= 20)) &&
+      (!('findingsChunkCount' in d) || (d.findingsChunkCount is int && d.findingsChunkCount >= 0 && d.findingsChunkCount <= 64)) &&
+      (!('narrativeChunkCount' in d) || (d.narrativeChunkCount is int && d.narrativeChunkCount >= 0 && d.narrativeChunkCount <= 64)) &&
+      (!('findingsChecksum' in d) || (d.findingsChecksum is string && d.findingsChecksum.size() <= 128)) &&
+      (!('narrativeChecksum' in d) || (d.narrativeChecksum is string && d.narrativeChecksum.size() <= 128)) &&
+      (!('auditCommitment' in d) || (d.auditCommitment is string && d.auditCommitment.size() <= 128)) &&
+      (!('analysisManifestJson' in d) || (d.analysisManifestJson.size() <= 8000 && d.analysisManifestJson.matches('(?s)^\\{.*\\}$'))) &&
+      (!('abstentionSummaryJson' in d) || (d.abstentionSummaryJson.size() <= 8000 && d.abstentionSummaryJson.matches('(?s)^\\{.*\\}$'))) &&
+      (!('readinessSummaryJson' in d) || (d.readinessSummaryJson.size() <= 6000 && d.readinessSummaryJson.matches('(?s)^\\{.*\\}$'))) &&
+      (!('auditLogJson' in d) || (d.auditLogJson.size() <= 24000 && d.auditLogJson.matches('(?s)^\\[.*\\]$'))) &&
+      (!('refereeCoverageJson' in d) || (d.refereeCoverageJson.size() <= 4000 && d.refereeCoverageJson.matches('(?s)^\\{.*\\}$')));
     }
 
-    function isModeAlignedVerdict(mode, verdict) {
-      return (mode == 'POST_PUBLICATION_APPRAISAL' && verdict in ['HIGH_CREDIBILITY', 'SOUND_WITH_CAVEATS', 'REQUIRES_CORRECTION', 'MAJOR_CONCERNS', 'LOW_CREDIBILITY', 'INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT', 'PROVISIONAL_APPRAISAL_DESIGN_UNCERTAIN']) ||
-             (mode == 'JOURNAL_REFEREE' && verdict in ['ACCEPT', 'MINOR_REVISION', 'MINOR_REVISION_WITH_CAVEATS', 'MAJOR_REVISION', 'REJECT_AND_RESUBMIT', 'REJECT', 'INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT', 'PROVISIONAL_APPRAISAL_DESIGN_UNCERTAIN']) ||
-             (mode == 'CLINICAL_EVIDENCE_APPRAISAL' && verdict in ['HIGH_CERTAINTY', 'MODERATE_CERTAINTY', 'LOW_CERTAINTY', 'VERY_LOW_CERTAINTY', 'INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT', 'PROVISIONAL_APPRAISAL_DESIGN_UNCERTAIN']);
-    }
-
-    function isLegacyReviewSchema(d) {
-      return !d.keys().hasAny([
-               'methodologyScore', 'significanceScore', 'clarityScore',
-               'originalityScore', 'mathRigorScore', 'reproducibilityScore'
-             ]) &&
-             d.verdict in ['ACCEPT', 'MINOR_REVISION', 'MAJOR_REVISION', 'REJECT_AND_RESUBMIT', 'REJECT'];
-    }
-
-    function isV4RubricConsistent(d) {
-      let m = d.methodologyScore;
-      let s = d.significanceScore;
-      let c = d.clarityScore;
-      let o = d.originalityScore;
-      let r = d.mathRigorScore;
-      let p = d.reproducibilityScore;
-      return (d.verdict == 'INSUFFICIENT_EVIDENCE_FOR_ASSESSMENT' &&
-              d.credibilityScore == 0 &&
-              m == 0 && s == 0 && c == 0 && o == 0 && r == 0 && p == 0) ||
-             (m is int && m >= 1 && m <= 10 &&
-              s is int && s >= 1 && s <= 10 &&
-              c is int && c >= 1 && c <= 10 &&
-              o is int && o >= 1 && o <= 10 &&
-              r is int && r >= 1 && r <= 10 &&
-              p is int && p >= 1 && p <= 10 &&
-              d.credibilityScore == int((m * 25 + s * 20 + c * 15 + o * 15 + r * 15 + p * 10 + 5) / 10));
-    }
-
-    function isValidCoreReview(d) {
-      return d.userId == request.auth.uid &&
-             d.title is string && d.title != '' && d.title.size() <= 500 &&
-             d.authors is string && d.authors != '' && d.authors.size() <= 500 &&
-             d.publicationYear is string && d.publicationYear.size() <= 40 &&
-             d.venueOrCitation is string && d.venueOrCitation.size() <= 500 &&
-             d.isEmpirical is bool &&
-             d.credibilityScore is int && d.credibilityScore >= 0 && d.credibilityScore <= 100 &&
-             (('reviewMode' in d)
-               ? (isModeAlignedVerdict(d.reviewMode, d.verdict) && isV4RubricConsistent(d))
-               : isLegacyReviewSchema(d)) &&
-             d.abstractSummary is string &&
-             d.researchQuestion is string &&
-             d.keyMethodology is string &&
-             d.coreContributions is string &&
-             d.redTeamCritique is string &&
-             d.blueTeamVerification is string &&
-             d.mathAuditReport is string &&
-             d.codeAuditReport is string &&
-             d.editorNote is string &&
-             d.copyeditSuggestions is string &&
-             d.reviewerQuestions is string &&
-             d.formattedDossier is string && d.formattedDossier != '' && d.formattedDossier.size() <= 40000 &&
-             d.bookmarked is bool &&
-             d.personalNotes is string && d.personalNotes.size() <= 5000 &&
-             d.createdAt is timestamp && d.createdAt <= request.time &&
-             d.updatedAt is timestamp && d.updatedAt <= request.time;
-    }
-
-    function isValidJustifications(d) {
-      return (!('methodologyJustification' in d) || d.methodologyJustification is string) &&
-             (!('significanceJustification' in d) || d.significanceJustification is string) &&
-             (!('clarityJustification' in d) || d.clarityJustification is string) &&
-             (!('originalityJustification' in d) || d.originalityJustification is string) &&
-             (!('mathRigorJustification' in d) || d.mathRigorJustification is string) &&
-             (!('reproducibilityJustification' in d) || d.reproducibilityJustification is string);
-    }
-
-    function isValidAuditMetaCore(d) {
-      return (!('refereeConfidence' in d) || (d.refereeConfidence is int && d.refereeConfidence >= 1 && d.refereeConfidence <= 5)) &&
-             (!('extractionConfidence' in d) || (d.extractionConfidence is int && d.extractionConfidence >= 1 && d.extractionConfidence <= 5)) &&
-             (!('coverageDisclosure' in d) || (d.coverageDisclosure is string && d.coverageDisclosure.size() <= 2000)) &&
-             (!('validationStatus' in d) || d.validationStatus in ['VERIFIED', 'ADJUDICATED_WITH_CAVEATS', 'PARTIALLY_VALIDATED', 'PROVISIONAL', 'UNVERIFIED', 'LEGACY_UNVALIDATED', 'REQUIRES_REANALYSIS']) &&
-             (!('structuredFindingsJson' in d) || (d.structuredFindingsJson is string && d.structuredFindingsJson.size() <= 60000)) &&
-             (!('schemaVersion' in d) || (d.schemaVersion is int && d.schemaVersion >= 1 && d.schemaVersion <= 20)) &&
-             (!('findingsChunkCount' in d) || (d.findingsChunkCount is int && d.findingsChunkCount >= 0 && d.findingsChunkCount <= 64)) &&
-             (!('narrativeChunkCount' in d) || (d.narrativeChunkCount is int && d.narrativeChunkCount >= 0 && d.narrativeChunkCount <= 64));
-    }
-
-    function isValidRefereeMeta(d) {
-      return (!('findingsChecksum' in d) || d.findingsChecksum is string) &&
-             (!('narrativeChecksum' in d) || d.narrativeChecksum is string) &&
-             (!('refereeDecision' in d) || (d.refereeDecision is string && d.refereeDecision.size() <= 64)) &&
-             (!('analysisManifestJson' in d) || d.analysisManifestJson is string) &&
-             (!('abstentionSummaryJson' in d) || d.abstentionSummaryJson is string) &&
-             (!('readinessSummaryJson' in d) || d.readinessSummaryJson is string) &&
-             (!('auditLogJson' in d) || d.auditLogJson is string) &&
-             (!('refereeCoverageJson' in d) || d.refereeCoverageJson is string);
-    }
-
-    function isValidPartialFieldUpdate(next, prev) {
+    function isValidReviewUpdate(userId) {
+      let next = request.resource.data;
+      let prev = resource.data;
       let changed = next.diff(prev).affectedKeys();
-      return (
-               (changed.hasOnly(['bookmarked', 'updatedAt']) && next.bookmarked is bool) ||
-               (changed.hasOnly(['personalNotes', 'updatedAt']) && next.personalNotes is string && next.personalNotes.size() <= 5000)
-             ) &&
-             next.updatedAt is timestamp && next.updatedAt <= request.time;
+      return next.userId == prev.userId &&
+             next.createdAt == prev.createdAt &&
+             (!('auditCommitment' in prev) || prev.auditCommitment == '' ||
+               (next.get('auditCommitment', '') == prev.auditCommitment &&
+                next.get('auditLogJson', '') == prev.get('auditLogJson', ''))) &&
+             (((changed.hasOnly(['bookmarked', 'updatedAt']) && next.bookmarked is bool) ||
+               (changed.hasOnly(['personalNotes', 'updatedAt']) && next.personalNotes is string && next.personalNotes.size() <= 5000)) &&
+              next.updatedAt is timestamp && next.updatedAt <= request.time ||
+              isValidFullReview(userId));
     }
 
     function isValidFindingsChunk(d) {
@@ -151,28 +131,8 @@ service cloud.firestore {
     match /users/{userId}/reviews/{reviewId} {
       allow get: if isOwner(userId) && isValidId(reviewId) && resource.data.userId == request.auth.uid;
       allow list: if isOwner(userId);
-
-      allow create: if isOwner(userId) &&
-                       isValidId(reviewId) &&
-                       hasAllowedReviewKeys(request.resource.data) &&
-                       isValidCoreReview(request.resource.data) &&
-                       isValidJustifications(request.resource.data) &&
-                       isValidAuditMetaCore(request.resource.data) &&
-                       isValidRefereeMeta(request.resource.data);
-
-      allow update: if isOwner(userId) &&
-                       isValidId(reviewId) &&
-                       request.resource.data.userId == resource.data.userId &&
-                       request.resource.data.createdAt == resource.data.createdAt &&
-                       (
-                         isValidPartialFieldUpdate(request.resource.data, resource.data) ||
-                         (hasAllowedReviewKeys(request.resource.data) &&
-                          isValidCoreReview(request.resource.data) &&
-                          isValidJustifications(request.resource.data) &&
-                          isValidAuditMetaCore(request.resource.data) &&
-                          isValidRefereeMeta(request.resource.data))
-                       );
-
+      allow create: if isOwner(userId) && isValidId(reviewId) && isValidFullReview(userId);
+      allow update: if isOwner(userId) && isValidId(reviewId) && isValidReviewUpdate(userId);
       allow delete: if isOwner(userId) && isValidId(reviewId) && resource.data.userId == request.auth.uid;
 
       match /findings_chunks/{chunkId} {

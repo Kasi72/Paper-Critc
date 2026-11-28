@@ -169,7 +169,9 @@ class Phase1To4RefereeFoundationTest {
     )
     assertEquals(DocumentReadiness.READY_WITH_LIMITATIONS, missingSupp.readiness)
     assertEquals(SupplementStatus.ABSENT, missingSupp.supplementStatus)
-    assertTrue(missingSupp.allowsVerifiedVerdict)
+    assertTrue(missingSupp.hasMaterialLimitations)
+    assertFalse("READY_WITH_LIMITATIONS with material limitations must block verified verdicts", missingSupp.allowsVerifiedVerdict)
+    assertTrue("READY_WITH_LIMITATIONS must still permit bounded pre-inference execution", missingSupp.allowsPreInferenceExecution)
 
     // Missing Methods & Results -> INCOMPLETE, never verified referee verdict
     val missingMethodsResults = DocumentReadinessEvaluator.assess(

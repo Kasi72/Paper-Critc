@@ -20,7 +20,7 @@ import com.example.data.ai.GroundedWebSource
 import com.example.data.ai.ManuscriptForensicEngine
 import com.example.data.ai.Reviewer2PipelineService
 import com.example.data.ai.SearchGroundingResult
-import com.example.data.ai.referee.InMemoryRemotePayloadCleanupHook
+import com.example.data.ai.referee.LocalReferenceCleanupHook
 import com.example.data.ai.referee.TamperEvidentAuditLog
 import com.example.data.local.ANONYMOUS_OWNER_SCOPE
 import com.example.data.local.PaperCriticSqlDatabase
@@ -1419,7 +1419,7 @@ class PaperCriticViewModel(
 
     // Finding 6: Strictly enforce draft-bound replication code at the analysis boundary
     val boundReplicationCode = resolveBoundReplicationCode(form)
-    val cleanupHook = InMemoryRemotePayloadCleanupHook()
+    val cleanupHook = LocalReferenceCleanupHook()
 
     activePipelineJob = viewModelScope.launch {
       val currentJob = coroutineContext[Job]

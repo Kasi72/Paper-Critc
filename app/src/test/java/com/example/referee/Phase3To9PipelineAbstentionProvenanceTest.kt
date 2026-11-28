@@ -11,8 +11,8 @@ import com.example.data.ai.referee.DocumentReadinessAssessment
 import com.example.data.ai.referee.DomainAppraisalReport
 import com.example.data.ai.referee.DomainCriterionEvaluation
 import com.example.data.ai.referee.DomainCriterionRating
-import com.example.data.ai.referee.InMemoryRemotePayloadCleanupHook
 import com.example.data.ai.referee.InterPassDisagreement
+import com.example.data.ai.referee.LocalReferenceCleanupHook
 import com.example.data.ai.referee.PassComparisonInput
 import com.example.data.ai.referee.PipelineStageId
 import com.example.data.ai.referee.QuantitativeFindingStatus
@@ -351,8 +351,9 @@ class Phase3To9PipelineAbstentionProvenanceTest {
     assertNotEquals(0L, manifest.startedAtMs)
     assertTrue(manifest.completedAtMs >= manifest.startedAtMs)
 
-    // Remote payload cleanup hook tracks and clears temporary payload handles
-    val hook = InMemoryRemotePayloadCleanupHook()
+    // Local payload reference cleanup hook tracks local handles accurately and never claims remote deletion
+    val hook = LocalReferenceCleanupHook()
+    assertFalse(hook.capability.supportsRemoteDeletion)
     hook.registerPayloadHandle("tmp_vision_bundle_1", System.currentTimeMillis() + 60_000L)
     assertEquals(1, hook.activeHandles().size)
     assertEquals(1, hook.cleanupAll("pipeline_completed"))

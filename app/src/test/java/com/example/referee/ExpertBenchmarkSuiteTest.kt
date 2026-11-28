@@ -2,6 +2,7 @@ package com.example.referee
 
 import com.example.data.ai.referee.RefereeBenchmarkHarness
 import com.example.data.ai.referee.ReleaseReadinessEvaluator
+import com.example.data.ai.referee.ReleaseValidationState
 import java.io.File
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -47,6 +48,8 @@ class ExpertBenchmarkSuiteTest {
 
     val report = ReleaseReadinessEvaluator.evaluate(architectureDocPresent = docFile != null)
     assertFalse(report.externallyValidated)
+    assertEquals(ReleaseValidationState.EXTERNAL_VALIDATION_PENDING, report.validationState)
+    assertTrue(report.statusHeadline.contains("EXTERNAL VALIDATION PENDING", ignoreCase = true))
     assertEquals(12, report.totalGates)
     assertTrue(
       "Expected all 12 release gates to pass, failed: ${report.gates.filterNot { it.passed }}",

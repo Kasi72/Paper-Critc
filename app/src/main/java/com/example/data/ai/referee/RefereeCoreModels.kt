@@ -110,13 +110,30 @@ data class DocumentReadinessAssessment(
   val visionPagesBound: Boolean,
   val supplementStatus: SupplementStatus,
   val reasons: List<String>,
-  val requestedActions: List<String>
+  val requestedActions: List<String>,
+  val lowTextPageCount: Int = 0
 ) {
-  val allowsVerifiedVerdict: Boolean
+  val materialLimitationReasons: List<String>
+    get() = buildList {
+      if (!searchableTextExists) add("No searchable text layer.")
+      if (!tablesAndFiguresDetectable) add("Primary tables/figures not detected in extracted text.")
+      if (supplementStatus == SupplementStatus.ABSENT) add("Referenced supplementary material is absent.")
+      if (!referencesSeparated) add("References boundary could not be cleanly separated.")
+      if (lowTextPageCount > 0) add("$lowTextPageCount sparse/low-text page(s) detected.")
+    }
+
+  val hasMaterialLimitations: Boolean
+    get() = readiness == DocumentReadiness.READY_WITH_LIMITATIONS && materialLimitationReasons.isNotEmpty()
+
+  val allowsPreInferenceExecution: Boolean
     get() = readiness == DocumentReadiness.READY || readiness == DocumentReadiness.READY_WITH_LIMITATIONS
 
+  val allowsVerifiedVerdict: Boolean
+    get() = readiness == DocumentReadiness.READY ||
+      (readiness == DocumentReadiness.READY_WITH_LIMITATIONS && !hasMaterialLimitations)
+
   val allowsPreliminaryAppraisalOnly: Boolean
-    get() = readiness == DocumentReadiness.INCOMPLETE && searchableTextExists
+    get() = (readiness == DocumentReadiness.INCOMPLETE || hasMaterialLimitations) && searchableTextExists
 
   fun toJson(): String {
     val o = JSONObject()
@@ -130,6 +147,7 @@ data class DocumentReadinessAssessment(
     o.put("extractionQualityAcceptable", extractionQualityAcceptable)
     o.put("visionPagesBound", visionPagesBound)
     o.put("supplementStatus", supplementStatus.name)
+    o.put("lowTextPageCount", lowTextPageCount)
     o.put("reasons", JSONArray(reasons))
     o.put("requestedActions", JSONArray(requestedActions))
     return o.toString()
@@ -157,6 +175,7 @@ data class DocumentReadinessAssessment(
           supplementStatus = SupplementStatus.entries.firstOrNull {
             it.name.equals(o.optString("supplementStatus"), ignoreCase = true)
           } ?: SupplementStatus.UNKNOWN,
+          lowTextPageCount = o.optInt("lowTextPageCount", 0),
           reasons = buildList {
             if (reasonsArr != null) {
               for (i in 0 until reasonsArr.length()) {

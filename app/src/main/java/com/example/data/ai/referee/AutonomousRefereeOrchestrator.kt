@@ -193,17 +193,21 @@ object AutonomousRefereeOrchestrator {
     val decision = when {
       input.isOutOfScopeDocument || input.readiness.readiness == DocumentReadiness.UNSUPPORTED_FORMAT ->
         RefereeDecision.OUT_OF_SCOPE
-      !input.consentVerified || input.readiness.readiness == DocumentReadiness.EXTRACTION_FAILURE ->
-        RefereeDecision.INSUFFICIENT_EVIDENCE
-      !input.readiness.methodsPresent || !input.readiness.resultsPresent ->
+      !input.consentVerified ||
+        input.readiness.readiness == DocumentReadiness.EXTRACTION_FAILURE ||
+        !input.readiness.visionPagesBound ||
+        (input.readiness.searchableTextExists && (!input.readiness.methodsPresent || !input.readiness.resultsPresent)) ||
+        !input.readiness.extractionQualityAcceptable ->
         RefereeDecision.INSUFFICIENT_EVIDENCE
       domainReport == null ||
         domainReport.domain == AppraisalDomain.DESIGN_UNCERTAIN ||
         domainReport.restrictsVerdictDueToUncertainDesign ||
         domainReport.rubricCriteria.isEmpty() ->
         RefereeDecision.PROVISIONAL_APPRAISAL
-      neverVerifiedReasons.isNotEmpty() -> {
-        if (confirmedFatalOrMajorCount >= 2 ||
+      abstention.shouldAbstainFromVerifiedVerdict || neverVerifiedReasons.isNotEmpty() -> {
+        if (abstention.hardBlockAllVerdicts) {
+          RefereeDecision.INSUFFICIENT_EVIDENCE
+        } else if (confirmedFatalOrMajorCount >= 2 ||
           input.quantitativeStatuses.any { it == QuantitativeFindingStatus.CONFIRMED_ERROR }
         ) {
           RefereeDecision.MAJOR_UNRESOLVED_CONCERNS
@@ -288,6 +292,15 @@ object AutonomousRefereeOrchestrator {
     }
 
     val entries = auditLog.entries()
+    val terminalHash = entries.lastOrNull()?.entryHash.orEmpty()
+    val commitment = if (terminalHash.isNotBlank()) {
+      TamperEvidentAuditLog.computeCommitmentHash(
+        terminalHash = terminalHash,
+        analysisId = input.analysisId,
+        manuscriptSha256 = manuscriptHash,
+        stageCount = entries.size
+      )
+    } else ""
     return RefereeAdjudicationOutput(
       decision = decision,
       stageRecords = stageRecords,
@@ -299,6 +312,7 @@ object AutonomousRefereeOrchestrator {
       auditLogEntries = entries,
       auditLogJson = auditLog.toJson(),
       auditLogChainValid = TamperEvidentAuditLog.verifyChain(entries),
+      auditCommitment = commitment,
       coverageMetrics = coverageMetrics,
       neverVerifiedReasons = neverVerifiedReasons
     )

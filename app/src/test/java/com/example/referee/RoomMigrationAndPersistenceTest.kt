@@ -172,7 +172,7 @@ class RoomMigrationAndPersistenceTest {
     v9Helper.writableDatabase.close()
     v9Helper.close()
 
-    // Open Room v10 with MIGRATION_9_10 and verify existing v9 row + revisions + new v10 columns
+    // Open Room v11 with MIGRATION_9_10 + MIGRATION_10_11 and verify existing v9 row + revisions + new v10/v11 columns
     roomDb = Room.databaseBuilder(context, PaperCriticSqlDatabase::class.java, dbName)
       .addMigrations(
         PaperCriticSqlDatabase.MIGRATION_3_4,
@@ -181,7 +181,8 @@ class RoomMigrationAndPersistenceTest {
         PaperCriticSqlDatabase.MIGRATION_6_7,
         PaperCriticSqlDatabase.MIGRATION_7_8,
         PaperCriticSqlDatabase.MIGRATION_8_9,
-        PaperCriticSqlDatabase.MIGRATION_9_10
+        PaperCriticSqlDatabase.MIGRATION_9_10,
+        PaperCriticSqlDatabase.MIGRATION_10_11
       )
       .allowMainThreadQueries()
       .build()
@@ -195,8 +196,9 @@ class RoomMigrationAndPersistenceTest {
     assertEquals(7L, migrated.personalNotesRevision)
     assertEquals("", migrated.refereeDecision)
     assertEquals("", migrated.analysisManifestJson)
+    assertEquals("", migrated.auditCommitment)
 
-    // Round-trip new v10 referee metadata fields via LocalReviewRepository
+    // Round-trip new v10/v11 referee metadata + auditCommitment fields via LocalReviewRepository
     val repo = LocalReviewRepository(dao)
     val enriched = migrated.toPaperReview().copy(
       refereeDecision = "VERIFIED_WITH_MINOR_CONCERNS",
@@ -204,12 +206,14 @@ class RoomMigrationAndPersistenceTest {
       abstentionSummaryJson = "{\"shouldAbstain\":false}",
       readinessSummaryJson = "{\"readiness\":\"READY\"}",
       auditLogJson = "[{\"seq\":0}]",
+      auditCommitment = "c".repeat(64),
       refereeCoverageJson = "{\"pagesExtracted\":2}"
     )
     repo.cacheReviewOffline(enriched, ownerScope = "uid-alice")
     val reloaded = dao.getReviewByIdForOwner("rev-1", "uid-alice")!!.toPaperReview()
     assertEquals("VERIFIED_WITH_MINOR_CONCERNS", reloaded.refereeDecision)
     assertEquals("{\"analysisId\":\"a1\"}", reloaded.analysisManifestJson)
+    assertEquals("c".repeat(64), reloaded.auditCommitment)
     assertEquals("{\"pagesExtracted\":2}", reloaded.refereeCoverageJson)
 
     // Verify concurrent dirty-revision ack race: rev 7 ack does NOT clear rev 8 note edit

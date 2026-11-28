@@ -94,7 +94,8 @@ object QuantitativeAdjudicationContracts {
   fun mapDomainStatus(
     finding: DomainAuditFinding,
     sourceAnchorsVerified: Boolean,
-    estimandCompatible: Boolean
+    estimandCompatible: Boolean,
+    checklist: DiscrepancyCrossCheckChecklist = DiscrepancyCrossCheckChecklist()
   ): QuantitativeFindingStatus {
     if (finding.findingType == StatisticalFindingType.UNSUPPORTED_TO_ASSESS) {
       return QuantitativeFindingStatus.NOT_ASSESSABLE
@@ -107,7 +108,11 @@ object QuantitativeAdjudicationContracts {
       QuantFindingStatus.INFO -> QuantitativeFindingStatus.NOT_ASSESSABLE
       QuantFindingStatus.WARN -> QuantitativeFindingStatus.WARNING
       QuantFindingStatus.FAIL -> {
-        if (finding.findingType.isConfirmedError && sourceAnchorsVerified && estimandCompatible) {
+        if (finding.findingType.isConfirmedError &&
+          sourceAnchorsVerified &&
+          estimandCompatible &&
+          checklist.allChannelsChecked
+        ) {
           QuantitativeFindingStatus.CONFIRMED_ERROR
         } else {
           QuantitativeFindingStatus.REQUIRES_SOURCE_RECONCILIATION
